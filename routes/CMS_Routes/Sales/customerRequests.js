@@ -218,6 +218,7 @@ router.get("/requests/export", async (req, res) => {
         // Same stage-vs-status handling as the list route below, so an export
         // taken with a filter on screen contains the rows that were on screen.
         applyStatusFilter(filter, status);
+        Object.assign(filter, NOT_SAMPLING);
         filter = await withOwnedOrders(req, filter);
 
         const requests = await CustomerRequest.find(filter)
@@ -285,6 +286,9 @@ function applyStatusFilter(filter, status) {
 }
 
 // GET all customer requests — NOW with WO completion enrichment + deadline risk
+/** Sample runs are not orders in the Order Book (6 Oct 2026, owner). */
+const NOT_SAMPLING = Object.freeze({ orderOrigin: { $ne: "sampling" } });
+
 router.get("/requests", async (req, res) => {
     try {
         const { search = "", status, dateRange, priority, page = 1, limit = 20 } = req.query;
@@ -322,6 +326,10 @@ router.get("/requests", async (req, res) => {
             }
         }
 
+        /* The Order Book is customers' orders. A sample run — the order R&D's
+           sample is made under, in-house or for a customer's style — is not
+           one, and lives on the style's own page (6 Oct 2026, owner). */
+        Object.assign(filter, NOT_SAMPLING);
         filter = await withOwnedOrders(req, filter);
         const skip = (page - 1) * limit;
         const requests = await CustomerRequest.find(filter)
@@ -422,7 +430,7 @@ router.get("/requests", async (req, res) => {
         const [total, grouped] = await Promise.all([
             CustomerRequest.countDocuments(filter),
             CustomerRequest.aggregate([
-                { $match: await withOwnedOrders(req) },
+                { $match: await withOwnedOrders(req, { ...NOT_SAMPLING }) },
                 { $group: { _id: '$status', count: { $sum: 1 } } },
             ]),
         ]);

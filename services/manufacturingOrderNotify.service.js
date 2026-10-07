@@ -133,9 +133,31 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
         <div style="font-size:12px;color:#555;margin-top:4px">${esc(origin.description)}</div>
       </div>`;
 
+    /* The commercial facts PPC plans against (7 Oct 2026, owner: "proper,
+       formal, informative … for the PPC department"): the PI, the customer's
+       PO, the order value, who released it and when. Read off the approved
+       quotation when there is one. */
+    const q = (request.quotations || []).find((x) => x?.status === "sales_approved") || (request.quotations || [])[0] || null;
+    const poNumber = q?.poProof?.poNumber || request.poProof?.poNumber || "";
+    let releasedBy = request.__releasedByName || "";
+    if (!releasedBy && q?.salesApproval?.approvedBy) {
+      /* the approver's id is a Sales user or a department user — read the name, never fail the mail */
+      try {
+        const id = q.salesApproval.approvedBy;
+        const sd = await require("../models/SalesDepartment").findById(id).select("name email").lean().catch(() => null);
+        const du = sd ? null : await require("../models/Access/DeptUser").findById(id).select("name email").lean().catch(() => null);
+        releasedBy = sd?.name || sd?.email || du?.name || du?.email || "";
+      } catch { /* unnamed */ }
+    }
+    const introHtml = `
+      <p style="font-size:13px;color:#333;margin:0 0 12px">Sales has released a new order to production. The details below are what the order was approved at;
+      the attached Manufacturing Order sheet is the formal record for planning. Please schedule the work orders against the delivery date and
+      raise any capacity or material concern with Sales before cutting begins.</p>`;
     return await notifyEvent("manufacturing_order_created", {
-      subject: `New Manufacturing Order ${moNumber} — ${origin.label}`,
-      heading: `Manufacturing Order ${moNumber} raised`,
+      subject: `New Manufacturing Order ${moNumber} — ${origin.label} · ${request.customerInfo?.name || "customer"} · ${totalQty} pcs`,
+      heading: `Manufacturing Order ${moNumber} released to production`,
+      bodyHtml: introHtml,
+      bodyText: "Sales has released a new order to production. The attached Manufacturing Order sheet is the formal record for planning.",
       // Placeholders for a PM-authored template. The banner and tables below
       // are facts about the record and stay with this call site — same rule
       // the sampling templates follow.
@@ -145,12 +167,20 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
         ["Order shape", personWiseOf(request) ? "Person-wise (measurement conversion)" : "Size-wise (bulk)"],
         ["MO number", moNumber],
         ["Customer", request.customerInfo?.name || "—"],
-        ["Total quantity", `${totalQty} pcs`],
+        ["Proforma invoice", q?.quotationNumber || "—"],
+        ["Customer PO", poNumber || "Not recorded"],
+        ["Order value", q?.grandTotal != null ? `₹${Number(q.grandTotal).toLocaleString("en-IN", { maximumFractionDigits: 2 })} incl. GST` : "—"],
+        ["Total quantity", `${totalQty} pcs across ${items.length} product${items.length === 1 ? "" : "s"}`],
         ["Work orders", String(workOrders.length)],
         ["Priority", String(request.priority || "medium").toUpperCase()],
         ["Delivery deadline", prettyDate(request.customerInfo?.deliveryDeadline)],
+        ["Released on", prettyDate(q?.salesApproval?.approvedAt || new Date())],
+        ...(releasedBy ? [["Released by", releasedBy]] : []),
+        ...(request.customerInfo?.description ? [["Order notes", String(request.customerInfo.description).slice(0, 300)]] : []),
       ],
       extraHtml: banner + productTable + woTable,
+      /* a preview / test send names its own recipients — see departmentNotify */
+      ...(Array.isArray(request.__onlyTo) ? { onlyTo: request.__onlyTo } : {}),
       ctaLabel: "Open Manufacturing Order",
       ctaUrl: moUrl(request),
       attachments,
@@ -170,8 +200,9 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
 // and why the formats differ rather than one letter going to everyone.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const moUrl = (request) =>
-  `${APP_URL}/project-manager/dashboard/production/manufacturing-orders/${request._id}`;
+/* The order's page in PPC, the production control center (the old
+   /project-manager address only forwards there). */
+const moUrl = (request) => `${APP_URL}/ppc/orders/${request._id}`;
 
 const personWiseOf = (r) => Boolean(r?.requestType === "measurement_conversion" || r?.measurementId);
 
