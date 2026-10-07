@@ -42,6 +42,7 @@ const MOUNTS = Object.freeze([
   ["/hr/shift-swaps", "./routes/HrRoutes/ShiftSwap_section"],
   ["/hr/face-registration", "./routes/HrRoutes/FaceRegistration_section"],
   ["/hr/face-enroll", "./routes/HrRoutes/FaceEnrollInvite_section"],
+  ["/api/hr/attendance/shifts", "./routes/HrRoutes/ShiftMaster_section"],
   ["/hr/performance", "./routes/HrRoutes/Performance_section"],
   ["/hr/reports", "./routes/HrRoutes/Reports_section"],
 

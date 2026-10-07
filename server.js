@@ -1350,6 +1350,9 @@ const hrProfileRoutes = require("./routes/HrRoutes/HrProfile-Section");
 const hrOverviewRoutes = require("./routes/HrRoutes/Overview-Section");
 app.use("/api/hr/overview", hrOverviewRoutes);
 
+// HR › Attendance › Shift Management — named shift definitions.
+app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_section"));
+
 // The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
 // /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central
 // GRAV assistant for the whole CMS. HR data is reached through its permission-
@@ -3998,6 +4001,19 @@ const gracefulShutdown = (signal) => {
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 
+/* ONE STRAY PROMISE MUST NOT TAKE EVERY DEPARTMENT DOWN.
+   With no handler, Node ends the process on any unhandled rejection. On 6 Oct
+   2026 one did exactly that — /api/google/dashboard started three Google calls,
+   threw before awaiting them, and when Google refused one the whole backend
+   exited: HR, Store, Accounting and the CEO pages all failed until a restart.
+   A rejection nobody awaited belongs to one request that has already been
+   answered; log it with its stack, loudly, and keep serving everyone else.
+   (Synchronous uncaught EXCEPTIONS still end the process — their state is
+   genuinely unknown.) */
+process.on("unhandledRejection", (reason) => {
+  console.error("❌ [unhandledRejection] — kept serving; fix the caller:", reason?.stack || reason);
+});
+
 const PORT = process.env.PORT || 5000;
 
 /* ─── The scanners' port ───────────────────────────────────────────────────
@@ -4065,6 +4081,14 @@ server.listen(PORT, () => {
      running the schedules stops here and simply serves requests. */
   announceBackgroundJobMode();
   if (!backgroundJobsEnabled()) return;
+
+  /* Data repairs that must happen on EVERY database this code is deployed
+     against, not only the one a fix was first tested on — the late-streak
+     markers, departed employees' reporting lines, administrators' Accounting
+     access. Idempotent; see services/startupRepairs.js. */
+  firstConnection
+    .then(() => require("./services/startupRepairs").runStartupRepairs(mongoose.connection.db))
+    .catch((err) => console.error("[startup-repair]", err?.message || err));
 
   /* ─── Barcode scanner: rollup + LAN announcement ─────────────────────────
    * Full recompute of the three read models from productionevents, every 60s.

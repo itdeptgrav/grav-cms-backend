@@ -299,6 +299,13 @@ const DECLARATIONS = [
     note: "Mints a two-minute, one-operation token so a browser can stream frames at the face engine directly. Shipped undeclared and so refused for everybody. Classified like `recheck` — its nearest sibling, non-mutating, face-registration-scoped — rather than from an observed caller: NOTHING in the CMS or the employee app calls it, so whichever surface drives face sign-in lives outside both repos. If that surface turns out to authenticate as something without an HR grant, this is the line to revisit; the handler’s own comment asks only for a session.",
   }),
 
+  /* Shift Management (routes/HrRoutes/ShiftMaster_section.js) — named shift
+     definitions. The page shipped calling these and they did not exist. */
+  D("GET", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
+  D("POST", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
+  D("PUT", "/api/hr/attendance/shifts/:id", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
+  D("DELETE", "/api/hr/attendance/shifts/:id", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
+
   /* Face enrolment by link (routes/HrRoutes/FaceEnrollInvite_section.js).
      Shipped undeclared, so the contract refused BOTH halves for everybody —
      HR could not mint a link and an employee opening one got 403 (found by

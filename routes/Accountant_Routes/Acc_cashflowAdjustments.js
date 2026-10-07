@@ -140,6 +140,36 @@ router.get("/", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────
+// GET /list?scope=org|mine&status=all|pending|approved|rejected
+// ─────────────────────────────────────────────────────────────────────────
+// What Accounting › Approvals reads. The page called this and it did not
+// exist, and the page swallowed the 404 — so these requests were simply
+// missing from every approver's queue (found by scripts/pageSweep.js,
+// 6 Oct 2026). scope=org is the approver's view and needs canApprove; anybody
+// else gets their own requests whatever they ask for.
+const LIST_STATUS = {
+  pending: ["pending_approval"],
+  approved: ["approved", "posted"],
+  rejected: ["rejected"],
+  void: ["void"],
+};
+router.get("/list", async (req, res) => {
+  try {
+    if (!requireOrg(req, res)) return;
+    const q = { organizationId: req.user.organizationId };
+    const wantsOrg = req.query.scope === "org" && Boolean(req.user?.permissions?.canApprove);
+    if (!wantsOrg) q.createdBy = req.user.id;
+    const st = String(req.query.status || "all");
+    if (st !== "all") q.status = { $in: LIST_STATUS[st] || [st] };
+    const rows = await Acc_CashFlowAdjustment.find(q).sort({ createdAt: -1 }).limit(300).lean();
+    res.json({ success: true, adjustments: rows });
+  } catch (e) {
+    console.error("[adjustments/list]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
 // GET /pending — approver queue: all pending in this org
 // ─────────────────────────────────────────────────────────────────────────
 router.get("/pending", async (req, res) => {

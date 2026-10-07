@@ -1,0 +1,13 @@
+{
+ "takenAt": "2026-10-06T18:00:41.042Z",
+ "productRef": "PROD-BLA-FROOFFBLA-733",
+ "stockItem": {
+  "_id": "6ac4f4bcd17f54fc305943dd",
+  "reference": "PROD-BLA-FROOFFBLA-733",
+  "measurements": []
+ },
+ "config": null,
+ "createdConfigIds": [
+  "6ac53754f1cddde97b967efb"
+ ]
+}

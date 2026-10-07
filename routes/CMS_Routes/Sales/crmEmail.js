@@ -125,7 +125,10 @@ router.get("/for-lead", async (req, res) => {
       return res.json({ success: true, connected: false, connectedEmail: null, messages: [], addresses: [] });
     }
 
-    const out = await emailsForLead({ employeeId, leadId, accountId, customerId });
+    const out = await emailsForLead(
+      { employeeId, leadId, accountId, customerId },
+      await require("../../../services/companyContext/evidenceContext").evidenceContext(req),
+    );
     if (!out) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     res.json({

@@ -3173,7 +3173,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     if (req.user?.employeeId) {
       try {
         const { emailsForLead } = require("../../../services/gmailLeadMatch.service");
-        const out = await emailsForLead({ employeeId: req.user.employeeId, leadId: lead._id });
+        const out = await emailsForLead({ employeeId: req.user.employeeId, leadId: lead._id }, await evidenceCtx(req));
         if (out?.connected) {
           for (const m of out.messages || []) {
             if (!m.sentAt) continue;
@@ -3218,7 +3218,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     } else if (ambiguous.email) {
       try {
         const { emailsForLead } = require("../../../services/gmailLeadMatch.service");
-        const out = await emailsForLead({ employeeId: req.user?.employeeId, leadId: lead._id });
+        const out = await emailsForLead({ employeeId: req.user?.employeeId, leadId: lead._id }, await evidenceCtx(req));
         skippedCounts.emails = out?.messages?.length || 0;
       } catch { /* best-effort count only */ }
     }
