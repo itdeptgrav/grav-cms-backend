@@ -72,6 +72,9 @@ const { roleAtLeast } = require("../departmentRoles");
    and the technical document each frozen revision carries. It adds no model, no
    write route and no copy of a document, and its allowlist is its own code. */
 const evidence = require("./ieDevelopmentEvidence");
+/* The manufacturing facts IE engineers from — its own read-only projection,
+   built the same way the evidence one is: its own module, its own fields. */
+const manufacturing = require("./ieDevelopmentManufacturing");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -275,7 +278,11 @@ const STYLE_PROJECTION = [
 ].join(" ");
 
 /** Everything the ONE-STYLE read additionally needs for its evidence. */
-const STYLE_DETAIL_PROJECTION = [STYLE_PROJECTION, evidence.EVIDENCE_DETAIL_PROJECTION].join(" ");
+const STYLE_DETAIL_PROJECTION = [
+  STYLE_PROJECTION,
+  evidence.EVIDENCE_DETAIL_PROJECTION,
+  manufacturing.MANUFACTURING_DETAIL_PROJECTION,
+].join(" ");
 
 /** Merchandising's file, as evidence — no BOM rows, no buyer, no required-by. */
 const DEVELOPMENT_PROJECTION = [
@@ -1147,6 +1154,13 @@ async function readDevelopment(ctx, { styleId } = {}) {
             + "drawn from, so the material lineage between Merchandising and R&D is not proved.",
       },
     },
+
+    /* ── WHAT IE WAS GIVEN TO ENGINEER FROM ──────────────────────────────
+       A sibling of `row` and `evidence`, never a member of either: `row` is
+       shared with the register's list, and anything added there would land on
+       every row of it. Built from records this read already holds, so the
+       detail costs no extra query. */
+    manufacturingInputs: manufacturing.manufacturingInputsFor({ style, development }),
   };
 }
 

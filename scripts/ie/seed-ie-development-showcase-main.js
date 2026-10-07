@@ -25,6 +25,7 @@ const DeptUser = require("../../models/Access/DeptUser");
 
 const styleFiles = require("../../services/industrialEngineering/ieStyleFile.service");
 const versions = require("../../services/industrialEngineering/ieBulletinVersion.service");
+const feasibility = require("../../services/industrialEngineering/ieFeasibility.service");
 const { actorOf, approveRowTimes } = require("./ieDemoLifecycle");
 
 const MANIFEST_COLLECTION = "ie_demo_manifest";
@@ -403,6 +404,92 @@ async function seedEngineering({ editor, approver, manifest }) {
     approver,
     minutesByCode: OPERATION_TIMES,
     manifest: { studyIds: studies },
+  });
+
+  /* ── CAN IT BE MADE? ──────────────────────────────────────────────────
+     The bulletin cannot be submitted until somebody has assessed whether the
+     factory can make the garment. The showcase records a real judgement about
+     THIS polo — a folder nobody has arranged, decoration that has to happen
+     before assembly, a needle and thread still to confirm, and an in-process
+     check on the placket — rather than a rubber stamp. */
+  await feasibility.saveFeasibility(ctx, {
+    fileId,
+    actor: actorOf(editor),
+    body: {
+      expectedRevision: 0,
+      outcome: "FEASIBLE_WITH_CONDITIONS",
+      recommendation: "Make it, once the collar folder is arranged and the chest embroidery "
+        + "is sequenced before front assembly.",
+      findings: [
+        {
+          area: "CONSTRUCTION",
+          title: "Fabric stretches while attaching the collar",
+          observation: "The rib collar grows on the shoulder seam when it is set by hand.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Trial a folder or guide on the next sample round.",
+        },
+        {
+          area: "MACHINES",
+          title: "Collar folder must be arranged before bulk production",
+          observation: "No folder for this collar width is on the floor today.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Arrange or order the folder.",
+          availability: "NEED_TO_ARRANGE",
+        },
+        {
+          area: "SPECIAL_PROCESSES",
+          title: "Chest embroidery must be finished before front assembly",
+          observation: "The 68 mm crest cannot be hooped once the front is joined to the back.",
+          severity: "CONCERN",
+          owner: "PRODUCTION",
+          requiredAction: "Sequence the embroidery ahead of assembly.",
+        },
+        {
+          area: "MATERIALS",
+          title: "Confirm the needle and thread on the approved fabric",
+          observation: "The pique is bio-washed; the needle and thread pairing has not been "
+            + "proved on it.",
+          severity: "CONCERN",
+          owner: "RESEARCH_DEVELOPMENT",
+          requiredAction: "Confirm the combination on the approved fabric.",
+        },
+        {
+          area: "QUALITY_RISK",
+          title: "Placket alignment needs an in-process check",
+          observation: "The placket shifts against the button stand on the fit sample.",
+          severity: "CONCERN",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Add an in-process alignment check at the placket operation.",
+        },
+        {
+          area: "SAMPLE_EVIDENCE",
+          title: "Round 3 proved the collar and the crest placement",
+          observation: "The accepted round shows the crest at 68 mm on the left chest.",
+          severity: "INFORMATION",
+          owner: "RESEARCH_DEVELOPMENT",
+          requiredAction: "",
+        },
+      ],
+      conditions: [
+        {
+          text: "A collar folder is available before bulk production starts",
+          owner: "INDUSTRIAL_ENGINEERING",
+          requiredAction: "Arrange the folder and prove it on a sample.",
+        },
+        {
+          text: "Chest embroidery is completed before front assembly",
+          owner: "PRODUCTION",
+          requiredAction: "Sequence the outside process ahead of assembly.",
+        },
+        {
+          text: "The needle and thread combination is confirmed on the approved fabric",
+          owner: "RESEARCH_DEVELOPMENT",
+          requiredAction: "Confirm and record the combination.",
+        },
+      ],
+    },
   });
 
   const ready = await styleFiles.readFileForOwnedStyle(ctx, { styleId: STYLE_ID });

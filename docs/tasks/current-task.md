@@ -1,3 +1,118 @@
+# ACTIVE TASK — CMS DEVELOPMENT QWEN RUNTIME (2 Oct 2026)
+
+The user requested that the existing CMS assistant use `qwen3:32b` from the
+development RunPod after a direct comparison with `qwen3:8b`. The runtime is private: Ollama is
+loopback-only on the pod and the local backend reaches it through an SSH tunnel
+on `127.0.0.1:11435`. No production traffic or assistant authority boundary is
+changed. Durable decision: `docs/decisions/cms-dev-qwen-runtime.md`.
+
+Acceptance requires the exact model and quantization to be verified, the tunnel
+to pass a health check, the assistant catalogue/unit suites to remain green,
+and one live structured model request to succeed through the tunnel.
+
+**State: live in CMS development.** Verified `qwen3:32b` / `Q4_K_M` by digest,
+100% GPU residency on the A40, structured requests through the private tunnel,
+68/68 focused assistant tests, a clean catalogue audit, and a healthy restarted
+backend with its database and socket connected. The 8B files remain available
+for rollback but that model is not resident in GPU memory.
+
+---
+
+# ACTIVE TASK — R&D FIT SIMULATION, SLICE 1 (1 Oct 2026)
+
+The active implementation scope is the **first in-app 2D→3D fit slice** for
+R&D. Decision record: `docs/decisions/rnd-fit-simulation.md`.
+
+The product direction is fixed and is not re-litigated by this slice:
+
+- the 2D pattern is the only manufacturing source of truth;
+- the 3D garment is derived from an approved, immutable pattern revision;
+- nothing in 3D may modify 2D geometry;
+- it all happens inside the R&D web application — no Blender, no command-line
+  export, no separate operator application.
+
+**This slice builds:** the cloth solver with body and self collision and staged
+settling; an explicit mm/cm/in unit boundary with the millimetre as the one
+internal unit; the adapter from a `patternSet` revision to simulation pieces;
+triangulation that keeps every vertex's source piece; the geometry-fidelity
+gate; readiness validation and a visual seam-mapping step; the worker lifecycle
+wired to `RenderJob`; Draft/Normal/High; and a derived drape rendered in the
+existing workspace.
+
+**This slice does NOT build** the Fit Assistant or side-by-side trial
+comparison. Boundaries are left for Grab, Pin, Relax, Strain and Clearance.
+
+`cad.zip` is first-party GRAV code, authorised for reuse, **not open source and
+not for redistribution** — see the decision record.
+
+---
+
+# ACTIVE TASK — CUSTOMER-SUPPLIED DEVELOPMENT SAMPLES (1 Oct 2026)
+
+Decision record: `docs/decisions/store-customer-supplied-material.md`.
+Lane A, within the Store & Purchase programme below.
+
+**State: feature complete, UNCOMMITTED, with two things outstanding — one of
+them an operator action nobody can do from a test suite.**
+
+## What was built
+
+A material request line can declare the customer is supplying the material.
+Approving it opens a `CustomerMaterialExpectation` with
+`origin: DEVELOPMENT_SAMPLE`, already `ISSUED`, which Store receives against on
+the existing `CUSTOMER_MATERIAL` goods receipt. No purchase order is created, of
+any value. Ownership is walked from the development file to the customer and
+**refused when it cannot be proven**; `customerId` is never read from a request
+payload.
+
+## Outstanding — 1: one index must be dropped by hand
+
+`merchandising_customer_material_expectations.one_revision_per_development` was
+built by an earlier revision of this feature and is **wrong**: keyed on the
+development, it refuses a second expectation for one development, which is an
+ordinary case. It is replaced by `one_revision_per_document`. The replacement is
+declared and present; the wrong one is still in the database and must go:
+
+```
+node -r dotenv/config scripts/migrations/customer-material-ownership-indexes.js --retire
+```
+
+`--retire` drops only the indexes named in that script's `RETIRED` list, one at a
+time, by name. It is separate from `--apply` deliberately: every other mode of
+that script promises in writing that it touches nothing it did not build.
+
+**Do not run `--apply` for this feature.** Both of this feature's indexes are
+already present. `--apply` would build 7 indexes belonging to other features
+(`customer_material_lots`, `stockissuances`, `barcodes`,
+`customer_material_returns`) and is not scoped to this change.
+
+There is also a pre-existing conflict the script leaves alone and this feature
+did not create: `barcodes.customerMaterial.lotId_1` holds a different index than
+declared (`sparse` wanted, not found). Dropping a live index is a person's
+decision.
+
+## Outstanding — 2: the live authenticated journey is NOT verified
+
+The whole chain is proven against the real services and the real database engine
+by `test/store-purchase/customer-supplied-routing.test.js`, and the Store screen
+is proven structurally by `components/store/receiving/workspace.test.mjs` and the
+`/preview/store/receive` route.
+
+**None of that is the live journey.** The authenticated end-to-end walk — raise,
+approve, see it in Store, receive it, confirm ownership and QC, cancel — has not
+been run, because no session is available in this environment and there is no
+authentication bypass to use. A real session is the only thing that closes it.
+
+## What this feature does not include
+
+Stated here as well as in the decision record, because each is a plausible next
+request and **none is implemented**: supplier free-of-charge receipts,
+inter-company or warehouse transfers as a source of customer material, a
+"sample inward" document type of its own, and Store raising a customer-supplied
+request on its own authority.
+
+---
+
 # ACTIVE TASK — STORE & PURCHASE, TWO LANES (28 Sep 2026)
 
 > **The CMS-wide Assistant Semantic Catalogue entry that used to head this file
@@ -5463,7 +5578,7 @@ No full regression suite and no production build were run, per the brief.
   Domains, entities and metrics are validated once; the runtime performs
   longest-unique metric resolution, domain detection, collision audits and
   cross-catalogue model-candidate filtering.
-- Migrated HR to 10 domains, 5 entities, 55 scalar metrics and 89 aliases.
+- Migrated HR to 10 domains, 5 entities and 62 scalar metrics.
   Migrated all 21 HR tools to machine-readable domain/subject metadata.
 - Added Accounting's 6 domains and 4 entities and migrated its 6 registered
   tools, preventing HR vocabulary from hiding a valid Accounting capability.
@@ -5510,7 +5625,7 @@ rule for every wording, while keeping HR records and actions reliable.
   bypass model enum selection; ambiguous or free-form requests still use Qwen.
   Longest unique alias matching prevents a broad field from shadowing a more
   specific field.
-- Expanded the registry to 55 scalar metrics with 89 standard aliases, covering
+- Expanded the registry to 62 scalar metrics, covering
   every standard employee/profile field plus configured compensation and posted
   payroll values. All aliases are checked as one generated collision/routing
   matrix rather than by isolated prompt regressions.
@@ -5532,6 +5647,11 @@ rule for every wording, while keeping HR records and actions reliable.
   metric first, read the authorised value, and return a deterministic yes/no
   plus the canonical value. The comparison grammar is generated across every
   registered HR metric alias rather than patched for individual sentences.
+- Added an enforced standard-identity coverage contract and deterministic
+  composite `employee.full_name` metric. Misspelled-but-unique employee names
+  now pass through the existing fuzzy employee resolver, while the requested
+  field remains catalogue-owned; the language model cannot substitute another
+  employee attribute or ask a generic entity clarification.
 
 ## Safety boundary
 
@@ -5556,6 +5676,21 @@ execution and audit event. The model has no raw MongoDB access.
 - A fresh-history live check of `what is arpita's email?` selected
   `employee.work_email` without model planning and returned the authorised work
   email in 1.036 seconds.
+- A live database and end-to-end fresh-history check of
+  `what is umung's full name?` resolved `UMUNG ARORA (GR0002)`, selected
+  `hr_person_metric` / `employee.full_name` through a catalogue claim, and
+  returned `UMUNG ARORA's full name is UMUNG ARORA.` deterministically. The
+  focused catalogue, planner, route and permission suites pass 68/68, and the
+  assistant catalogue audit reports 62 HR metrics with zero issues.
+- Activated `qwen3:32b` (`Q4_K_M`, immutable Ollama blob
+  `3291abe70f16ee9682de7bfae08db5373ea9d6497e614aaad63340ad421d6312`)
+  for CMS development through the existing private tunnel. On an identical
+  eight-question real-catalogue routing sample it scored 7/8 versus 6/8 for
+  `qwen3:8b`; warm planning was about 4.0–7.6 seconds and resident VRAM was
+  about 28 GB. One audit case failed closed at argument-schema validation, so
+  the larger model is an improvement, not a replacement for typed catalogues
+  and validators. The focused regression suite remains green at 68/68 and the
+  catalogue audit remains clean at 27 tools / 62 HR metrics.
 - A fresh-history live matrix selected deterministic sources for attendance,
   work email, CTC, father and blood group. `arpita's attendance` returned the
   authorised 30-day tally through `hr_employee` in 1.186 seconds, without model

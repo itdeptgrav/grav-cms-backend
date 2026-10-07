@@ -47,6 +47,7 @@ const styleFiles = require("./ieStyleFile.service");
    with the first about which approval was current. */
 const layouts = require("./ieLineLayout.service");
 const processRoutes = require("./ieProcessRoute.service");
+const feasibility = require("./ieFeasibility.service");
 
 const { STATE, LIMITS } = IeBulletinVersion;
 
@@ -232,7 +233,7 @@ const gap = (code, action, message, extra = {}) => ({
   code, owner: "INDUSTRIAL_ENGINEERING", action, message, ...extra,
 });
 
-async function readinessGapsFor(ctx, file, { bound, timeGaps }) {
+async function readinessGapsFor(ctx, file, { bound, timeGaps, stage = "submitted" }) {
   const rows = file.bulletin?.rows || [];
   const gaps = [];
 
@@ -345,6 +346,17 @@ async function readinessGapsFor(ctx, file, { bound, timeGaps }) {
      the caller resolves approved times exactly once for both the gates and the
      snapshot. */
   void bound;
+  /* ── CAN IT BE MADE? ───────────────────────────────────────────────────
+     A standard submitted with nobody having asked whether the factory can make
+     the garment is the gap the feasibility assessment exists to close, so an
+     unassessed style cannot be submitted. An open BLOCK stops the approval
+     rather than the submission: a blocked assessment is worth saving and
+     sharing — it is how the owning desk learns what to fix — and it is the
+     approved standard it may not become. See ieFeasibility.service.js. */
+  for (const g of feasibility.feasibilityGaps(file, { stage })) {
+    gaps.push(gap(g.code, g.action, g.message, g.details ? { details: g.details } : {}));
+  }
+
   return gaps;
 }
 
@@ -645,6 +657,12 @@ function publishVersion(doc, { withRows = true, withHistory = false } = {}) {
        UNKNOWN with `stages: null` when none was declared at submission. */
     processRoute: processRoutes.publishRoute(doc.processRoute),
 
+    /* The assessment as it was when this version was submitted — evidence, and
+       never editable from here. */
+    feasibility: doc.feasibility
+      ? feasibility.publishFeasibility(null, { frozen: doc.feasibility })
+      : null,
+
     source: {
       fingerprint: doc.sourceFingerprint,
       approvalDigest: doc.sourceApprovalDigest,
@@ -737,6 +755,7 @@ async function submitVersion(ctx, { fileId, body = {}, actor } = {}) {
   const digests = layouts.sourceDigestsOf(rows);
   const fingerprint = layouts.sourceFingerprintOf(rows);
   const frozenRoute = processRoutes.freezeRoute(file.bulletin?.processRoute);
+  const frozenFeasibility = feasibility.freezeFeasibility(file);
 
   /* ── A DUPLICATE KEY HERE IS A LOST RACE, AND IS ANSWERED AS ONE ────────
      Two mechanisms refuse a second submission and either is sufficient: the
@@ -789,6 +808,10 @@ async function submitVersion(ctx, { fileId, body = {}, actor } = {}) {
       /* The draft route, frozen with the rows it was declared beside. Left
          absent — never an empty route — when the draft declared none. */
       ...(frozenRoute ? { processRoute: frozenRoute } : {}),
+      /* And the feasibility judgement, frozen with the standard it is about.
+         Absent when nobody assessed it, which reads as "not assessed" rather
+         than as a pass — the submit gate above refuses that case anyway. */
+      ...(frozenFeasibility ? { feasibility: frozenFeasibility } : {}),
       totals,
       allowancePolicyId: policy.allowancePolicyId,
       allowancePolicyRevision: policy.allowancePolicyRevision,
@@ -1077,7 +1100,7 @@ async function approveVersion(ctx, { versionId, body = {}, actor } = {}) {
   const file = await IeStyleFile.findOne({ _id: current.ieStyleFileId, companyId: ctx.companyId }).lean();
   if (!file) throw versionNotFound();
   const { timeGaps } = await snapshotOf(ctx, file);
-  const gaps = await readinessGapsFor(ctx, file, { bound: null, timeGaps });
+  const gaps = await readinessGapsFor(ctx, file, { bound: null, timeGaps, stage: "approved" });
   if (gaps.length) throw notReady("approved", gaps);
 
   return inTransaction("Approving a bulletin version", async (session) => {

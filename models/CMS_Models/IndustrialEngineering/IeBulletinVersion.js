@@ -35,6 +35,7 @@
 
 const mongoose = require("mongoose");
 const { processRouteSchema } = require("./processRoute.schema");
+const { feasibilitySchema } = require("./feasibility.schema");
 
 /* ── THE FOUR STATES, AND WHAT THEY MEAN ────────────────────────────────────
    IN_REVIEW   submitted, freezing the draft, awaiting a decision
@@ -283,6 +284,14 @@ const ieBulletinVersionSchema = new mongoose.Schema(
        route existed, or from a draft that declared none — and a reader must
        treat that as "route unknown", never as "no stages". */
     processRoute: { type: processRouteSchema, default: undefined },
+
+    /* ── THE FEASIBILITY JUDGEMENT, FROZEN WITH THE STANDARD ─────────────
+       Copied from the file's draft at submission and decided with this version.
+       An approved version's copy is what was actually accepted: editing the
+       draft afterwards builds the NEXT assessment and cannot rewrite this one.
+       Absent on a version submitted before the assessment existed, which reads
+       as "not assessed" and never as "feasible". */
+    feasibility: { type: feasibilitySchema, default: undefined },
 
     totals: {
       garmentSamMinutes: { type: Number, default: 0, min: 0 },

@@ -72,6 +72,12 @@ const actorRef = () => ({
   email: { type: String, trim: true, lowercase: true },
 });
 
+/* The two kinds of work a customer can be sending material for. */
+const ORIGIN = Object.freeze({
+  CONFIRMED_ORDER: "CONFIRMED_ORDER",
+  DEVELOPMENT_SAMPLE: "DEVELOPMENT_SAMPLE",
+});
+
 const STATE = Object.freeze({
   DRAFT: "DRAFT",
   ISSUED: "ISSUED",
@@ -161,9 +167,58 @@ const expectationSchema = new mongoose.Schema(
        the order reference is how Store, the customer and every downstream
        reader recognise it without having to know Merchandising's own
        numbering. */
-    executionFileId: {
-      type: mongoose.Schema.Types.ObjectId, ref: "ExecutionFile", required: true, index: true,
+    /* ── WHICH KIND OF WORK THIS MATERIAL IS COMING FOR ───────────────────
+       Two things can make a customer send us material, and they are different
+       enough that one required field cannot serve both:
+
+         CONFIRMED_ORDER    — a job-work order. There is an execution file, a
+                              handover and a confirmed customer request, and the
+                              customer is established by walking them.
+         DEVELOPMENT_SAMPLE — a sample, before any order exists. There is a
+                              development and the Sales journey it was opened
+                              under, and no execution file at all.
+
+       The second used to be impossible: `executionFileId` was unconditionally
+       required, so material a customer sent for a sample had nowhere to be
+       expected and the store received it against nothing.
+
+       It is ONE record type with an explicit origin rather than two documents,
+       because everything downstream — the receipt, the ownership lot, QC, the
+       issue and the return to customer — is identical once the material is on
+       the shelf, and a second document would have meant a second of each. */
+    origin: {
+      type: String,
+      enum: Object.values(ORIGIN),
+      default: ORIGIN.CONFIRMED_ORDER,
+      required: true,
+      index: true,
     },
+
+    /* Required for a CONFIRMED_ORDER expectation, and forbidden on a
+       DEVELOPMENT_SAMPLE one — see `enforceOneOrigin` below. */
+    executionFileId: {
+      type: mongoose.Schema.Types.ObjectId, ref: "ExecutionFile", default: null, index: true,
+    },
+
+    /* The mirror image: required for DEVELOPMENT_SAMPLE, forbidden otherwise. */
+    developmentFileId: {
+      type: mongoose.Schema.Types.ObjectId, ref: "Development", default: null, index: true,
+    },
+
+    /* ── THE DEMAND THIS CAME FROM ────────────────────────────────────────
+       The approved material request whose customer-supplied line caused this
+       document to exist, and the line itself. Lineage and audit only: the MRF
+       is the OPERATIONAL root — who asked, for what work, how much — and it is
+       emphatically NOT the authority for whose goods these are. Ownership comes
+       from the development's Sales journey or the order's handover chain, on
+       the server, because a client that could name the customer could attribute
+       one customer's fabric to another by editing a form.
+
+       Null on a document Merchandising composed directly, which is how every
+       confirmed-order expectation was created before this existed. */
+    sourceMrfId: { type: mongoose.Schema.Types.ObjectId, ref: "MRF", default: null, index: true },
+    sourceMrfNumber: { type: String, trim: true, default: "" },
+    sourceMrfLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
     fileNumber: { type: String, trim: true, default: "" },
     orderRef: { type: String, trim: true, default: "", index: true },
     /* ── THE PERMANENT SALES ORDER LINE ───────────────────────────────────
@@ -185,7 +240,15 @@ const expectationSchema = new mongoose.Schema(
        later from a projection that may since have been revised. A document that
        could not say why it exists would be unexplainable the first time
        somebody asked. */
-    fulfilmentModel: { type: String, enum: ORDER_FULFILMENT_MODELS, required: true },
+    /* An order fact: WHY a confirmed order was allowed to have customer-supplied
+       material at all. A development sample has no fulfilment model, because
+       nothing has been ordered — the permission comes from the origin instead. */
+    fulfilmentModel: {
+      type: String,
+      enum: [...ORDER_FULFILMENT_MODELS, null],
+      default: null,
+      required() { return this.origin === ORIGIN.CONFIRMED_ORDER; },
+    },
 
     /* ── WHOSE GOODS THESE ARE ────────────────────────────────────────────
        The Customer's own id, resolved on the server by walking
@@ -282,9 +345,86 @@ const expectationSchema = new mongoose.Schema(
   { timestamps: true, collection: "merchandising_customer_material_expectations" },
 );
 
-/* One revision number per execution file, per company. */
+/* ── EXACTLY ONE ORIGIN, ENFORCED ON THE DOCUMENT ────────────────────────────
+   Neither is a document nothing can be received against; both is a document
+   that claims the material is for two different pieces of work at once, and
+   whichever reader looked at the other field would be wrong. The schema refuses
+   both rather than leaving the ambiguity for a service to notice. */
+expectationSchema.pre("validate", function enforceOneOrigin(next) {
+  const hasFile = Boolean(this.executionFileId);
+  const hasDevelopment = Boolean(this.developmentFileId);
+
+  if (hasFile && hasDevelopment) {
+    return next(new Error(
+      "A customer-material expectation belongs to an execution file or to a development, "
+      + "never to both.",
+    ));
+  }
+  if (!hasFile && !hasDevelopment) {
+    return next(new Error(
+      "A customer-material expectation must name the work it is for: an execution file for a "
+      + "confirmed order, or a development for a sample.",
+    ));
+  }
+  /* The origin and the field it requires must agree. A CONFIRMED_ORDER document
+     carrying only a development is not a confirmed order with a missing field;
+     it is a mislabelled record, and the label is what every downstream reader
+     branches on. */
+  if (this.origin === ORIGIN.CONFIRMED_ORDER && !hasFile) {
+    return next(new Error("A confirmed-order expectation must name its execution file."));
+  }
+  if (this.origin === ORIGIN.DEVELOPMENT_SAMPLE && !hasDevelopment) {
+    return next(new Error("A development-sample expectation must name its development."));
+  }
+  return next();
+});
+
+/* One revision number per execution file, per company. Partial, because a
+   development-sample document has no execution file and `null` is a value Mongo
+   would otherwise consider equal across every one of them. */
 expectationSchema.index(
-  { companyId: 1, executionFileId: 1, revisionNo: 1 }, { unique: true },
+  { companyId: 1, executionFileId: 1, revisionNo: 1 },
+  { unique: true, partialFilterExpression: { executionFileId: { $type: "objectId" } } },
+);
+
+/* ── A REVISION NUMBER BELONGS TO A DOCUMENT, NOT TO THE WORK ────────────────
+   This was first written as (companyId, developmentFileId, revisionNo), by
+   analogy with the execution-file rule above. The analogy does not hold, and
+   the difference matters:
+
+     · an execution file has ONE expectation, revised 1..n — so keying its
+       revisions on the file is keying them on the document;
+     · a development may have SEVERAL, because each approved customer-supplied
+       request line produces its own document, each opening at revision 1.
+
+   Keyed on the development, the second sample for one development collided with
+   the first and routing reported a duplicate-key failure — a legitimate case
+   refused by an index that had mistaken "the work" for "the document".
+
+   `documentRef` is the document's own identity and is stable across its
+   revisions (see the model header), so this is the rule both origins actually
+   need. It is deliberately NOT scoped to an origin: one document, one revision
+   number, however it was composed. */
+expectationSchema.index(
+  { companyId: 1, documentRef: 1, revisionNo: 1 },
+  { unique: true, name: "one_revision_per_document" },
+);
+
+/* ── AND ONE EXPECTATION PER APPROVED REQUEST LINE ───────────────────────────
+   The idempotency that makes routing safe to retry. An approval that is
+   delivered twice, or an API call the caller repeats after a timeout, re-inserts
+   the same (company, MRF line) pair and the database refuses the duplicate —
+   rather than a read-then-write that two simultaneous retries would both pass.
+
+   Partial: every document Merchandising composed directly carries no source
+   line, and `null` would collide across all of them. */
+expectationSchema.index(
+  { companyId: 1, sourceMrfLineId: 1 },
+  {
+    unique: true,
+    name: "one_expectation_per_request_line",
+    partialFilterExpression: { sourceMrfLineId: { $type: "objectId" } },
+  },
 );
 
 /* ── AT MOST ONE DRAFT PER FILE ──────────────────────────────────────────────
@@ -297,7 +437,19 @@ expectationSchema.index(
   {
     unique: true,
     name: "one_open_draft_per_execution_file",
-    partialFilterExpression: { state: STATE.DRAFT },
+    /* `executionFileId` is typed as well as the state: without it every
+       development-sample draft carries `null` here and the second one collides
+       with the first for a reason that has nothing to do with it. */
+    partialFilterExpression: { state: STATE.DRAFT, executionFileId: { $type: "objectId" } },
+  },
+);
+
+expectationSchema.index(
+  { companyId: 1, developmentFileId: 1 },
+  {
+    unique: true,
+    name: "one_open_draft_per_development",
+    partialFilterExpression: { state: STATE.DRAFT, developmentFileId: { $type: "objectId" } },
   },
 );
 
@@ -307,6 +459,7 @@ expectationSchema.index({ companyId: 1, state: 1, issuedAt: -1 });
 expectationSchema.index({ companyId: 1, orderRef: 1, revisionNo: -1 });
 
 module.exports = {
+  ORIGIN,
   STATE,
   STATES,
   EDITABLE_STATES,

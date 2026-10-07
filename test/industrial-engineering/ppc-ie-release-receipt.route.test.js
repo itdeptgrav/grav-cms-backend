@@ -40,6 +40,7 @@ const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkO
 const IeStyleFile = require("../../models/CMS_Models/IndustrialEngineering/IeStyleFile");
 const IeBulletinVersion = require("../../models/CMS_Models/IndustrialEngineering/IeBulletinVersion");
 const IeRelease = require("../../models/CMS_Models/IndustrialEngineering/IeRelease");
+const { assessFeasible } = require("./support/feasibility");
 const {
   IeReleaseReceipt, RECEIPT_STATE, CLARIFICATION_CATEGORY,
 } = require("../../models/CMS_Models/PPC/IeReleaseReceipt");
@@ -260,6 +261,7 @@ async function world(name, co) {
   }
 
   const stored = await IeStyleFile.findById(file.fileId).lean();
+  await assessFeasible(call, { fileId: file.fileId, ...t });
   const submittedVersion = await call(`/engineering-files/${file.fileId}/bulletin-versions`, {
     method: "POST", ...t, body: { expectedRevision: stored.revision },
   });

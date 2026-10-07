@@ -10,6 +10,7 @@
 //   5. UPDATED: POST / accepts variant.image + variant.vendorNicknames
 //   6. ADDED: unitConversion accepted on POST / and PUT /:id (product-level)
 
+const { attachActorNames } = require("../../../../services/actorNames");
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -2145,7 +2146,7 @@ router.get("/:id/transactions", canRead, async (req, res) => {
 
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }))
       .select("stockTransactions name sku quantity minStock")
-      .populate("stockTransactions.performedBy", "name email")
+      /* no populate: an Employee populate NULLS a dept_users id; attachActorNames resolves both (3 Oct 2026) */
       /* The supplier behind a movement is not resolved from the global
          table; the movement's own recorded `supplier` text is used. */
       .lean();
@@ -2153,6 +2154,7 @@ router.get("/:id/transactions", canRead, async (req, res) => {
     if (!rawItem) return res.status(404).json({ success: false, message: "Raw item not found" });
 
     let transactions = rawItem.stockTransactions || [];
+    await attachActorNames(transactions); // dept_users ids resolve too (3 Oct 2026)
     transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     const startIndex = (page - 1) * limit;
@@ -2205,7 +2207,7 @@ router.get("/:id/variants/:variantId/transactions", canRead, async (req, res) =>
 
     const rawItem = await RawItem.findOne(scoped(req, { _id: req.params.id }))
       .select("stockTransactions name sku variants minStock")
-      .populate("stockTransactions.performedBy", "name email")
+      /* no populate: an Employee populate NULLS a dept_users id; attachActorNames resolves both (3 Oct 2026) */
       /* The supplier behind a movement is not resolved from the global
          table; the movement's own recorded `supplier` text is used. */
       .lean();
@@ -2218,6 +2220,7 @@ router.get("/:id/variants/:variantId/transactions", canRead, async (req, res) =>
     let transactions = rawItem.stockTransactions.filter(tx =>
       tx.variantId && tx.variantId.toString() === req.params.variantId
     );
+    await attachActorNames(transactions);
     transactions.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
     const startIndex = (page - 1) * limit;

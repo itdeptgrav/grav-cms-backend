@@ -17,7 +17,7 @@ const tool = (name, catalogue, domains, options = {}) => ({
 describe("CMS semantic catalogue compiler", () => {
   test("the HR and Accounting catalogues compile without ambiguous metric aliases", () => {
     expect(hr.CATALOGUE.audit()).toEqual(expect.objectContaining({
-      ok: true, domainCount: 10, entityCount: 5, metricCount: 55,
+      ok: true, domainCount: 10, entityCount: 5, metricCount: 62,
     }));
     expect(accounting.CATALOGUE.audit()).toEqual(expect.objectContaining({
       ok: true, domainCount: 6, entityCount: 4,
@@ -30,6 +30,25 @@ describe("CMS semantic catalogue compiler", () => {
         expect(hr.CATALOGUE.resolveMetric(`Arpita ${term}`)).toMatchObject({ id: metric.id });
       }
     }
+  });
+
+  test("the standard employee identity contract cannot silently lose fields", () => {
+    const required = [
+      "employee.full_name",
+      "employee.title",
+      "employee.nickname",
+      "employee.work_email",
+      "employee.personal_email",
+      "employee.primary_manager",
+      "employee.secondary_manager",
+      "employee.department",
+      "employee.designation",
+      "employee.job_title",
+      "employee.work_location",
+      "employee.shift",
+      "employee.needs_to_operate",
+    ];
+    expect(required.filter((id) => !hr.metric(id))).toEqual([]);
   });
 
   test.each([

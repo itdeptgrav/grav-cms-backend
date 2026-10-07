@@ -25,6 +25,7 @@ const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Opera
 
 const mrfApprover = require("../../../../services/mrfApprover.service")
 const autoReservation = require("../../../../services/storePurchase/autoReservation.service")
+const customerSuppliedRouting = require("../../../../services/storePurchase/customerSuppliedRouting.service")
 const mrfNotify = require("../../../../services/mrfNotify.service")
 const mrfChat = require("../../../../services/mrfChat.service")
 const { buildContext } = require("../../../../services/mrfContext.service")
@@ -677,6 +678,12 @@ router.patch(
        fails must never un-approve a decision a person already made. The outcome
        is written onto each line, and a line that could not be held appears in
        the Store's Needs-attention queue with a retry. */
+    /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+       The same approval, routed the other way: a customer-supplied line
+       produces a customer-material expectation, never a reservation and
+       never a purchase. Both run after the commit for the same reason —
+       neither may be able to undo a decision a person already made. */
+    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
     autoReservation.attemptInBackground({
       tenant: req.tenant, mrfId: mrf._id,
       trigger: autoReservation.TRIGGERS.TL_APPROVED,
@@ -1011,7 +1018,13 @@ async function createMrfRequest(req, res) {
       /* An auto-forwarded request arrives at the Store already approved, so it
          is eligible the moment it exists — the same trigger as a TL approval,
          reached by a different door. */
-      autoReservation.attemptInBackground({
+      /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+         The same approval, routed the other way: a customer-supplied line
+         produces a customer-material expectation, never a reservation and
+         never a purchase. Both run after the commit for the same reason —
+         neither may be able to undo a decision a person already made. */
+      customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
+    autoReservation.attemptInBackground({
         tenant: req.tenant, mrfId: mrf._id,
         trigger: autoReservation.TRIGGERS.AUTO_FORWARDED,
         actorName: fullName || req.user.name || "", actorId: emp?._id || null,
@@ -1286,6 +1299,17 @@ router.patch(
       metadata: { lineCount: (mrf.items || []).length },
     })
 
+
+    /* ── AND THE DELIVERIES IT AUTHORISED ───────────────────────────
+       The expectation existed because this request authorised it; the
+       authorisation is now withdrawn, so Store must stop planning around a
+       delivery nobody is sending. Anything already received REFUSES - see
+       `cancelForRequest`: cancelling does not unship a lorry. After the
+       commit, and fire-and-forget, so it cannot undo the cancellation. */
+    customerSuppliedRouting.cancelForRequest({
+      tenant: req.tenant, mrfId: mrf._id,
+      reason: `${mrf.mrfNumber} was cancelled, so this material is no longer expected.`,
+    }).catch(() => {})
     await noteInThread(req, mrf, `${actorName || "The requester"} cancelled this request. ${mrf.cancellationNote}`, actorName)
     mrfNotify.cancelled(mrf).catch(e => console.error("[mrf cancel notify]", e.message))
 

@@ -622,6 +622,32 @@ it, because the wrapper runs before the router's own auth. The machine
 register (`/api/cms/machines`) and the registered-operations routes need
 only a session and were never department-gated.
 
+## Sewing line slots on the floor plan — 2 Oct 2026
+
+`CanvasLayout.lines[]` holds the floor's sewing lines. A line is one long
+table with `slotsPerSide` (13) slots down its left and right. Its fields:
+
+- `id`, `name`, `x`, `y`, `rotation`
+- `pitch`, `tableWidth` (cm)
+- `slots: [{ side: "L" | "R", index, item, machineId }]`, holding filled slots
+  only — `item` is "machine" (a register `machineId`) or "table" (a plain
+  work table: no id, no register lookup, no limit)
+
+`POST /api/cms/production/canvas-layout` takes `lines` with the same
+undefined-means-keep rule as every other collection. Before anything is
+archived or written, `services/production/lineSlots.js` (`normaliseLines`,
+`problemsOf`, tested) bounds the shape and refuses the WHOLE save with a 400
+naming the slot when:
+
+- a machine stands in two slots;
+- a slot is given two machines;
+- an id is not a machine in the register.
+
+Slots past a line's length, and empty ones, are dropped. The machine's own
+`machinePositions` row is written by the frontend to match its slot. The
+geometry lives in the frontend's `tracker/factory/lines.js`; nothing here
+computes it.
+
 ## PPC targets: rules, the day board, speed — 27 Sep 2026
 
 **What a target may ask** — `orderTargets.service.checkTarget(companyId, moId,

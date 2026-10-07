@@ -37,6 +37,9 @@ const ENTITIES = Object.freeze([
 ]);
 
 const ALIASES = Object.freeze({
+  "employee.full_name": ["full name", "complete name"],
+  "employee.title": ["title", "salutation"],
+  "employee.nickname": ["nickname", "nick name"],
   "employee.primary_manager": ["primary manager", "reporting manager"],
   "employee.secondary_manager": ["secondary manager"],
   "employee.department": ["department"],
@@ -59,7 +62,9 @@ const ALIASES = Object.freeze({
   "employee.gender": ["gender"],
   "employee.blood_group": ["blood group"],
   "employee.marital_status": ["marital status"],
+  "employee.marriage_date": ["marriage date", "wedding date"],
   "employee.spouse_name": ["spouse name", "spouse"],
+  "employee.spouse_date_of_birth": ["spouse date of birth", "spouse dob"],
   "employee.father_name": ["father's name", "father name", "father"],
   "employee.father_date_of_birth": ["father's date of birth", "father dob"],
   "employee.mother_name": ["mother's name", "mother name", "mother"],
@@ -71,6 +76,8 @@ const ALIASES = Object.freeze({
   "employee.is_director": ["director status", "is director", "director"],
   "employee.is_international": ["international employee", "international status"],
   "employee.is_physically_challenged": ["physically challenged", "physical challenge status"],
+  "employee.shift": ["work shift", "shift"],
+  "employee.needs_to_operate": ["needs to operate", "machine operator status"],
   "compensation.configured_gross_monthly": ["gross salary", "monthly gross", "current gross"],
   "compensation.configured_basic_monthly": ["basic salary", "monthly basic"],
   "compensation.configured_hra_monthly": ["hra", "house rent allowance"],
@@ -88,6 +95,9 @@ const ALIASES = Object.freeze({
 
 const rows = [
   // Employee master — current configured/profile values.
+  ["employee.full_name", "Full name", ["firstName", "middleName", "lastName"], CURRENT, "joined_text"],
+  ["employee.title", "Title", "title", CURRENT, "text"],
+  ["employee.nickname", "Nickname", "nickName", CURRENT, "text"],
   ["employee.primary_manager", "Primary manager", "primaryManager.managerName", CURRENT, "text"],
   ["employee.secondary_manager", "Secondary manager", "secondaryManager.managerName", CURRENT, "text"],
   ["employee.department", "Department", "department", CURRENT, "text"],
@@ -110,7 +120,9 @@ const rows = [
   ["employee.gender", "Gender", "gender", CURRENT, "text"],
   ["employee.blood_group", "Blood group", "bloodGroup", CURRENT, "text"],
   ["employee.marital_status", "Marital status", "maritalStatus", CURRENT, "text"],
+  ["employee.marriage_date", "Marriage date", "marriageDate", CURRENT, "date"],
   ["employee.spouse_name", "Spouse", "spouseName", CURRENT, "text"],
+  ["employee.spouse_date_of_birth", "Spouse date of birth", "spouseDOB", CURRENT, "date"],
   ["employee.father_name", "Father", ["fatherFirstName", "fatherMiddleName", "fatherLastName"], CURRENT, "joined_text"],
   ["employee.father_date_of_birth", "Father's date of birth", "fatherDateOfBirth", CURRENT, "date"],
   ["employee.mother_name", "Mother", ["motherFirstName", "motherMiddleName", "motherLastName"], CURRENT, "joined_text"],
@@ -122,6 +134,8 @@ const rows = [
   ["employee.is_director", "Director status", "isDirector", CURRENT, "boolean"],
   ["employee.is_international", "International-employee status", "isInternational", CURRENT, "boolean"],
   ["employee.is_physically_challenged", "Physical-challenge status", "isPhysicallyChallenged", CURRENT, "boolean"],
+  ["employee.shift", "Work shift", "shift", CURRENT, "text"],
+  ["employee.needs_to_operate", "Needs-to-operate status", "needsToOperate", CURRENT, "boolean"],
 
   // Employee compensation master — configured monthly values, not payroll.
   ["compensation.configured_gross_monthly", "Configured gross monthly salary", "salary.gross", CURRENT, "money"],

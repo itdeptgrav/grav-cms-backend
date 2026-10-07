@@ -50,6 +50,7 @@ const { Acc_User } = require("../../../models/Accountant_model/Acc_OrgModels");
 
 const intake = require("../../../services/requestIntake.service");
 const autoReservation = require("../../../services/storePurchase/autoReservation.service");
+const customerSuppliedRouting = require("../../../services/storePurchase/customerSuppliedRouting.service");
 const chain = require("../../../services/spendApproval.service");
 const mrfApprover = require("../../../services/mrfApprover.service");
 const budgetMatch = require("../../../services/budgetCommitment.service");
@@ -2266,6 +2267,15 @@ const { theCompany } = require("../../../services/requests/booksCompany");
 async function reserveForSpawnedMrf(mrf, who, whoId) {
   const { company } = await theCompany();
   if (!company?._id || !mrf?._id) return;
+  /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
+     The same approval, routed the other way: a customer-supplied line
+     produces a customer-material expectation, never a reservation and
+     never a purchase. Both run after the commit for the same reason —
+     neither may be able to undo a decision a person already made. */
+  customerSuppliedRouting.routeInBackground({
+    tenant: { companyId: company._id, siteId: null },
+    mrfId: mrf._id,
+  })
   autoReservation.attemptInBackground({
     tenant: { companyId: company._id, siteId: null },
     mrfId: mrf._id,

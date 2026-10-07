@@ -50,6 +50,7 @@ const reservationSvc = require("./reservation.service");
 const customerOwnedReserve = require("./customerOwnedReserve.service");
 const locStock = require("./locationStock.service");
 const unitOfWork = require("./unitOfWork.service");
+const customerSuppliedRouting = require("./customerSuppliedRouting.service");
 const Warehouse = require("../../models/CMS_Models/Inventory/Configurations/Warehouse");
 
 /* The same strict resolver the receipt path uses: it THROWS when no conversion
@@ -101,6 +102,7 @@ const REASONS = Object.freeze({
   ALREADY_RESERVED: "ALREADY_RESERVED",
   ALREADY_SATISFIED: "ALREADY_SATISFIED",
   NOT_APPROVED: "NOT_APPROVED",
+  CUSTOMER_SUPPLIED: "CUSTOMER_SUPPLIED",
   // ATTENTION
   ITEM_MISSING: "ITEM_MISSING",
   VARIANT_MISMATCH: "VARIANT_MISMATCH",
@@ -145,6 +147,20 @@ const isApprovedRequest = (mrf) =>
  */
 function skipReason(mrf, line) {
   if (!line) return { reason: REASONS.LINE_CLOSED, message: "That line is not part of this request." };
+  /* ── THE CUSTOMER IS SENDING THIS ONE ─────────────────────────────────
+     Holding company stock against a line the customer is supplying would
+     reserve the factory's own material for a need that is not the factory's to
+     meet, and make it unavailable to the work that actually needs it. The line
+     is routed to a customer-material expectation instead - see
+     `customerSuppliedRouting.service`. Asked of that service rather than
+     re-derived here, so there is one definition of what customer-supplied
+     means. */
+  if (customerSuppliedRouting.reservationShouldSkip(line)) {
+    return {
+      reason: REASONS.CUSTOMER_SUPPLIED,
+      message: "The customer is sending this material, so no company stock is held for it.",
+    };
+  }
   if (CLOSED_LINE_STATUSES.has(line.itemStatus)) {
     return { reason: REASONS.LINE_CLOSED, message: "This line is closed — nothing is reserved against it." };
   }

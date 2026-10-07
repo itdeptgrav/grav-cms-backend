@@ -104,10 +104,18 @@ const DESTINATIONS = Object.freeze({
     description: "Store records what a transporter quoted for a lane, dated and referenced.",
     requires: { departmentSlug: "store", minimumRole: "editor" },
   },
+  /* ── THE ID IS THE ENQUIRY'S; THE SCREEN IS COST & INVOICING'S ────────
+     Sales answers this on the Cost & Invoicing stage now (30 Sep 2026), under
+     Commercial terms, above the costing the arrangement changes. The id and
+     the stored field are unchanged — it is still `enquiry.freight`, written
+     by the same route — so only the wording that tells somebody where to go
+     moved with the screen. */
   SALES_ENQUIRY_DELIVERY_TERMS: {
     id: "SALES_ENQUIRY_DELIVERY_TERMS",
-    label: "Open the enquiry delivery terms",
-    description: "Sales records who bears the delivery on this order, and where it goes.",
+    label: "Open the order's delivery terms",
+    description:
+      "Sales records who bears the delivery on this order, and where it goes — "
+      + "Commercial terms, at the top of the Cost & Invoicing stage.",
     requires: { departmentSlug: "sales", minimumRole: "editor" },
   },
   OPERATION_MASTER: {
@@ -130,8 +138,12 @@ const DESTINATIONS = Object.freeze({
      half was outstanding. */
   SALES_PAYMENT_TERMS: {
     id: "SALES_PAYMENT_TERMS",
-    label: "Open the enquiry payment terms",
-    description: "Sales records the advance, the credit period and what it is counted from.",
+    /* Same move as the delivery half above: still `enquiry.paymentTerms`,
+       answered on Cost & Invoicing rather than on Enquiry/RFQ. */
+    label: "Open the order's payment terms",
+    description:
+      "Sales records the advance, the credit period and what it is counted from — "
+      + "Commercial terms, at the top of the Cost & Invoicing stage.",
     requires: { departmentSlug: "sales", minimumRole: "editor" },
   },
   /* ── AND THE BOARD'S OWN POLICY SURFACE ───────────────────────────────

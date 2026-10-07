@@ -63,6 +63,7 @@ const authority = require("../costing/helpers/authorityChain");
 const { fingerprintId, fingerprintPart } = require("../costing/helpers/storedCosting");
 
 const bind = require("../../services/centralCosting/approvedTechnicalSource.service");
+const { assessFeasible } = require("./support/feasibility");
 
 jest.setTimeout(300000);
 
@@ -429,6 +430,9 @@ async function ieVersionTwo(w) {
   });
   expect(reviewed.status).toBe(200);
 
+  /* Assessed AFTER the rebase review, so the judgement is recorded against the
+     technical pack this version is actually engineered from. */
+  await assessFeasible(authority.call, { fileId: w.fileId, ...t });
   const submitted = await authority.call(`/engineering-files/${w.fileId}/bulletin-versions`, {
     method: "POST", ...t, body: { expectedRevision: reviewed.body.file.revision },
   });

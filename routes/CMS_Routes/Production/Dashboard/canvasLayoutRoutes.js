@@ -5,6 +5,8 @@ const router = express.Router();
 const EmployeeAuthMiddleware = require("../../../../Middlewear/EmployeeAuthMiddlewear");
 const CanvasLayout = require("../../../../models/CMS_Models/Manufacturing/Production/CanvasLayout");
 const CanvasLayoutSnapshot = require("../../../../models/CMS_Models/Manufacturing/Production/CanvasLayoutSnapshot");
+const Machine = require("../../../../models/CMS_Models/Inventory/Configurations/Machine");
+const { normaliseLines, problemsOf, machineIdsOf } = require("../../../../services/production/lineSlots");
 
 // The same omission as productionDashboardRoutes.js next door, and worse: this
 // router has a POST and a DELETE. The productionSupervisorWrites guard on the
@@ -185,10 +187,27 @@ router.post("/", async (req, res) => {
       aisles,
       fixtures,
       floor,
+      // ── Added 2 Oct 2026: the sewing lines and which machine is in which slot
+      lines: rawLines,
       orgId = "default",
     } = req.body;
 
     const employeeId = actorOf(req);
+
+    /* Checked before anything is archived or written: a machine in two slots,
+       a slot given two machines, or a machine that is not in the register
+       refuses the WHOLE save, in words, rather than storing a plan the floor
+       cannot follow. */
+    let lines;
+    if (rawLines !== undefined) {
+      lines = normaliseLines(rawLines);
+      const ids = machineIdsOf(lines);
+      const found = ids.length ? await Machine.find({ _id: { $in: ids } }).select("_id").lean() : [];
+      const problems = problemsOf(lines, new Set(found.map((m) => String(m._id))));
+      if (problems.length) {
+        return res.status(400).json({ success: false, message: problems[0], problems });
+      }
+    }
 
     const existing = await CanvasLayout.findOne({ organizationId: orgId });
 
@@ -211,6 +230,7 @@ router.post("/", async (req, res) => {
       existing.walls = keep(walls, existing.walls);
       existing.aisles = keep(aisles, existing.aisles);
       existing.fixtures = keep(fixtures, existing.fixtures);
+      existing.lines = keep(lines, existing.lines);
       if (floor !== undefined) {
         // Merged, not replaced — the client may send only the grid size.
         existing.floor = { ...(existing.floor?.toObject?.() ?? existing.floor ?? {}), ...floor };
@@ -231,6 +251,7 @@ router.post("/", async (req, res) => {
       walls: walls || [],
       aisles: aisles || [],
       fixtures: fixtures || [],
+      lines: lines || [],
       ...(floor ? { floor } : {}),
       lastUpdatedBy: employeeId,
     });

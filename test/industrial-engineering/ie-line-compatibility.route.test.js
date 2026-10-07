@@ -41,6 +41,7 @@ const IeMethodStudy = require("../../models/CMS_Models/IndustrialEngineering/IeM
 const IeLineLayout = require("../../models/CMS_Models/IndustrialEngineering/IeLineLayout");
 
 const layoutService = require("../../services/industrialEngineering/ieLineLayout.service");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, seq = 0;
 
@@ -242,6 +243,7 @@ async function approveBulletinVersion({ co, maker, approver, fileId, skip = fals
      for exactly that reason. */
   if (skip) return { version: null, fileRevision: null, fileRevisionNow: null };
   const file = await IeStyleFile.findById(fileId).lean();
+  await assessFeasible(call, { fileId: fileId, token: maker.token, company: co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: maker.token, company: co._id,
     body: { expectedRevision: file.revision },
@@ -666,6 +668,7 @@ describe("evidence and supersession", () => {
        approves a method study for it — the submit gate says so by name, which
        is where "this row has no approved standard time" is now decided. */
     const file = await IeStyleFile.findById(w.fileId).lean();
+    await assessFeasible(call, { fileId: w.fileId, token: w.maker.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${w.fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: file.revision },

@@ -87,6 +87,22 @@ handoff.
 - No receipt posting, inspection, put-away, customer-material, stock, or
   location mutation code
 
+> **One deliberate exception, 1 Oct 2026 — customer-supplied development
+> samples.** `services/storePurchase/customerSuppliedRouting.service.js` is
+> Lane A code that creates a `CustomerMaterialExpectation`, which the line above
+> excludes. The exception is recorded rather than quietly taken, because a
+> boundary that is crossed without being amended stops describing anything.
+>
+> The reason it belongs on Lane A: the trigger is **approval of a material
+> request**, which is Lane A's own event, called beside `autoReservation` on the
+> same paths. The alternative was a second approval hook on Lane B watching
+> Lane A's requests — two engines deciding the same thing.
+>
+> The boundary that does still hold is the stronger half: this service **posts no
+> receipt and moves no stock**. It opens the expectation; Lane B's receiving and
+> inspection code does everything after it. Decision record:
+> `docs/decisions/store-customer-supplied-material.md`.
+
 ## Lane B — Receive simplification
 
 Lane B owns the complete arrival-to-disposition experience for purchased and

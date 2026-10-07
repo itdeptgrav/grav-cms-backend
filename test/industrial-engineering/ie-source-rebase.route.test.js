@@ -63,6 +63,7 @@ const Operation = require("../../models/CMS_Models/Inventory/Configurations/Oper
 
 const bind = require("../../services/centralCosting/approvedTechnicalSource.service");
 const styleFiles = require("../../services/industrialEngineering/ieStyleFile.service");
+const { assessFeasible } = require("./support/feasibility");
 
 let server, base, sales, seq = 0;
 
@@ -370,6 +371,7 @@ const fileNow = (w) =>
 
 async function submitAndApprove(w, fileId) {
   const file = await fileNow(w);
+  await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
   const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
     method: "POST", token: w.maker.token, company: w.co._id,
     body: { expectedRevision: file.revision },
@@ -622,6 +624,7 @@ describe("re-basing the engineering file", () => {
     const seam = rows.find((r) => r.operationCode === "OP-SEAM");
     expect(res.body.reviewRequiredRowIds).toEqual([seam.rowId]);
 
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const blocked = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: res.body.file.revision },
@@ -638,6 +641,7 @@ describe("re-basing the engineering file", () => {
     const res = await rebase(w, fileId, { expectedRevision: file.revision });
     expect(res.body.changes.materials.changed[0].fields).toContain("allowancePercent");
 
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const blocked = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: res.body.file.revision },
@@ -650,6 +654,7 @@ describe("re-basing the engineering file", () => {
     expect(reviewed.status).toBe(200);
     expect(reviewed.body.acknowledged).toBe(true);
 
+    await assessFeasible(call, { fileId: fileId, token: w.maker.token, company: w.co._id });
     const ok = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.maker.token, company: w.co._id,
       body: { expectedRevision: reviewed.body.file.revision },
@@ -784,6 +789,7 @@ describe("R&D revision 1 → IE version 1 → costing, and again", () => {
 
     /* Submitted by somebody who ALSO holds the approver role, so the refusal
        below is about the person and not about the rung they stand on. */
+    await assessFeasible(call, { fileId: fileId, token: w.approver.token, company: w.co._id });
     const submitted = await call(`/engineering-files/${fileId}/bulletin-versions`, {
       method: "POST", token: w.approver.token, company: w.co._id,
       body: { expectedRevision: reviewed.body.file.revision },

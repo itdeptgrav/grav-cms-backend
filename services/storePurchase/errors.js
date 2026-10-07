@@ -670,6 +670,90 @@ const CODES = {
      outstanding. */
   DEVELOPMENT_MATERIALS_STALE: { status: 409, code: "DEVELOPMENT_MATERIALS_STALE" },
   PRODUCT_LINE_NOT_FOUND: { status: 404, code: "PRODUCT_LINE_NOT_FOUND" },
+
+  /* ── R&D — THE 3D GARMENT WORKSPACE ────────────────────────────────────
+     These refusals let the workspace distinguish a bad anchor, unsupported
+     asset, oversized file and a lifecycle conflict without guessing from a
+     generic validation message. */
+  MODEL_ANCHOR_INVALID: { status: 422, code: "MODEL_ANCHOR_INVALID" },
+  MODEL_ANCHOR_UNKNOWN: { status: 422, code: "MODEL_ANCHOR_UNKNOWN" },
+  MODEL_FILE_TOO_LARGE: { status: 413, code: "MODEL_FILE_TOO_LARGE" },
+  /* The points do not describe a measurement — too few, too many, or all in
+     the same place. 422 rather than 400 because the request is well formed and
+     the problem is what it says, which is the distinction this table exists
+     to keep. */
+  MODEL_MEASUREMENT_INVALID: { status: 422, code: "MODEL_MEASUREMENT_INVALID" },
+
+  /* ── THE PATTERN IS THE DESIGN, THE 3D IS A PICTURE OF IT ─────────────
+     409 rather than 403 on each of these: nothing about the request is
+     unauthorised and nothing about it is malformed. The caller asked for a
+     thing that is not true of this record — an approved revision cannot be
+     rewritten, a derived preview cannot be annotated, a drape cannot start
+     without the inputs a solver needs. Each names the state so a screen can
+     say what to do instead. */
+  PATTERN_REVISION_FROZEN: { status: 409, code: "PATTERN_REVISION_FROZEN" },
+  PATTERN_UNREADABLE: { status: 422, code: "PATTERN_UNREADABLE" },
+  DERIVED_PREVIEW_READ_ONLY: { status: 409, code: "DERIVED_PREVIEW_READ_ONLY" },
+  SIMULATION_INPUTS_MISSING: { status: 422, code: "SIMULATION_INPUTS_MISSING" },
+  SIMULATION_ENGINE_NOT_CONNECTED: { status: 503, code: "SIMULATION_ENGINE_NOT_CONNECTED" },
+  RENDER_ALREADY_RUNNING: { status: 409, code: "RENDER_ALREADY_RUNNING" },
+  /* A render that produced a model publication, or has not finished, has no
+     drape geometry to send. A state, not a missing record. */
+  NO_DRAPE: { status: 409, code: "NO_DRAPE" },
+  /* A drape that is still beating its heartbeat is not abandoned, and "clear"
+     is for work nobody is doing. */
+  RENDER_STILL_RUNNING: { status: 409, code: "RENDER_STILL_RUNNING" },
+  MODEL_PREVIEW_UNSUPPORTED: { status: 415, code: "MODEL_PREVIEW_UNSUPPORTED" },
+  MODEL_SELF_APPROVAL: { status: 409, code: "MODEL_SELF_APPROVAL" },
+  MODEL_SOURCE_UNSUPPORTED: { status: 415, code: "MODEL_SOURCE_UNSUPPORTED" },
+  MODEL_STATE_CONFLICT: { status: 409, code: "MODEL_STATE_CONFLICT" },
+  MODEL_TOO_COMPLEX: { status: 422, code: "MODEL_TOO_COMPLEX" },
+  MODEL_UNREADABLE: { status: 415, code: "MODEL_UNREADABLE" },
+  MODEL_WEB_FILE_REQUIRED: { status: 400, code: "MODEL_WEB_FILE_REQUIRED" },
+  REVISION_CONFLICT: { status: 409, code: "REVISION_CONFLICT" },
+
+  /* ── R&D — THE FLAT PATTERN AND THE TECHNICAL BUNDLE ───────────────────
+     Registered for the reason this table states a few entries down: an
+     unlisted code silently becomes VALIDATION, and the upload screen reacts
+     differently to each of these. A file on the wrong card is corrected by
+     dragging it; a file that is not a pattern at all is corrected in CAD; a
+     pattern too large is corrected by exporting fewer sizes; and a bundle whose
+     files contradict each other is not correctable at the upload at all. One
+     generic "VALIDATION" for all four would leave the person guessing which. */
+
+  /* The bytes are not a readable DXF, or are a truncated one. 415 beside
+     MODEL_UNREADABLE, which is the same statement about the model. */
+  PATTERN_UNREADABLE: { status: 415, code: "PATTERN_UNREADABLE" },
+  /* Too many pieces or too many points to store whole. 413 rather than 422:
+     the request is well formed and the entity is simply too large, and the fix
+     is to send less of it. */
+  PATTERN_TOO_LARGE: { status: 413, code: "PATTERN_TOO_LARGE" },
+  PATTERN_FILE_REQUIRED: { status: 400, code: "PATTERN_FILE_REQUIRED" },
+  /* Asked for the pattern, or to map it, on a bundle that has none. 409 because
+     nothing is wrong with the request — the bundle is not in a state that has
+     an answer. */
+  PATTERN_NOT_PUBLISHED: { status: 409, code: "PATTERN_NOT_PUBLISHED" },
+  /* Asked to recover a pattern revision from a style whose publications carry
+     no parsed pattern. 409 for the same reason: the request is well formed and
+     there is simply nothing to recover — the answer is to import the DXF. */
+  NO_PATTERN_TO_RECOVER: { status: 409, code: "NO_PATTERN_TO_RECOVER" },
+
+  /* The contents contradict the upload card the file arrived on. Distinct from
+     PATTERN_UNREADABLE and MODEL_UNREADABLE on purpose: this file IS readable
+     and IS valid, and it is on the wrong card — which the person fixes by
+     moving it rather than by re-exporting anything. */
+  BUNDLE_FILE_MISMATCH: { status: 415, code: "BUNDLE_FILE_MISMATCH" },
+  BUNDLE_FILE_UNRECOGNISED: { status: 415, code: "BUNDLE_FILE_UNRECOGNISED" },
+  /* A blocking finding stands — the bundle's own files describe two different
+     garments, or a scale that cannot be right. 409, and never 422: the request
+     to approve is well formed and it is the RECORD that is not in a state
+     anybody may accept. */
+  BUNDLE_NOT_APPROVABLE: { status: 409, code: "BUNDLE_NOT_APPROVABLE" },
+  /* A .gltf whose geometry or textures are in files beside it. It would store
+     cleanly and render as an empty viewport, so it is refused with the one fix
+     that works: export GLB. */
+  MODEL_ASSETS_MISSING: { status: 422, code: "MODEL_ASSETS_MISSING" },
+
   /* ── IE CHUNK 1D — A WORK ORDER MUST KNOW ITS STYLE ─────────────────────
    * Registered rather than left to fall through to VALIDATION, which is what
    * an unlisted code silently becomes: an operator told "VALIDATION" cannot
@@ -766,6 +850,12 @@ const CODES = {
      applicability nobody stated, a predecessor that is later, missing or does
      not apply. 400, naming every entry at once. */
   IE_PROCESS_ROUTE_INVALID: { status: 400, code: "IE_PROCESS_ROUTE_INVALID" },
+  /* ── IE — ENGINEERING FEASIBILITY ─────────────────────────────────────────
+   * A result the findings do not support, a finding that names no area or
+   * desk, or a resolution with nothing said about it: 400, naming the entry.
+   * The conflict is 409 like every other optimistic-lock refusal in IE. */
+  IE_FEASIBILITY_INVALID: { status: 400, code: "IE_FEASIBILITY_INVALID" },
+  IE_FEASIBILITY_REVISION_CONFLICT: { status: 409, code: "IE_FEASIBILITY_REVISION_CONFLICT" },
   IE_BULLETIN_ROW_DUPLICATE: { status: 400, code: "IE_BULLETIN_ROW_DUPLICATE" },
   /* An operation this company's library does not hold — unknown, another
      company's, or not an id at all. One answer for all three. */

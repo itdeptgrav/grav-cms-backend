@@ -152,6 +152,33 @@ const mrfItemSchema = new mongoose.Schema(
     purchaseRequisitionNumber: { type: String, trim: true, default: "" },
     purchaseFormRaisedAt: { type: Date, default: null },
 
+    /* ── WHO IS SUPPLYING THIS LINE ──────────────────────────────────────────
+     * Two answers, and they route to completely different work:
+     *
+     *   COMPANY_FULFILLED — the factory provides it. Stock is checked, held and
+     *                       issued; a shortfall becomes a purchase request. The
+     *                       behaviour every existing line has.
+     *   CUSTOMER_SUPPLIED — the customer is sending it. Nothing is reserved,
+     *                       no spend request is raised and no purchase order can
+     *                       ever exist; a customer-material expectation is
+     *                       created instead and Store receives against it.
+     *
+     * ── WHY THE LINE AND NOT THE REQUEST ─────────────────────────────────────
+     * One development request routinely contains both: the customer sends the
+     * fabric and the factory buys the trims. A request-level answer would force
+     * that into a lie, and the person raising it would have to split one piece
+     * of work into two documents to tell the truth.
+     *
+     * Defaulted to COMPANY_FULFILLED so every line that exists today, and every
+     * line raised by a screen that has not learned about this, keeps exactly the
+     * behaviour it has.
+     */
+    supplySource: {
+      type: String,
+      enum: ["COMPANY_FULFILLED", "CUSTOMER_SUPPLIED"],
+      default: "COMPANY_FULFILLED",
+    },
+
     /* ── WHERE THIS LINE MUST COME FROM, WHEN SOMEBODY SAID ──────────────────
      * A request that names a warehouse is naming a REQUIREMENT, not a
      * preference: the material has to come from that site because that is where
@@ -267,6 +294,39 @@ const mrfSchema = new mongoose.Schema(
     requestedForId: { type: String, trim: true, default: "" }, // employee ID / badge
 
     // How the MRF was created
+    /* ── WHAT WORK THIS REQUEST IS FOR ───────────────────────────────────────
+     * The requester is asked ONE thing — what the material is for — and the
+     * system infers the rest. They are never asked which document type should be
+     * created, whether a receipt is needed, or how the stock should be valued:
+     * those are consequences of the answer, not further questions.
+     *
+     * `GENERAL` is the default and means what every request has meant until now.
+     */
+    purpose: {
+      type: String,
+      enum: ["GENERAL", "PRODUCTION", "DEVELOPMENT_SAMPLE", "TESTING"],
+      default: "GENERAL",
+    },
+
+    /* ── THE WORK CONTEXT, AS A REFERENCE AND NEVER AS TEXT ──────────────────
+     * At most ONE of these. A development for a sample, an execution file for a
+     * confirmed order — and nothing for the ordinary request that is simply for
+     * the factory.
+     *
+     * They are references because the customer's identity is resolved THROUGH
+     * them on the server. A free-text order number could not be walked to an
+     * owner, and a `customerId` accepted from the request would let whoever
+     * fills the form decide whose fabric arrives — which is the one thing
+     * ownership must never depend on. The MRF is the demand; Merchandising and
+     * Sales are the authority for who the customer is.
+     *
+     * Stamped automatically when a request is raised from a development, so the
+     * requester is not asked a question the screen they came from already knows
+     * the answer to.
+     */
+    developmentFileId: { type: mongoose.Schema.Types.ObjectId, ref: "Development", default: null, index: true },
+    executionFileId: { type: mongoose.Schema.Types.ObjectId, ref: "ExecutionFile", default: null, index: true },
+
     // SELF     → employee raised it themselves via Cowork
     // BYPASS   → store raised it on behalf of the employee
     creationMode: {
@@ -557,6 +617,19 @@ mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "",
  * The read-last fallback survives for company-less records only — legacy
  * fixtures and pre-boundary data, which no longer grow.
  */
+/* ── AT MOST ONE WORK CONTEXT ────────────────────────────────────────────────
+   A request cannot be for a development AND for a confirmed order: they are
+   different pieces of work with different customers, and whichever one a reader
+   looked at would be arbitrary. Neither is the ordinary case and stays allowed. */
+mrfSchema.pre("validate", function enforceOneWorkContext(next) {
+  if (this.developmentFileId && this.executionFileId) {
+    return next(new Error(
+      "A material request is for a development or for a confirmed order, never for both.",
+    ));
+  }
+  return next();
+});
+
 mrfSchema.pre("validate", async function (next) {
   if (this.mrfNumber) return next();
 
