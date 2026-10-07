@@ -1,7 +1,7 @@
 /**
  * PUT A PREPARED MASTER INTO A PRODUCT — what a designer does in the editor, done from a reviewed file.
  *
- *     node scripts/onboard/onboardProduct.js <prepared.json> [--dry-run]
+ *     node scripts/onboard/onboardProduct.js <prepared.json> [--dry-run] [--replace-svg]
  *     node scripts/onboard/onboardProduct.js --restore <backup.json>
  *
  * The prepared file comes from grav-cad-desktop/tools/onboard/prepare.mjs, which reads the SVG with the editor's own
@@ -27,6 +27,8 @@ const PatternGradingConfig = require("../../models/CMS_Models/Manufacturing/Patt
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
+/* --replace-svg: the designer has a NEW drawing for the master; upload it over the one stored (the backup keeps the old) */
+const REPLACE_SVG = args.includes("--replace-svg");
 const BACKUPS = path.join(__dirname, "backups");
 fs.mkdirSync(BACKUPS, { recursive: true });
 
@@ -72,7 +74,7 @@ async function main() {
   /* ── the SVG: keep the designer's own upload; otherwise upload the file the master was prepared from ── */
   let file = null;
   const existingMaster = config?.sizePatterns?.find((p) => p.sizeName === master);
-  if (existingMaster?.svgPublicId) {
+  if (existingMaster?.svgPublicId && !REPLACE_SVG) {
     file = { url: existingMaster.svgFileUrl, fileId: existingMaster.svgPublicId, name: existingMaster.originalFilename, bytes: existingMaster.bytes };
     console.log(`  master SVG already uploaded: ${file.name} (${file.fileId}) — kept`);
   } else {
