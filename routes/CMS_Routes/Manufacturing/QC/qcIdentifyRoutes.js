@@ -38,6 +38,7 @@ const { resolveQcActor, mayInspect } = require("../../../../services/manufacturi
 const { findWorkOrderByShortId } = require("../../../../services/manufacturing/workOrderShortId");
 const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarcodeIdentity");
 const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
+const qcGrns = require("../../../../services/manufacturing/qcRawItemGrns");
 const Barcode = require("../../../../models/CMS_Models/Inventory/Operations/Barcode");
 const QCRawItemInspection = require("../../../../models/CMS_Models/Manufacturing/QC/QCRawItemInspection");
 
@@ -170,13 +171,16 @@ router.post("/identify-barcode", qcAuth, async (req, res) => {
       });
     }
 
+    /* The GRN the label was printed on (8 Oct 2026): read once, handed to the
+       resolver so the order it was received for is the answer, and shown. */
+    const receipt = await qcGrns.receiptOfLabel(b);
     const [resolution, priors] = await Promise.all([
-      qcOrders.resolveOrdersForLabel(b),
+      qcOrders.resolveOrdersForLabel(b, receipt),
       QCRawItemInspection.find({ barcodeId: b._id, superseded: { $ne: true } })
         .select("moNumber manufacturingOrderId status passedQuantity defectiveQuantity inspectedAt inspectedByName")
         .lean(),
     ]);
-    const src = qcOrders.labelSource(b);
+    const src = qcOrders.labelSource(b, receipt);
 
     const warnings = [];
     if (!(b.quantity > 0)) warnings.push("This label shows no quantity left — it was used up.");
@@ -206,6 +210,13 @@ router.post("/identify-barcode", qcAuth, async (req, res) => {
         vendorName: str(b.vendorName),
         purchaseOrderNumber: str(b.purchaseOrderNumber),
         goodsReceiptNumber: str(b.goodsReceiptNumber) || str(b.customerMaterial?.goodsReceiptNumber),
+        goodsReceiptId: receipt ? receipt.goodsReceiptId : null,
+        /* the receipt, the request and the order it serves — what the checker
+           sees after the scan and what the save records */
+        goodsReceipt: receipt,
+        /* a label with no receipt: the material-request GRNs carrying this
+           material, for the checker to choose from on the spot */
+        grnChoices: resolution.grnChoices || [],
         customerOrderRef: str(b.customerMaterial?.orderRef),
         customerLabel: str(b.customerMaterial?.customerLabel),
         printedAt: b.createdAt || null,

@@ -1286,3 +1286,96 @@ backdating is normal and there is no company backdating window to enforce.
 `test/hr-access/leave-before-joining.route.test.js` drives the real router.
 That record (GR0087, still `pending`) was left for the employee to withdraw and
 re-apply, by the owner's choice.
+
+## One goods receipt as a document; Receive lists material requests (7 Oct 2026)
+
+`services/storePurchase/goodsReceiptDocument.service.js` reads any GRN as a
+document: `document(tenant, grnId)` returns the receipt header, its source
+(purchase: PO and supplier; material-request: request, order, customer, PI;
+customer-material: document and customer), its lines (ordered, previously
+received, received, invoiced, difference, pending after, base quantity, labels
+activated) and totals. `listForSource(tenant, {purchaseOrderId |
+materialRequestId})` lists a source's GRNs. Read-only; figures are the GRN's
+own. Routes on `goodsReceipts.js`, declared before `/:grnId`:
+
+- `GET /api/cms/store/goods-receipts/for-source?purchaseOrderId=` (or
+  `materialRequestId=`)
+- `GET /api/cms/store/goods-receipts/:grnId/document`
+
+`receiveWorkspace.service` has a fourth source, `material-request`
+(`?source=material` is shorthand). Expected rows are submitted merchandising
+requests with a line pending, read through `materialRequestReceipt.registerRows`;
+their action is `RECEIVE_MATERIAL` to the request's receive page.
+
+**8 Oct 2026, owner:** `stage=all` lists RECORDED receipts only — the Receive
+list is the GRN register; expected arrivals are read only by Record receipt's
+picker (`stage=expected`). And a `MATERIAL_REQUEST` GRN goes through the same
+receipt control as a purchase GRN (`deriveControl`: awaiting inspection ->
+quarantine -> put-away), named by the order's customer. Only
+`POST /:grnId/supplier-returns` refuses it (`reason: "NO_SUPPLIER"`); `/control`
+returns `goodsReceipt.materialRequest`. QC's raw-item order page counts these
+GRNs as "received" for the order (`materialRequest.customerRequestId`), beside
+customer-supplied ones. Store inspection needs a receiving location
+(`NO_RECEIVING_LOCATION`), which no GRN has had since the destination panel left
+the receive pages on 1 Oct 2026 — true for purchase GRNs too.
+
+Only three GRNs existed on 7 Oct 2026, all against material requests
+(GRN/2026-27/0001–0003). The purchase-order wording of the document was checked
+with a synthetic receipt, not a recorded one.
+
+## Raw-material QC reads the GRN a label came from (8 Oct 2026)
+
+A label printed on a material-request GRN carries `Barcode.goodsReceiptId`,
+and the GRN names the request and the order it serves. QC never read it: a
+scan of such a label offered a chooser of unrelated orders ("requires this
+material") and called the source "Unavailable". Now:
+
+- `services/manufacturing/qcRawItemGrns.js` — `receiptOfLabel(b)` (the GRN,
+  request, order, customer and the label's line), `grnsForMaterial({rawItemId,
+  variantId})` (material-request GRNs whose lines carry that material; a line
+  with no variant matches any), `listGrns({q,status,customer})` and
+  `grnDetail(id)` (per line: received vs checked vs remaining, per unit; every
+  label with its verdict; every record). Routes on the raw-item router:
+  `GET /raw-items/grns`, `GET /raw-items/grns/:grnId`.
+- `qcRawItemOrders.resolveOrdersForLabel(b, receipt)`: signal 0 is the GRN's
+  order (`matchedBy: "label"`, auto). A label with NO receipt gets
+  `grnChoices` (the GRNs carrying its material) and their orders as
+  `"grn-for-material"` candidates, ahead of the requirement match. `labelSource`
+  answers `MATERIAL_REQUEST` for a receipt label. `eligibleOrders` counts a
+  material-request GRN as `received`.
+- `/identify-barcode` and `/lookup` return `goodsReceipt` (in `context` on
+  identify) and `grnChoices`. `/save` accepts `goodsReceiptId`: for a label
+  that names no receipt it must be one of `grnsForMaterial`'s, the record is
+  stamped with it AND the label is linked (`goodsReceiptId/Number/LineId` set
+  where null) so the next scan resolves alone. A label that names a receipt
+  keeps it. `QCRawItemInspection` gained `goodsReceiptId` (indexed),
+  `goodsReceiptNumber`, `goodsReceiptLineId`, `materialRequestId`,
+  `materialRequestNumber`; records saved before carry none and so are not
+  in the GRN book.
+
+Verified 8 Oct 2026 through the API: a GRN/2026-27/0002 label resolved
+straight to MO-REQ-2026-0041; a copied label with no receipt was offered
+GRN 0002 and 0001, a pass saved against 0001 linked it (`labelLinked:
+true`), the next identify resolved via the label, and the GRN book showed
+0001 complete; the test label and its verdict were then deleted.
+
+### QC's check is the Store's inspection of a material-request GRN; a label with no receipt is offered every GRN (8 Oct 2026, later)
+
+- `services/storePurchase/qcInspectionBridge.js` — `qcStandingFor(grns)` /
+  `qcStandingOf(grn)`: QC's standing `QCRawItemInspection` records per
+  MATERIAL_REQUEST GRN, per line (a record with no line sits on the line
+  carrying its material). When every line is checked in full it hands back an
+  inspection shaped like the Store's own (`source: "qc"`, accepted = passed
+  capped at received, rejected = the rest, nothing quarantined); otherwise
+  `progress` (`anyChecked`, `text` "20 of 20 Mtr", checkers). Used by
+  `receiveWorkspace.readRecordedReceipts` (controlStage "Awaiting QC check" /
+  "QC checking · …" / "Checked by QC · awaiting put-away") and by
+  `GET /goods-receipts/:grnId/control` (`inspection.source`, `qcProgress`).
+  `deriveControl` takes `ctx.noSupplier`: rejected stock never holds such a
+  receipt at "supplier return required". `POST /:grnId/inspection` refuses a
+  material-request GRN (`INSPECTED_BY_QC`). It reads only; put-away still
+  needs a receiving location on the GRN (`NO_RECEIVING_LOCATION`).
+- `qcRawItemGrns.grnsForMaterial` falls back to EVERY recent material-request
+  GRN (`carriesMaterial: false`, `line: null`, `materials[]`) when none
+  carries the label's raw item + variant, so the checker can still say which
+  delivery it came with; `/save` links the label to it with no line id.

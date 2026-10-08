@@ -24,6 +24,7 @@
 
 const mongoose = require("mongoose");
 const { SETTLED_SAMPLE_STATUSES } = require("../sampleReadiness");
+const { resolveOrderFulfilmentModel } = require("../../constants/orderFulfilment");
 
 const model = (name, path) => (mongoose.models[name] || require(path));
 const SampleStyle = () => model("SampleStyle", "../../models/CMS_Models/Sales/SampleStyle");
@@ -112,4 +113,32 @@ async function linkMissingLineStyles(request, ctx = {}) {
   return linked;
 }
 
-module.exports = { settledStylesFor, pickStyle, resolveStyleForStockItem, linkMissingLineStyles, accountIdForCustomer };
+/**
+ * The enquiry line a style was raised for — its `productLineRef` and the
+ * Job work / Full package tag Sales set on it (7 Oct 2026).
+ *
+ * The order form raises lines from the PRODUCT and sends neither, so every
+ * order it made was FULL_PACKAGE whatever the enquiry said, and a job-work
+ * order could not be released from the Sales screens at all. The enquiry route
+ * (`proformaRequest.service`) copies the same two facts from the same row; this
+ * lets the order form do so too. A style with no enquiry line (a house sample)
+ * answers null and the line keeps the default.
+ * @returns {Promise<{productLineRef: string|null, fulfilmentModel: string}|null>}
+ */
+async function enquiryLineForStyle(styleId) {
+  if (!isId(styleId)) return null;
+  const style = await SampleStyle().findById(oid(styleId))
+    .select("enquiryId enquiryProductId").lean();
+  if (!style?.enquiryId || !style.enquiryProductId) return null;
+  const Enquiry = model("Enquiry", "../../models/CMS_Models/Sales/Enquiry");
+  const enquiry = await Enquiry.findById(style.enquiryId)
+    .select("fulfilmentModel products._id products.productLineRef products.fulfilmentModel").lean();
+  const row = (enquiry?.products || []).find((p) => str(p._id) === str(style.enquiryProductId));
+  if (!row) return null;
+  return {
+    productLineRef: str(row.productLineRef) || null,
+    fulfilmentModel: resolveOrderFulfilmentModel(row.fulfilmentModel || enquiry.fulfilmentModel),
+  };
+}
+
+module.exports = { settledStylesFor, pickStyle, resolveStyleForStockItem, linkMissingLineStyles, accountIdForCustomer, enquiryLineForStyle };

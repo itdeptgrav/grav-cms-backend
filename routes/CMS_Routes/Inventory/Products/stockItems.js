@@ -1117,7 +1117,10 @@ router.get("/", async (req, res) => {
     const [totalItems, stockItems, statsAgg, missingRawItemsAgg, missingOperationsAgg] = await Promise.all([
       StockItem.countDocuments(filter),
       StockItem.find(filter)
-        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations genderCategory")
+        /* `attributes` and `baseSalesPrice` added 7 Oct 2026: the PI form
+           reads this list when it offers every product, and builds its size
+           table from them. Additive — every earlier field is unchanged. */
+        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice baseSalesPrice status images variants attributes hsnCode profitMargin operations genderCategory")
         .sort({ createdAt: -1 }).skip(skip).limit(limitNum),
       StockItem.aggregate([{
         $group: {

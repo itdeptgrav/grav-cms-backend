@@ -771,3 +771,98 @@ describe("identity: reading needs capability, acting needs a named employee", ()
     expect((await call(ceo, "/")).body.serviceOrders).toHaveLength(0);
   });
 });
+
+/* ══ STORE RAISES A SERVICE ORDER DIRECTLY (7 Oct 2026) ═════════════════════
+   No request behind it: the order is made from the form, numbered and priced
+   on the server, opens as a DRAFT, and — since Store is the only department
+   involved — Store accepts it at the end. */
+describe("a service order raised directly by Store", () => {
+  const Service = require("../../models/CMS_Models/Inventory/Services/Service");
+  const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+
+  const mkService = (s, over = {}) => Service.create({
+    companyId: s.company._id, serviceCode: `SVC-D${seq++}`, name: `Machine servicing ${seq}`,
+    billingUnit: "visit", sacCode: "998719", status: "ACTIVE", ...over,
+  });
+
+  test("creates a numbered DRAFT with server-computed totals and the master's snapshot", async () => {
+    const s = await seed();
+    const svc = await mkService(s);
+    const v = await Vendor.create({ companyName: "Fix It Co", gstNumber: "21ABCDE1234F1Z5", companyId: s.company._id });
+    const r = await call(s.store, "/", { method: "POST", body: {
+      vendor: String(v._id), title: "Sewing machine servicing", purpose: "Quarterly check",
+      expectedStartDate: "2026-10-10", expectedCompletionDate: "2026-10-12",
+      lines: [
+        { service: String(svc._id), quantity: 2, rate: 1500, gstRate: 18, totalAmount: 1 },
+        { description: "Needle bar replacement", billingUnit: "job", quantity: 1, rate: 800, gstRate: 5 },
+      ],
+      status: "ACCEPTED", serviceOrderNumber: "FAKE-1",
+    } });
+    expect(r.status).toBe(201);
+    const so = r.body.serviceOrder;
+    expect(so.status).toBe("DRAFT");                         // never from the body
+    expect(so.serviceOrderNumber).toMatch(/^SVO\//);         // never from the body
+    expect(so.origin).toBe("direct");
+    expect(so.spendRequestId).toBeNull();
+    expect(so.vendorName).toBe("Fix It Co");
+    expect(so.vendorGstin).toBe("21ABCDE1234F1Z5");
+    expect(so.lines[0].serviceCode).toBe(svc.serviceCode);
+    expect(so.lines[0].sacCode).toBe("998719");
+    expect(so.lines[0].billingUnit).toBe("visit");
+    expect(so.lines[0].lineTotal).toBe(3540);                // 2 × 1500 + 18%
+    expect(so.lines[1].lineTotal).toBe(840);                 // 800 + 5%
+    expect(so.subtotal).toBe(3800);
+    expect(so.taxAmount).toBe(580);
+    expect(so.totalAmount).toBe(4380);
+    expect(so.taxMode).toBe("MIXED_RATE");
+    expect(so.requestedByName).toBeTruthy();
+    expect(await PurchaseOrder.countDocuments({})).toBe(0);
+  });
+
+  test("Store runs it end to end and accepts it itself", async () => {
+    const s = await seed();
+    const r = await call(s.store, "/", { method: "POST", body: {
+      vendorName: "Local electrician", lines: [{ description: "Rewire cutting table", quantity: 1, rate: 2000 }],
+    } });
+    expect(r.status).toBe(201);
+    const id = r.body.serviceOrder._id;
+    for (const [ep, st] of [["issue", "ISSUED"], ["start", "IN_PROGRESS"], ["report-completion", "COMPLETION_REPORTED"]]) {
+      expect((await call(s.store, `/${id}/${ep}`, { method: "PATCH", body: {} })).body.serviceOrder.status).toBe(st);
+    }
+    const det = await call(s.store, `/${id}`);
+    expect(det.body.viewer.canAccept).toBe(true);
+    const acc = await call(s.store, `/${id}/accept`, { method: "PATCH", body: { note: "done well" } });
+    expect(acc.status).toBe(200);
+    expect(acc.body.serviceOrder.status).toBe("ACCEPTED");
+    /* Somebody outside Store still cannot accept it. */
+    const r2 = await call(s.store, "/", { method: "POST", body: { vendorName: "X", lines: [{ description: "Y", quantity: 1, rate: 1 }] } });
+    await ServiceOrder.updateOne({ _id: r2.body.serviceOrder._id }, { $set: { status: "COMPLETION_REPORTED" } });
+    expect((await call(s.other, `/${r2.body.serviceOrder._id}/accept`, { method: "PATCH", body: {} })).status).toBe(403);
+  });
+
+  test("an order made from a request is still accepted only by its requester", async () => {
+    const s = await seed();
+    const so = await mkOrder(s, { status: "COMPLETION_REPORTED" });
+    expect((await call(s.store, `/${so._id}/accept`, { method: "PATCH", body: {} })).status).toBe(403);
+  });
+
+  test("refuses what it should, and says why", async () => {
+    const s = await seed();
+    const viewer = await personWithRole("store", "viewer");
+    expect((await call(viewer, "/", { method: "POST", body: { vendorName: "X", lines: [{ description: "Y", quantity: 1, rate: 1 }] } })).status).toBe(403);
+    expect((await call(s.requester, "/", { method: "POST", body: { vendorName: "X", lines: [{ description: "Y", quantity: 1, rate: 1 }] } })).status).toBe(403);
+
+    const noVendor = await call(s.store, "/", { method: "POST", body: { lines: [{ description: "Y", quantity: 1, rate: 1 }] } });
+    expect(noVendor.status).toBe(400); expect(noVendor.body.field).toBe("vendor");
+    const noLines = await call(s.store, "/", { method: "POST", body: { vendorName: "X", lines: [] } });
+    expect(noLines.status).toBe(400); expect(noLines.body.field).toBe("lines");
+    const zeroQty = await call(s.store, "/", { method: "POST", body: { vendorName: "X", lines: [{ description: "Y", quantity: 0, rate: 1 }] } });
+    expect(zeroQty.status).toBe(400); expect(zeroQty.body.message).toMatch(/quantity/);
+    const inactive = await mkService(s, { status: "INACTIVE" });
+    const r = await call(s.store, "/", { method: "POST", body: { vendorName: "X", lines: [{ service: String(inactive._id), quantity: 1, rate: 1 }] } });
+    expect(r.status).toBe(400); expect(r.body.message).toMatch(/inactive/);
+    const backwards = await call(s.store, "/", { method: "POST", body: { vendorName: "X", expectedStartDate: "2026-10-12", expectedCompletionDate: "2026-10-10", lines: [{ description: "Y", quantity: 1, rate: 1 }] } });
+    expect(backwards.status).toBe(400);
+    expect(await ServiceOrder.countDocuments({ origin: "direct", companyId: s.company._id })).toBe(0);
+  });
+});

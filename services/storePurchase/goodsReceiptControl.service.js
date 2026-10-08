@@ -151,7 +151,10 @@ function deriveControl(goodsReceipt, inspection = null, putaways = [], ctx = {},
   // any quantity summary is grouped STRICTLY by normalised unit.
   const hasRemainingToPutAway = inspected && lines.some((x) => x.remainingToPutAway > TOL);
   const hasUnresolvedQuarantine = inspected && lines.some((x) => x.unresolvedQuarantine > TOL);
-  const hasRejectedAwaitingReturn = inspected && lines.some((x) => x.rejectedAwaitingReturn > TOL);
+  /* A receipt with no supplier (a material-request GRN, 8 Oct 2026) has nobody
+     to return rejected stock to: the rejected figure is reported on the line
+     and never holds the receipt at "supplier return required". */
+  const hasRejectedAwaitingReturn = inspected && !ctx.noSupplier && lines.some((x) => x.rejectedAwaitingReturn > TOL);
   const remainingToPutAwayByUnit = {};
   for (const x of lines) {
     if (x.remainingToPutAway > TOL) remainingToPutAwayByUnit[x.unit || "?"] = r4((remainingToPutAwayByUnit[x.unit || "?"] || 0) + x.remainingToPutAway);
@@ -190,7 +193,7 @@ function deriveControl(goodsReceipt, inspection = null, putaways = [], ctx = {},
   const canInspect = !inspected && lines.length > 0 && Boolean(ctx.receivingLocationActive);
   const canPutaway = inspected && hasRemainingToPutAway && Boolean(ctx.receivingLocationActive);
   const canDisposition = inspected && hasUnresolvedQuarantine && Boolean(ctx.receivingLocationActive);
-  const canSupplierReturn = inspected && hasRejectedAwaitingReturn && Boolean(ctx.receivingLocationActive);
+  const canSupplierReturn = inspected && hasRejectedAwaitingReturn && !ctx.noSupplier && Boolean(ctx.receivingLocationActive);
   if (canPutaway && !ctx.usableAvailable) {
     blockers.push({ code: "NO_USABLE_LOCATION", message: "This warehouse has no active usable-stock location to put stock away into." });
   }

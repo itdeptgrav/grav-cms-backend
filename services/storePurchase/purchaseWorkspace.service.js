@@ -195,6 +195,9 @@ function inferredViewFor(poStatus) {
   return stage ? { stage, status: STATUS_FILTER.OPEN } : null;
 }
 
+const KIND = Object.freeze({ ALL: "all", PURCHASE_ORDER: "purchase-orders", MATERIAL_REQUEST: "material-requests" });
+const KINDS = Object.freeze(Object.values(KIND));
+
 function readQuery(q = {}) {
   /* Whether the caller CHOSE a stage, as opposed to getting the default. An
      explicit stage always wins; the exact status then only narrows it. */
@@ -202,6 +205,11 @@ function readQuery(q = {}) {
   const explicitStatus = STATUS_FILTERS.includes(str(q.status)) ? str(q.status) : null;
 
   const type = TYPES.includes(str(q.type)) ? str(q.type) : TYPE.ALL;
+  /* ── WHICH DOCUMENTS (7 Oct 2026) ──────────────────────────────────────
+     `kind` tells purchase orders from Merchandising's material requests —
+     the latter raised against a released order with no supplier and no
+     price, received against on their own pages. `type` was already taken. */
+  const kind = KINDS.includes(str(q.kind)) ? str(q.kind) : KIND.ALL;
   const page = Math.max(1, parseInt(q.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 25));
 
@@ -236,7 +244,7 @@ function readQuery(q = {}) {
   const ordersOnly = str(q.records) === "orders";
 
   return {
-    stage, type, status, search: str(q.search).slice(0, 200), page, pageSize,
+    stage, type, kind, status, search: str(q.search).slice(0, 200), page, pageSize,
     vendor, poStatus,
     /* So the page can tell whether a status it sent was honoured, and avoid
        showing a chip for a filter the server ignored. */
@@ -652,7 +660,7 @@ function summarise(rows) {
  */
 async function workspace(tenant, ctx, query = {}) {
   const {
-    stage, type, status, search, page, pageSize, vendor, poStatus,
+    stage, type, kind, status, search, page, pageSize, vendor, poStatus,
     poStatusApplied, stageInferred, ordersOnly,
   } = readQuery(query);
   /* Asking for a supplier or a purchase-order status is asking about material
@@ -674,11 +682,23 @@ async function workspace(tenant, ctx, query = {}) {
     }
   };
 
-  const wantMaterial = type === TYPE.ALL || type === TYPE.MATERIAL;
-  const wantService = !materialOnly && (type === TYPE.ALL || type === TYPE.SERVICE);
-  const wantFreight = !materialOnly && (type === TYPE.ALL || type === TYPE.FREIGHT);
+  /* A supplier or an exact PO status names a purchase order; the material
+     requests are then not asked for. Otherwise `kind` decides. */
+  const wantOrders = kind !== KIND.MATERIAL_REQUEST;
+  const wantRequests = !materialOnly && kind !== KIND.PURCHASE_ORDER && (type === TYPE.ALL || type === TYPE.MATERIAL);
+  const wantMaterial = wantOrders && (type === TYPE.ALL || type === TYPE.MATERIAL);
+  const wantService = wantOrders && !materialOnly && (type === TYPE.ALL || type === TYPE.SERVICE);
+  const wantFreight = wantOrders && !materialOnly && (type === TYPE.ALL || type === TYPE.FREIGHT);
 
   let rows = [];
+
+  if (wantRequests) {
+    const out = await attempt("materialRequests", async () => ({
+      rows: await require("./materialRequestReceipt.service").registerRows(tenant, { stage, status, search }),
+      coverage: null,
+    }));
+    rows = rows.concat(out.rows || []);
+  }
 
   /* Exceptions are only an indicator, and only where an order could carry one. */
   let exceptionsByPo = new Map();

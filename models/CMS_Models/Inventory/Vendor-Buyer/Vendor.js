@@ -66,7 +66,12 @@ const vendorSchema = new mongoose.Schema({
     accountNumber: { type: String, trim: true },
     bankName: { type: String, trim: true },
     ifscCode: { type: String, trim: true, uppercase: true },
-    branch: { type: String, trim: true }
+    branch: { type: String, trim: true },
+    /* How this supplier is paid (7 Oct 2026). One of
+       BANK_TRANSFER | UPI | CHEQUE | CASH, or blank when not recorded;
+       the route validates it. */
+    paymentMode: { type: String, trim: true },
+    upiId: { type: String, trim: true }
   },
   
   // Status and Additional Info

@@ -34,6 +34,10 @@ const mongoose = require("mongoose");
 const SOURCE_TYPE = Object.freeze({
   PURCHASE_ORDER: "PURCHASE_ORDER",
   CUSTOMER_MATERIAL: "CUSTOMER_MATERIAL",
+  /* A merchandiser's material request against a released order (7 Oct
+     2026): the Store receives the material in; no supplier, no price, no
+     invoice. Company-owned stock, unlike customer material. */
+  MATERIAL_REQUEST: "MATERIAL_REQUEST",
 });
 const SOURCE_TYPES = Object.freeze(Object.values(SOURCE_TYPE));
 
@@ -78,6 +82,11 @@ const goodsReceiptLineSchema = new mongoose.Schema(
     // ── How much arrived, in the PO unit, plus the canonical/base evidence ──
     poUnit: { type: String, trim: true, default: "" },
     receivedQuantity: { type: Number, required: true, min: 0 },     // in poUnit
+    /* What the supplier's invoice / challan says arrived, beside what was
+       actually counted (`receivedQuantity`, which is what stock moves by).
+       Recorded on material-request receipts since 7 Oct 2026; null where
+       nobody stated it. */
+    invoicedQuantity: { type: Number, min: 0, default: null },
     baseUnit: { type: String, trim: true, default: "" },            // RawItem registered unit
     baseQuantity: { type: Number, min: 0, default: 0 },             // received in baseUnit
     conversionFactor: { type: Number, default: 1 },                 // baseQuantity / receivedQuantity
@@ -146,6 +155,15 @@ const goodsReceiptSchema = new mongoose.Schema(
 
        There is deliberately no price, no value, no tax and nothing payable: the
        factory bought nothing, so there is nowhere for one to land. */
+    /* ── MATERIAL REQUEST PROVENANCE ───────────────────────────────────────
+       Which order, which request. Nothing commercial. */
+    materialRequest: {
+      customerRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      requestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      requestNumber: { type: String, trim: true, default: "" },
+      orderRef: { type: String, trim: true, default: "" },
+    },
+
     customerMaterial: {
       customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null, index: true },
       customerLabel: { type: String, trim: true, default: "" },
@@ -226,6 +244,26 @@ goodsReceiptSchema.pre("validate", function enforceSourceContract(next) {
        against either. */
     if (String(this.sourceDocumentId) !== String(this.purchaseOrderId)) {
       return next(new Error("A purchase receipt's source document must be its purchase order."));
+    }
+    return next();
+  }
+
+  /* ── MATERIAL REQUEST ────────────────────────────────────────────────── */
+  if (this.sourceType === SOURCE_TYPE.MATERIAL_REQUEST) {
+    if (this.purchaseOrderId || (this.poNumber || "").trim()) {
+      return next(new Error("A material-request receipt has no purchase order."));
+    }
+    if (this.supplierId || (this.supplierName || "").trim() || (this.invoiceNumber || "").trim()) {
+      return next(new Error("A material-request receipt carries no supplier or invoice: nothing was bought through it."));
+    }
+    if (!this.materialRequest?.customerRequestId || !this.materialRequest?.requestId) {
+      return next(new Error("A material-request receipt must name the order and the request it was received against."));
+    }
+    if (lines.some((l) => !l.sourceLineId)) {
+      return next(new Error("Every material-request receipt line must name its request line."));
+    }
+    if (lines.some((l) => l.poItemId || l.spendLineId)) {
+      return next(new Error("A material-request receipt line carries no purchase-order or spend line."));
     }
     return next();
   }

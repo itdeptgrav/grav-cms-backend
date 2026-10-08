@@ -196,6 +196,9 @@ app.get("/api/feature-flags", async (req, res) => {
        (STORE_BUDGET_SETUP=1, services/requests/budgetGate). Exposed here so a
        Store page can hide a "Budget head" label without a session call. */
     flags["flag.storeBudget"] = require("./services/requests/budgetGate").budgetEnabled();
+    /* Same shape: whether the PI form offers every product or only the
+       customer's approved ones (SALES_PI_ALL_PRODUCTS, services/sales/piProductGate). */
+    flags["flag.piAllProducts"] = require("./services/sales/piProductGate").piAllProducts();
     res.json({ success: true, flags });
   } catch {
     res.json({ success: true, flags: {} });
@@ -1836,6 +1839,11 @@ app.use(
    decisions, and the Execution File register. Same mount, second router;
    distinct paths, one access implementation behind both. */
 app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/executionRoute"));
+/* Released orders and the material requests raised against them (7 Oct
+   2026): every order Sales released, with its products, quantities and raw
+   material need, so Merchandising can ask the Store for material without
+   waiting for a handover. Same mount, same access implementation. */
+app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/orderRoute"));
 /* Time & Action — the M5 date control: templates, calendars, plans,
    baselines, reschedules, and the cross-file register. Third router on the
    same mount for the same reason as the second: distinct paths, one access
@@ -2162,6 +2170,10 @@ app.use("/api/cms/store-purchase", storePurchaseContextRoutes);
 
 const purchaseOrderRoutes = require("./routes/CMS_Routes/Inventory/Operations/purchaseOrders");
 app.use("/api/cms/inventory/operations/purchase-orders", purchaseOrderRoutes);
+/* Merchandising's material requests, as the Store receives against them
+   (7 Oct 2026): listed on the Purchase register under kind=material-requests,
+   opened and received on their own pages. */
+app.use("/api/cms/inventory/operations/material-requests", require("./routes/CMS_Routes/Inventory/Operations/materialRequests"));
 
 // Service Orders — the operational document an approved SERVICE request becomes.
 // Creates no PO, goods receipt, stock or inventory movement (see the router).

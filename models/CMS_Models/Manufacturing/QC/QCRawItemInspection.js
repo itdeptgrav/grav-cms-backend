@@ -58,6 +58,15 @@ const schema = new mongoose.Schema(
     purchaseOrderNumber: { type: String, default: "", trim: true },
     vendorName:   { type: String, default: "", trim: true },
 
+    /* which goods receipt the label was received under (8 Oct 2026) — the unit
+       of raw-material QC work for a material-request GRN; null for a label
+       printed from stock on hand */
+    goodsReceiptId:     { type: mongoose.Schema.Types.ObjectId, ref: "GoodsReceipt", default: null, index: true },
+    goodsReceiptNumber: { type: String, default: "", trim: true },
+    goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    materialRequestId:  { type: mongoose.Schema.Types.ObjectId, default: null },
+    materialRequestNumber: { type: String, default: "", trim: true },
+
     /* the verdict, as quantities */
     status:            { type: String, enum: STATUSES, required: true, index: true },
     passedQuantity:    { type: Number, required: true, min: 0 },
@@ -83,6 +92,7 @@ schema.index({ manufacturingOrderId: 1, superseded: 1, inspectedAt: -1 });
 schema.index({ barcodeId: 1, manufacturingOrderId: 1, superseded: 1 });
 schema.index({ inspectedByEmail: 1, date: 1 });
 schema.index({ date: 1, superseded: 1 });
+schema.index({ goodsReceiptId: 1, superseded: 1 });
 
 module.exports = mongoose.models.QCRawItemInspection || mongoose.model("QCRawItemInspection", schema);
 module.exports.STATUSES = STATUSES;

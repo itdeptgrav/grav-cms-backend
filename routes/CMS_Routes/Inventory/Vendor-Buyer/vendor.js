@@ -715,6 +715,12 @@ function publicSupplier(doc) {
   out.hasBankDetails = Boolean(
     d.bankDetails && (d.bankDetails.accountNumber || d.bankDetails.ifscCode),
   );
+  /* Any way to pay recorded at all — a mode, a UPI id or an account. The
+     order pages read it to ask for payment details where none exist yet. */
+  out.hasPaymentDetails = Boolean(
+    d.bankDetails && (d.bankDetails.paymentMode || d.bankDetails.upiId
+      || d.bankDetails.accountNumber || d.bankDetails.ifscCode),
+  );
   return out;
 }
 
@@ -1846,6 +1852,7 @@ router.get("/:id/bank-details", ...canMaintain, async (req, res) => {
       bankDetails: {
         accountName: b.accountName || "", accountNumber: b.accountNumber || "",
         bankName: b.bankName || "", ifscCode: b.ifscCode || "", branch: b.branch || "",
+        paymentMode: b.paymentMode || "", upiId: b.upiId || "",
       },
       note: "Restricted supplier instructions. Payment execution is recorded in Accounting.",
     });
@@ -1876,7 +1883,12 @@ router.put("/:id/bank-details", ...canMaintain, withIdempotency("SUPPLIER_BANK_U
        * into an empty string, so sending a number ERASED the stored
        * instruction and reported success. Clearing must be deliberate: an
        * empty string or null does it, and nothing else is accepted. */
-      const FIELDS = ["accountName", "accountNumber", "bankName", "ifscCode", "branch"];
+      const FIELDS = ["accountName", "accountNumber", "bankName", "ifscCode", "branch", "paymentMode", "upiId"];
+      const PAYMENT_MODES = ["", "BANK_TRANSFER", "UPI", "CHEQUE", "CASH"];
+      if (typeof req.body?.paymentMode === "string" && !PAYMENT_MODES.includes(req.body.paymentMode.trim())) {
+        return refuse(res, 400, CODES.FIELD_INVALID,
+          `paymentMode must be one of ${PAYMENT_MODES.filter(Boolean).join(", ")}.`, { field: "paymentMode" });
+      }
       const next = { ...(supplier.bankDetails ? supplier.bankDetails.toObject?.() || { ...supplier.bankDetails } : {}) };
       for (const f of FIELDS) {
         const raw = req.body?.[f];
