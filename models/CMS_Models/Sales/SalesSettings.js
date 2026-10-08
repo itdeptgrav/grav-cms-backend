@@ -138,6 +138,14 @@ const emailConfigSchema = new mongoose.Schema(
 const salesSettingsSchema = new mongoose.Schema(
   {
     // ── Sales Representative Profile ─────────────────────────────────────────
+    /* ── WHICH PRODUCTS THE PROFORMA INVOICE OFFERS (8 Oct 2026, owner) ──
+       "all"      every product in the register (the default)
+       "approved" only the products this customer approved in Style & Sample
+       Read by services/sales/piProductGate.js and published to the CMS as
+       flag.piAllProducts; the environment switch is the fallback when this
+       is unset. */
+    piProductScope: { type: String, enum: ["all", "approved"], default: "all" },
+
     repName:             { type: String, trim: true,    default: "Sales Team" },
     repEmail:            { type: String, trim: true, lowercase: true, default: "sales@grav.in" },
     repPhone:            { type: String, trim: true,    default: "+91 96920 90096" },

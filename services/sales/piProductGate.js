@@ -24,9 +24,32 @@
 
 const OFF = new Set(["0", "false", "no", "off"]);
 
-function piAllProducts() {
+function envAllProducts() {
   const raw = String(process.env.SALES_PI_ALL_PRODUCTS ?? "").trim().toLowerCase();
   return !OFF.has(raw);
 }
 
-module.exports = { piAllProducts };
+/* ── A STORED SETTING SINCE 8 Oct 2026 (owner) ─────────────────────────────
+   `SalesSettings.piProductScope` ("all" | "approved") is set on the Sales
+   settings page and wins; the environment switch stands only while the
+   setting is absent. Cached for a few seconds — the flags endpoint is hit on
+   every page paint. */
+const CACHE_MS = 5000;
+let cached = { at: 0, value: null };
+async function piAllProducts() {
+  if (Date.now() - cached.at < CACHE_MS && cached.value !== null) return cached.value;
+  let value = envAllProducts();
+  try {
+    const SalesSettings = require("../../models/CMS_Models/Sales/SalesSettings");
+    const s = await SalesSettings.findOne().select("piProductScope").lean();
+    if (s?.piProductScope === "approved") value = false;
+    else if (s?.piProductScope === "all") value = true;
+  } catch (err) {
+    console.error("[piProductGate] settings read failed, using the environment:", err?.message || err);
+  }
+  cached = { at: Date.now(), value };
+  return value;
+}
+const forget = () => { cached = { at: 0, value: null }; };
+
+module.exports = { piAllProducts, envAllProducts, forgetPiProductScope: forget };

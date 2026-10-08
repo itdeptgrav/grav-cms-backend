@@ -16,11 +16,21 @@ const { USED_AS_VALUES, DEFAULT_USED_AS } = require("./usedAs");
 const { DEFAULT_OWNERSHIP, DEFAULT_OWNERSHIP_VALUES } = require("./materialOwnership");
 
 // e.g. Button → fromUnit "Piece", toUnit "Kilogram", quantity 0.4  → 1 pc = 0.4 KG
+//
+// ── MEASURED BY WEIGHT (8 Oct 2026, owner) ─────────────────────────────────
+// Small parts (buttons, hooks) are not counted one by one: the packet is put on
+// a scale. A conversion flagged `measureByWeight` is the one the scale reads
+// through — 1 Pc = 0.2234 Gram — and `tareQuantity` is the weight of the extra,
+// unused material weighed with it (the packet cover, the box), in `toUnit`.
+// Material labels then take the scale's reading: (weighed − tare) ÷ quantity =
+// base units. Null tare means "not stated", never 0.
 const unitConversionSchema = new mongoose.Schema(
   {
     fromUnit: { type: String, trim: true, default: "" },
     toUnit:   { type: String, trim: true, default: "" },
-    quantity: { type: Number, default: 0, min: 0 }
+    quantity: { type: Number, default: 0, min: 0 },
+    measureByWeight: { type: Boolean, default: false },
+    tareQuantity:    { type: Number, default: null, min: 0 },
   },
   { _id: false }
 );

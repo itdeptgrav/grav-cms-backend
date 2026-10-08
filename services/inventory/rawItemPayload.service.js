@@ -239,10 +239,16 @@ const normaliseUnitConversion = (uc) => {
   }
   const qty = parseFloat(uc.quantity);
   if (isNaN(qty) || qty < 0) return null;
+  /* measured by weight (8 Oct 2026): the flag, and the weight of the unused
+     material weighed with the goods, in toUnit — blank is "not stated" */
+  const tareRaw = uc.tareQuantity;
+  const tare = tareRaw === undefined || tareRaw === null || tareRaw === "" ? null : parseFloat(tareRaw);
   return {
     fromUnit: (uc.fromUnit || "").toString().trim(),
     toUnit: (uc.toUnit || "").toString().trim(),
-    quantity: qty
+    quantity: qty,
+    measureByWeight: uc.measureByWeight === true || uc.measureByWeight === "true",
+    tareQuantity: tare === null || isNaN(tare) || tare < 0 ? null : tare,
   };
 };
 

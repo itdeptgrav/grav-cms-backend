@@ -198,7 +198,7 @@ app.get("/api/feature-flags", async (req, res) => {
     flags["flag.storeBudget"] = require("./services/requests/budgetGate").budgetEnabled();
     /* Same shape: whether the PI form offers every product or only the
        customer's approved ones (SALES_PI_ALL_PRODUCTS, services/sales/piProductGate). */
-    flags["flag.piAllProducts"] = require("./services/sales/piProductGate").piAllProducts();
+    flags["flag.piAllProducts"] = await require("./services/sales/piProductGate").piAllProducts();
     res.json({ success: true, flags });
   } catch {
     res.json({ success: true, flags: {} });

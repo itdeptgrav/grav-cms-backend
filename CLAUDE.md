@@ -1379,3 +1379,105 @@ true`), the next identify resolved via the label, and the GRN book showed
   GRN (`carriesMaterial: false`, `line: null`, `materials[]`) when none
   carries the label's raw item + variant, so the checker can still say which
   delivery it came with; `/save` links the label to it with no line id.
+
+## Raw material measured by weight (8 Oct 2026, owner)
+
+Small parts (buttons, hooks) are weighed, not counted. `RawItem`'s
+`unitConversionSchema` gained `measureByWeight` (Boolean) and `tareQuantity`
+(Number, null = not stated): a conversion flagged for weighing — 1 Pcs =
+0.2234 Gram — is what the scale reads through, and the tare is the weight of
+the extra, unused material weighed with the goods (the packet cover, the box)
+in the conversion's `toUnit`. `rawItemPayload.normaliseUnitConversion` (both
+the create service and `PUT /raw-items/:id`) carries both; a negative or
+blank tare is null. The arithmetic itself is the CMS's
+(`components/store/barcode-labels/labels.js`): base quantity = (weighed −
+tare) ÷ quantity. The older per-variant `weightGrams` field stays on the
+schema and the write paths but the form no longer shows it.
+
+## `/api/auth/verify` resolves access once, not three times (8 Oct 2026)
+
+The route the browser calls most walked the grant catalogue several times per
+request: an employee session resolved the launcher (every department with its
+grant) and then asked `resolveAppAccess` AGAIN for the one department it was
+in; a department account resolved the requested department, then its role,
+then the whole launcher for the grid — each a fresh identity check and grant
+walk. Now `services/access/appAccess.service.js` builds one **grant index**
+per identity (`grantIndexFor`: one `DepartmentRole.find` over the person's
+emails plus one `distinct` of configured slugs) and `listAccessibleApps` passes
+it to every `resolveWithIdentity`; `routes/auth/deptAuth.js` resolves the
+launcher once (`resolveEmployeeLauncherWithAccess` returns `{ departments,
+accessById }`) and reads the session's `deptRole`, the requested department
+and `departments` from it. Behaviour is unchanged except that a department
+account requesting an *inactive* department now falls back to its own instead
+of answering 401. Measured on Atlas: employee verify 1.46 s → 0.25 s, CEO
+0.30 s → 0.13 s.
+
+`services/manufacturing/qcActor.js` runs its three reads (role, roster row,
+employee) with `Promise.all` for the same reason.
+
+A scratch token for an employee must carry `email` — every `/api/cms` router
+reads `req.user.email` from the JWT, and a token minted without it is a
+QC "session expired" / no-role user, which looks exactly like an access bug.
+
+## Packing without a carton; carton counts on the orders list (8 Oct 2026, owner)
+
+`POST /api/cms/manufacturing/packaging/done` accepts `noCarton: true`: the
+scanned units are written on their work orders through the same
+`recordOnWorkOrder` (same records, same unit numbers, same person and time)
+with no `cartonId`/`cartonNumber`, no `PackingCarton` is made, and the
+one-order-per-carton rule is not applied (there is no box to mix). The answer
+is `{ success, noCarton: true, added, carton: null, lines[] }`. Such units
+count in `packagedQuantity` and show as `packedNotInCarton` on the carton
+dispatch overview — they cannot be dispatched by carton. `cartonNumber` and
+`noCarton` together: the carton is ignored.
+
+`GET …/packaging-dispatch-view/manufacturing-orders` rows gained
+`cartonsReady`, `cartonsDispatched`, `piecesReady`,
+`piecesInDispatchedCartons`, `cartonsUnweighed` and `packedNotInCarton` (one
+grouped count over the page's orders). Additive.
+
+## A carton may hold several orders (8 Oct 2026, owner)
+
+"One carton, one order" is gone: `POST /packaging/done` no longer refuses
+MIXED_ORDERS or CARTON_OTHER_ORDER. `PackingCarton` keeps its head fields
+(`manufacturingOrderId`, `moNumber`, `poNumber`, `customerName` = the FIRST
+order, so older readers work) and gained `orders[]` (every order inside, with
+PO and customer), `lines[].manufacturingOrderId` / `lines[].moNumber`, and
+`dispatchChallans[]`. A line written before carries no order — read the
+carton's head for it (`lineOrderOf` in cartonDispatchRoutes). Everything
+that found "this order's cartons" by `manufacturingOrderId` now matches
+`orders.manufacturingOrderId` too (`cartonsHolding`), and counts THIS
+order's pieces as its lines, never the whole box (`piecesOfThisOrder` on
+the overview's cartons; the orders list aggregates by line order). Dispatch
+of a mixed carton: the box leaves whole, and **one challan per order
+inside it** is made — the screen's order gets the head challan
+(`carton.dispatchChallanNumber`), the others are in `carton.dispatchChallans`
+and the response's `challans[]`; each work order's `dispatchRecords` names
+its own order's challan. `/resolve` accepts a carton holding any piece of
+the order; OTHER_ORDER names every order the box does hold.
+
+`DispatchChallan.cartons[].lines[].productImage` and `bulkProducts[] /
+persons[].products[].productImage` (8 Oct 2026): the product photo as
+resolved at dispatch (`resolvePhotos`, variant image first), for the challan
+PDF. Blank on earlier challans.
+
+## Every customer onto the pipeline; the PI product scope is a setting (8 Oct 2026, owner)
+
+`services/sales/customerPipelineImport.js` — `importCustomersIntoPipeline({
+ownership, actor, dryRun })`: one Lead per active `Customer` that is not on
+the board yet, in `qualificationState: "new"` (Interest Confirmed), `source:
+"existing_customer"`, `prospectType: "company"`, company = the customer's
+`profile.companyName` or `name`, one primary contact, owner = the customer's
+`salesAssignedBy` else the actor. "Already there" = a Lead with
+`importedFromCustomerId` / `convertedCustomerId` = the customer, else the
+same e-mail, else the same phone (8+ digits). Lead gained
+`importedFromCustomerId` (indexed) + `importedFromCustomerCode`; that link is
+what makes the import idempotent. `POST /api/cms/crm/leads/import-customers`
+(Sales manager / admin; `?dryRun=1` lists only) and
+`scripts/importCustomersToPipeline.js [--dry-run]` (sole company, or
+`COMPANY_ID=`) both call it.
+
+`SalesSettings.piProductScope` ("all" | "approved", default "all") now decides
+`flag.piAllProducts`: `piProductGate.piAllProducts()` is async, reads the
+setting (5 s cache, `forgetPiProductScope()` on a settings save) and falls back
+to `SALES_PI_ALL_PRODUCTS` only while the setting is absent.
