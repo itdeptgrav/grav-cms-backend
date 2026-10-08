@@ -1296,10 +1296,11 @@ router.post("/import-customers", salesAuth, async (req, res) => {
     if (!(await isSalesManager(req.user))) {
       return res.status(403).json({ success: false, message: "Only a Sales manager or an administrator can place every customer on the pipeline." });
     }
-    const { ownership } = await scopeAndOwnership(req);
+    const { scope, ownership } = await scopeAndOwnership(req);
     const { importCustomersIntoPipeline } = require("../../../services/sales/customerPipelineImport");
     const dryRun = String(req.query.dryRun || req.body?.dryRun || "") === "1" || req.body?.dryRun === true;
-    const r = await importCustomersIntoPipeline({ ownership, actor: { id: req.user?.id, name: req.user?.name }, dryRun });
+    const actor = { id: req.user?.id, name: req.user?.name };
+    const r = await importCustomersIntoPipeline({ scope, ownership, actor, fallbackOwner: actor, dryRun });
     return res.json({
       success: true,
       message: dryRun
@@ -1311,6 +1312,20 @@ router.post("/import-customers", salesAuth, async (req, res) => {
     if (err?.code && err?.status) return res.status(err.status).json({ success: false, code: err.code, message: err.message });
     console.error("[leads] import-customers:", err);
     return res.status(500).json({ success: false, message: err.message || "The import failed." });
+  }
+});
+
+/* The Leads the FIRST version of the import made (8 Oct 2026, same day) are
+   not the pipeline; this archives them. Managers and administrators only. */
+router.post("/import-customers/retire-leads", salesAuth, async (req, res) => {
+  try {
+    if (!(await isSalesManager(req.user))) return res.status(403).json({ success: false, message: "Only a Sales manager or an administrator can do this." });
+    const { retireImportedLeads } = require("../../../services/sales/customerPipelineImport");
+    const r = await retireImportedLeads();
+    return res.json({ success: true, message: `${r.retired} lead${r.retired === 1 ? "" : "s"} made by the earlier import archived.`, ...r });
+  } catch (err) {
+    console.error("[leads] retire imported leads:", err);
+    return res.status(500).json({ success: false, message: err.message });
   }
 });
 

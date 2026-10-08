@@ -1463,19 +1463,39 @@ PDF. Blank on earlier challans.
 
 ## Every customer onto the pipeline; the PI product scope is a setting (8 Oct 2026, owner)
 
+**The pipeline is the Sales Journeys page** (`/sales/dashboard/journeys`,
+Account → Enquiry → … → Retention), not the Leads board. A first version the
+same morning made LEADS; the owner's "see this script is not working" was
+that. It was redone the same day.
+
 `services/sales/customerPipelineImport.js` — `importCustomersIntoPipeline({
-ownership, actor, dryRun })`: one Lead per active `Customer` that is not on
-the board yet, in `qualificationState: "new"` (Interest Confirmed), `source:
-"existing_customer"`, `prospectType: "company"`, company = the customer's
-`profile.companyName` or `name`, one primary contact, owner = the customer's
-`salesAssignedBy` else the actor. "Already there" = a Lead with
-`importedFromCustomerId` / `convertedCustomerId` = the customer, else the
-same e-mail, else the same phone (8+ digits). Lead gained
-`importedFromCustomerId` (indexed) + `importedFromCustomerCode`; that link is
-what makes the import idempotent. `POST /api/cms/crm/leads/import-customers`
-(Sales manager / admin; `?dryRun=1` lists only) and
-`scripts/importCustomersToPipeline.js [--dry-run]` (sole company, or
-`COMPANY_ID=`) both call it.
+scope, ownership, actor, fallbackOwner, dryRun })`: for every active,
+non-test `Customer`, (1) its CRM Account — `customerAccountLink.resolve`
+(LINKED / REPAIRABLE), else the one active Account whose active `Contact`
+carries the customer's e-mail (then `linkedCustomer` is set on it; two
+accounts with that e-mail = a named failure), else `ensure` creates one (a
+name is never matched); (2) one `SalesJourney` on that account unless it
+already has a live one (any outcome) — `name` = the account's company,
+`businessType: "repeat"`, stage enquiry, `ownerId` = the customer's
+`salesAssignedBy` else `fallbackOwner`/actor, `leadId/leadRef` from the Lead
+the first version made (if any), `importedFromCustomerId/Code` (new on the
+Journey schema, traceability only — idempotency is one Journey per Account).
+Result: `created[]`, `alreadyThere[]` (with `journeyId`, `stage`, `outcome`),
+`skippedTest[]` (`@internal.gravtest.com`), `failed[]`, `strayLeads` (Leads
+still carrying `importedFromCustomerId`). `retireImportedLeads()` archives
+those (`isActive:false`, `captureStatus:"archived"`).
+
+Doors: `POST /api/cms/crm/leads/import-customers` (Sales manager / admin;
+`?dryRun=1` lists only), `POST …/import-customers/retire-leads`, and
+`scripts/importCustomersToPipeline.js [--dry-run]` (sole / primary company or
+`COMPANY_ID=`; `OWNER_EMAIL=` names the fallback owner — any CMS login:
+an Employee, Sales or CEO user — else the CEO user; journey owners are CMS
+login ids and Sales people are `employees` rows, `salesdepartments` is
+empty here). Local dry run 8 Oct 2026: 27 customers, 25 "already
+there" — 28 journeys (SJ-2026-0011…0038) had been created in bulk by the
+CEO on 7 Oct 2026 13:07, so locally nothing is added; production had 1
+journey and 24 stray Leads at the time. Several customers share a
+`customerId` (CUST-0021 ×4, six with none) — a data quirk, untouched.
 
 `SalesSettings.piProductScope` ("all" | "approved", default "all") now decides
 `flag.piAllProducts`: `piProductGate.piAllProducts()` is async, reads the

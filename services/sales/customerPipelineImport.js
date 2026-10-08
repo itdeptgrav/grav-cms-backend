@@ -3,125 +3,149 @@
 // EVERY EXISTING CUSTOMER, ONTO THE PIPELINE  (8 Oct 2026, owner)
 //
 // "Whoever the existing customers are in the customer schema, they need to
-// show in the pipeline." The pipeline is the Leads board; a Customer record
-// is a portal account and sits nowhere on it. This walks every active
-// Customer and makes a Lead for each one that has none yet, in the first
-// column ("Interest Confirmed" — qualificationState `new`), sourced
-// `existing_customer`, linked back to the Customer by `importedFromCustomerId`
-// so running it twice creates nothing twice.
+// show in the pipeline." The pipeline is the Sales Journeys page (Account →
+// Enquiry → Style & Sample → … → Retention). A Customer record is a portal
+// account and sits nowhere on it; a Journey needs a CRM Account. So, for
+// every active Customer:
 //
-// "Already there" is decided by that link first, then by e-mail, then by
-// phone — a Lead somebody typed by hand for the same company must not get a
-// twin. Nothing on the Customer is changed, nothing is deleted, and a Lead
-// that already exists is never edited.
+//   1. the Account — the one already LINKED to the customer
+//      (customerAccountLink.resolve: by id, or proved by an order); else the
+//      one whose active CONTACT carries the customer's e-mail (the portal
+//      login — a credential, not a name — the CRM's accounts were keyed in
+//      from the same addresses); else a new one (customerAccountLink.ensure).
+//      A name is never used to match — see that service's header.
+//   2. the Journey — one per account; an account that already has a live
+//      Journey (any outcome) is "already on the pipeline". A new one starts at
+//      the Enquiry stage, business type `repeat` (they are a customer already),
+//      owned by the customer's salesperson, else the person running this, and
+//      names the Lead the first version of this import made, if one exists.
+//
+// Idempotent: run it twice and the second run creates nothing. `dryRun` lists
+// what would happen and writes nothing. Nothing on the Customer is changed.
+//
+// The first version (earlier the same day) made LEADS instead — the Leads
+// board, which the owner does not call the pipeline. `strayLeads` counts
+// them and `retireImportedLeads` archives them.
 //
 // Two doors, one function: the Sales settings page's button
-// (POST /api/cms/crm/leads/import-customers) and scripts/importCustomersToPipeline.js
-// for a deploy. `dryRun` lists what WOULD be created and writes nothing.
+// (POST /api/cms/crm/leads/import-customers) and scripts/importCustomersToPipeline.js.
 "use strict";
 
+const mongoose = require("mongoose");
 const Customer = require("../../models/Customer_Models/Customer");
+const Account = require("../../models/CMS_Models/Sales/Account");
+const Contact = require("../../models/CMS_Models/Sales/Contact");
 const Lead = require("../../models/CMS_Models/Sales/Lead");
-const { createWithRef } = require("../leadRef");
+const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
+const customerAccountLink = require("./customerAccountLink.service");
+const { createWithRef } = require("../salesJourneyRef");
 
 const str = (v) => (v === null || v === undefined ? "" : String(v).trim());
-const digits = (v) => str(v).replace(/\D+/g, "");
+const id = (v) => (v ? String(v) : "");
+const within = (scope, extra = {}) => ({ ...(scope?.clause || {}), ...extra });
 /* Internal test accounts (the CAD test organisation's "DO NOT USE FOR REAL
    ORDERS" customers carry this domain) are not customers and never go on the
    board; they are listed back as skipped so nobody wonders where they went. */
 const TEST_EMAIL_DOMAINS = ["internal.gravtest.com"];
 const isTestCustomer = (c) => TEST_EMAIL_DOMAINS.some((d) => str(c.email).toLowerCase().endsWith(`@${d}`));
 
-/** What a Customer becomes on the board. Exported for the test. */
-function leadPayloadFor(customer, { ownership = {}, actor = null } = {}) {
-  const profile = customer.profile || {};
-  const address = profile.address || {};
-  const company = str(profile.companyName) || str(customer.name);
-  /* The Customer's `name` is the account name, often the company itself; when
-     a company name is recorded separately the account name is the person. */
-  const person = str(profile.companyName) && str(customer.name) !== str(profile.companyName) ? str(customer.name) : "";
-  const contactName = person || company;
-  const assignedTo = customer.salesAssignedBy || actor?.id || undefined;
-  const assignedToName = customer.salesAssignedBy ? str(customer.salesAssignedByName) : str(actor?.name);
-  return {
-    ...ownership,
-    company,
-    firstName: person || undefined,
-    prospectType: "company",
-    email: str(customer.email).toLowerCase() || undefined,
-    phone: str(customer.phone) || undefined,
-    whatsapp: str(customer.alternatePhone) || undefined,
-    city: str(address.city) || undefined,
-    state: str(address.state) || undefined,
-    country: str(address.country) || "India",
-    source: "existing_customer",
-    qualificationState: "new",
-    stage: "new",
-    captureStatus: "active",
-    reviewStatus: "approved",
-    priority: "medium",
-    assignedTo,
-    assignedToName: assignedToName || undefined,
-    sourcedBy: actor?.id || undefined,
-    sourcedByName: str(actor?.name) || undefined,
-    contacts: contactName ? [{ name: contactName, email: str(customer.email).toLowerCase() || undefined, phone: str(customer.phone) || undefined, isPrimary: true, status: "active" }] : [],
-    importedFromCustomerId: customer._id,
-    importedFromCustomerCode: str(customer.customerId),
-    isActive: true,
-  };
+/** The customer's Account: linked, proved, matched by contact e-mail, or made. */
+async function accountFor({ scope, customer, actor, dryRun }) {
+  const found = await customerAccountLink.resolve({ scope, customerId: customer._id });
+  if (found.state === customerAccountLink.STATE.LINKED) return { ok: true, account: found.account, establishedBy: "LINKED" };
+  if (found.state === customerAccountLink.STATE.REPAIRABLE) {
+    const r = await customerAccountLink.ensure({ scope, customerId: customer._id, customer, actor, dryRun });
+    return r.ok ? { ok: true, account: r.account || found.account, establishedBy: "REPAIRED" } : { ok: false, reason: r.message };
+  }
+  if (found.state !== customerAccountLink.STATE.ABSENT) return { ok: false, reason: found.reason || found.state };
+
+  const email = str(customer.email).toLowerCase();
+  if (email) {
+    const contacts = await Contact.find(within(scope, { email, isActive: true, accountId: { $ne: null } })).select("accountId").lean();
+    const accountIds = [...new Set(contacts.map((c) => id(c.accountId)).filter(Boolean))];
+    if (accountIds.length > 1) {
+      return { ok: false, reason: `Two commercial records' contacts carry ${email} — say which is this customer's on the Accounts page first.` };
+    }
+    if (accountIds.length === 1) {
+      const account = await Account.findOne(within(scope, { _id: accountIds[0], isActive: true }))
+        .select("_id accountId companyName displayName linkedCustomer").lean();
+      if (account) {
+        if (account.linkedCustomer && id(account.linkedCustomer) !== id(customer._id)) {
+          return { ok: false, reason: `${account.companyName} (${account.accountId}) already belongs to another customer.` };
+        }
+        if (!dryRun && !account.linkedCustomer) {
+          await Account.updateOne({ _id: account._id, linkedCustomer: { $in: [null, undefined] } }, { $set: { linkedCustomer: customer._id } });
+        }
+        return { ok: true, account, establishedBy: "EMAIL" };
+      }
+    }
+  }
+
+  const made = await customerAccountLink.ensure({ scope, customerId: customer._id, customer, actor, dryRun });
+  if (!made.ok) return { ok: false, reason: made.message };
+  return { ok: true, account: made.account || { _id: null, companyName: made.name, accountId: "" }, establishedBy: "CREATED" };
 }
 
 /**
  * @param {object} opts
- * @param {object} opts.ownership  companyId + companyOwnership for the new Leads
- * @param {object} [opts.actor]    { id, name } — who ran it (owner, sourcer)
- * @param {boolean} [opts.dryRun]  list only, write nothing
+ * @param {object} opts.scope       the Sales scope (companyId + clause) — salesScope.service
+ * @param {object} opts.ownership   companyId + companyOwnership for the new Journeys
+ * @param {object} [opts.actor]     { id, name } — who ran it
+ * @param {object} [opts.fallbackOwner] { id, name } — the Journey owner when the customer has no salesperson
+ * @param {boolean} [opts.dryRun]
  */
-async function importCustomersIntoPipeline({ ownership, actor = null, dryRun = false } = {}) {
-  if (!ownership?.companyId) throw new Error("A company must be resolved before customers can be placed on its pipeline.");
+async function importCustomersIntoPipeline({ scope, ownership, actor = null, fallbackOwner = null, dryRun = false } = {}) {
+  if (!scope?.companyId || !ownership?.companyId) throw new Error("A company must be resolved before customers can be placed on its pipeline.");
+  const owner = fallbackOwner || actor;
 
   const customers = await Customer.find({ isActive: { $ne: false } })
-    .select("customerId name email phone alternatePhone profile.companyName profile.address salesAssignedBy salesAssignedByName createdAt")
+    .select("customerId name email phone profile.companyName businessInfo.companyName salesAssignedBy salesAssignedByName createdAt")
     .sort({ createdAt: 1 })
     .lean();
 
-  const ids = customers.map((c) => c._id);
-  const emails = [...new Set(customers.map((c) => str(c.email).toLowerCase()).filter(Boolean))];
-  const phones = [...new Set(customers.map((c) => digits(c.phone)).filter((p) => p.length >= 8))];
-  const existing = await Lead.find({
-    isActive: true,
-    $or: [
-      { importedFromCustomerId: { $in: ids } },
-      { convertedCustomerId: { $in: ids } },
-      ...(emails.length ? [{ email: { $in: emails } }] : []),
-      ...(phones.length ? [{ phone: { $exists: true, $ne: "" } }] : []),
-    ],
-  }).select("leadRef importedFromCustomerId convertedCustomerId email phone company").lean();
+  const result = { customers: customers.length, created: [], alreadyThere: [], skippedTest: [], failed: [], dryRun: Boolean(dryRun), strayLeads: 0 };
+  result.strayLeads = await Lead.countDocuments({ importedFromCustomerId: { $ne: null }, isActive: true });
 
-  const byCustomer = new Map();
-  const byEmail = new Map();
-  const byPhone = new Map();
-  for (const l of existing) {
-    if (l.importedFromCustomerId) byCustomer.set(String(l.importedFromCustomerId), l);
-    if (l.convertedCustomerId) byCustomer.set(String(l.convertedCustomerId), l);
-    if (l.email) byEmail.set(str(l.email).toLowerCase(), l);
-    const p = digits(l.phone);
-    if (p.length >= 8) byPhone.set(p, l);
-  }
-
-  const result = { customers: customers.length, created: [], alreadyThere: [], skippedTest: [], failed: [], dryRun: Boolean(dryRun) };
   for (const c of customers) {
     if (isTestCustomer(c)) { result.skippedTest.push({ customerId: c.customerId, name: c.name, email: c.email }); continue; }
-    const hit = byCustomer.get(String(c._id)) || byEmail.get(str(c.email).toLowerCase()) || (digits(c.phone).length >= 8 ? byPhone.get(digits(c.phone)) : null);
-    if (hit) { result.alreadyThere.push({ customerId: c.customerId, name: c.name, leadRef: hit.leadRef || "", company: hit.company || "" }); continue; }
-    const payload = leadPayloadFor(c, { ownership, actor });
-    if (dryRun) { result.created.push({ customerId: c.customerId, name: c.name, company: payload.company, email: payload.email || "" }); continue; }
     try {
-      const lead = await createWithRef(Lead, payload);
-      result.created.push({ customerId: c.customerId, name: c.name, company: lead.company, leadRef: lead.leadRef || "", leadId: String(lead._id) });
-      /* a second customer with the same e-mail or phone in this run joins the one just made */
-      if (payload.email) byEmail.set(payload.email, lead);
-      if (digits(payload.phone).length >= 8) byPhone.set(digits(payload.phone), lead);
+      const acc = await accountFor({ scope, customer: c, actor, dryRun });
+      if (!acc.ok) { result.failed.push({ customerId: c.customerId, name: c.name, reason: acc.reason }); continue; }
+      const account = acc.account;
+      const company = account.displayName || account.companyName || str(c.profile?.companyName) || str(c.name);
+
+      if (account._id) {
+        const existing = await SalesJourney.findOne(within(scope, { accountId: account._id, isActive: true }))
+          .select("journeyId name currentStage outcome").sort({ createdAt: -1 }).lean();
+        if (existing) {
+          result.alreadyThere.push({ customerId: c.customerId, name: c.name, company, accountId: account.accountId, journeyId: existing.journeyId, stage: existing.currentStage, outcome: existing.outcome });
+          continue;
+        }
+      }
+      if (dryRun) {
+        result.created.push({ customerId: c.customerId, name: c.name, company, accountId: account.accountId || "(new)", accountEstablishedBy: acc.establishedBy });
+        continue;
+      }
+
+      const ownerId = c.salesAssignedBy || owner?.id;
+      if (!ownerId) { result.failed.push({ customerId: c.customerId, name: c.name, reason: "No salesperson to own the journey (the customer has none assigned and nobody is signed in)." }); continue; }
+      const ownerName = c.salesAssignedBy ? str(c.salesAssignedByName) : str(owner?.name);
+      const lead = await Lead.findOne({ importedFromCustomerId: c._id, isActive: true }).select("_id leadId").lean();
+
+      const journey = await createWithRef(SalesJourney, {
+        ...ownership,
+        name: company,
+        accountId: account._id,
+        businessType: "repeat",
+        ownerId: new mongoose.Types.ObjectId(String(ownerId)),
+        ownerName: ownerName || undefined,
+        createdBy: actor ? { id: actor.id, name: actor.name } : undefined,
+        updatedBy: actor ? { id: actor.id, name: actor.name } : undefined,
+        ...(lead ? { leadId: lead._id, leadRef: lead.leadId || undefined } : {}),
+        importedFromCustomerId: c._id,
+        importedFromCustomerCode: str(c.customerId),
+      });
+      result.created.push({ customerId: c.customerId, name: c.name, company, accountId: account.accountId, accountEstablishedBy: acc.establishedBy, journeyId: journey.journeyId, journeyDbId: String(journey._id) });
     } catch (err) {
       result.failed.push({ customerId: c.customerId, name: c.name, reason: err?.message || String(err) });
     }
@@ -129,4 +153,13 @@ async function importCustomersIntoPipeline({ ownership, actor = null, dryRun = f
   return result;
 }
 
-module.exports = { importCustomersIntoPipeline, leadPayloadFor };
+/** Archive the Leads the first version of this import made (they are not the pipeline). */
+async function retireImportedLeads() {
+  const r = await Lead.updateMany(
+    { importedFromCustomerId: { $ne: null }, isActive: true },
+    { $set: { isActive: false, captureStatus: "archived", qualificationReason: "Retired: made by the customer→pipeline import before it placed customers on Journeys (8 Oct 2026)." } },
+  );
+  return { retired: r.modifiedCount || 0 };
+}
+
+module.exports = { importCustomersIntoPipeline, retireImportedLeads, accountFor };
