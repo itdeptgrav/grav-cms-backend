@@ -298,9 +298,12 @@ function recordOnWorkOrder(wo, {
 }
 
 /** What a carton line records about the work order it came from. */
-function cartonLineBase(wo) {
+function cartonLineBase(wo, mosById = new Map()) {
+  const mo = mosById.get(String(wo.customerRequestId || ""));
   return {
     workOrderId: wo._id,
+    manufacturingOrderId: wo.customerRequestId || null,
+    moNumber: mo ? `MO-${mo.requestId}` : "",
     workOrderNumber: displayWorkOrderNumber(wo),
     workOrderShortId: String(wo._id).slice(-8),
     stockItemId: wo.stockItemId || null,
@@ -872,11 +875,37 @@ function mergeCartonLines(existing, incoming) {
  * so a retried attempt starts from the committed state, not from its own
  * half-finished first try.
  */
+/** The order rows a set of lines needs on the carton, in line order. */
+function ordersOfLines(lines, mosById) {
+  const out = [];
+  const seen = new Set();
+  for (const l of lines) {
+    const k = String(l.manufacturingOrderId || "");
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    const mo = mosById.get(k);
+    out.push({
+      manufacturingOrderId: l.manufacturingOrderId,
+      moNumber: mo ? `MO-${mo.requestId}` : l.moNumber || "",
+      poNumber: poOf(mo).poNumber,
+      customerName: mo?.customerInfo?.name || "",
+      requestType: mo?.requestType || "",
+    });
+  }
+  return out;
+}
+
 async function applyPackingSession({
   session, companyId, groups, notes, packagedBy, packedBy, now,
-  cartonId, cartonNumber, appendTo, mo,
+  cartonId, cartonNumber, appendTo, mosById = new Map(), noCarton = false,
 }) {
-  const cartonRef = { cartonId, cartonNumber, packedByUserId: packedBy.userId };
+  /* ── PACKING WITHOUT A CARTON (8 Oct 2026, owner) ──────────────────────
+     "Pack into a carton" is a box on the packing station, ticked by default.
+     Unticked, the scanned pieces are recorded as packed on their work orders
+     — the same records, the same unit numbers, the same person and time —
+     and no carton is made, so nothing here can be dispatched by carton; the
+     order page counts them as "packed, no carton". */
+  const cartonRef = noCarton ? null : { cartonId, cartonNumber, packedByUserId: packedBy.userId };
   const lines = [];
   const summary = { measurementUpdates: 0, bulkUpdates: 0, totalUnitsPackaged: 0, totalUnitsMarkedComplete: 0, workOrdersTouched: 0 };
 
@@ -884,7 +913,7 @@ async function applyPackingSession({
     const wo = await WorkOrder.findOne(access.scoped(companyId, { _id: access.oid(g.workOrderId) })).session(session);
     if (!wo) continue; // proved before the transaction; gone since means nothing to do
     const alreadyOnWo = new Set((wo.packagingRecords || []).flatMap((r) => r.unitNumbers || []));
-    const base = cartonLineBase(wo);
+    const base = cartonLineBase(wo, mosById);
 
     if (g.isMeasurement && Array.isArray(g.employees) && g.employees.length) {
       const woUnits = [];
@@ -964,6 +993,7 @@ async function applyPackingSession({
   if (!lines.length) return { nothingNew: true, summary };
 
   const added = lines.reduce((n, l) => n + l.quantity, 0);
+  if (noCarton) return { carton: null, added, summary, appended: false, noCarton: true, lines };
   const addition = {
     at: now,
     packedBy,
@@ -984,19 +1014,34 @@ async function applyPackingSession({
       throw new PackingRefusal(409, "CARTON_DISPATCHED", `Carton ${cartonNumber} has already been dispatched — it cannot take more pieces.`);
     }
     mergeCartonLines(carton.lines, lines);
+    /* Orders new to this box join its list; the head order stays the first. */
+    const known = new Set((carton.orders || []).map((o) => String(o.manufacturingOrderId || "")));
+    if (!known.size && carton.manufacturingOrderId) known.add(String(carton.manufacturingOrderId));
+    if (!(carton.orders || []).length && carton.manufacturingOrderId) {
+      carton.orders = [{ manufacturingOrderId: carton.manufacturingOrderId, moNumber: carton.moNumber, poNumber: carton.poNumber, customerName: carton.customerName, requestType: carton.requestType }];
+    }
+    for (const o of ordersOfLines(lines, mosById)) {
+      if (known.has(String(o.manufacturingOrderId))) continue;
+      known.add(String(o.manufacturingOrderId));
+      carton.orders.push(o);
+      if (!carton.manufacturingOrderId) { carton.manufacturingOrderId = o.manufacturingOrderId; carton.moNumber = o.moNumber; carton.poNumber = o.poNumber; carton.customerName = o.customerName; carton.requestType = o.requestType; }
+    }
     carton.additions.push(addition);
     carton.lastPackedAt = now;
     if (addition.notes) carton.notes = carton.notes ? `${carton.notes} · ${addition.notes}` : addition.notes;
   } else {
+    const orders = ordersOfLines(lines, mosById);
+    const head = orders[0] || null;
     carton = new PackingCarton({
       _id: cartonId,
       cartonNumber,
       companyId,
-      manufacturingOrderId: mo?._id || null,
-      moNumber: mo ? `MO-${mo.requestId}` : "",
-      poNumber: poOf(mo).poNumber,
-      customerName: mo?.customerInfo?.name || "",
-      requestType: mo?.requestType || "",
+      manufacturingOrderId: head?.manufacturingOrderId || null,
+      moNumber: head?.moNumber || "",
+      poNumber: head?.poNumber || "",
+      customerName: head?.customerName || "",
+      requestType: head?.requestType || "",
+      orders,
       lines,
       packedBy,
       packedAt: now,
@@ -1015,7 +1060,8 @@ async function applyPackingSession({
 router.post("/done", ...canRecord, async (req, res) => {
   try {
     const { groups, notes = "" } = req.body;
-    const appendTo = access.str(req.body?.cartonNumber) ? normaliseCartonNumber(req.body.cartonNumber) : "";
+    const noCarton = req.body?.noCarton === true;
+    const appendTo = !noCarton && access.str(req.body?.cartonNumber) ? normaliseCartonNumber(req.body.cartonNumber) : "";
     const packagedBy = req.user?.name || req.user?.employeeId || "Packaging Dept";
     const packedBy = {
       userId: access.str(req.user?.id),
@@ -1060,28 +1106,28 @@ router.post("/done", ...canRecord, async (req, res) => {
     }
 
     /* ── ONE CARTON, ONE ORDER ─────────────────────────────────────────── */
-    const orderKeys = new Set(provenWorkOrders.map((w) => String(w.customerRequestId || "")));
-    if (orderKeys.size > 1) {
-      return res.status(400).json({
-        success: false,
-        code: "MIXED_ORDERS",
-        message: `A carton holds one order. The scanned pieces belong to ${orderKeys.size} different orders — pack them as separate cartons.`,
-      });
-    }
-    const orderId = [...orderKeys][0] || "";
-    const mo = orderId && access.isId(orderId)
-      ? await CustomerRequest.findById(orderId).select(`requestId requestType customerInfo.name ${PO_SELECT}`).lean()
-      : null;
+    /* ── A CARTON MAY HOLD SEVERAL ORDERS (8 Oct 2026, owner) ─────────────
+       The MIXED_ORDERS and CARTON_OTHER_ORDER refusals that stood here are
+       gone: pieces of several POs may go in one box, and more may be added
+       to a box holding another order. Each line records its order and the
+       carton lists every order inside it. */
+    const orderKeys = [...new Set(provenWorkOrders.map((w) => String(w.customerRequestId || "")))].filter(access.isId);
+    const mosById = new Map(
+      (orderKeys.length ? await CustomerRequest.find({ _id: { $in: orderKeys.map(access.oid) } }).select(`requestId requestType customerInfo.name ${PO_SELECT}`).lean() : [])
+        .map((m) => [String(m._id), m]),
+    );
 
-    await ensureCartonCollection();
+    if (!noCarton) await ensureCartonCollection();
 
     /* ── AN EXISTING CARTON: it must be this company's, still on the floor,
        and holding the same order. Checked here so the person hears why
        before anything is written; re-checked inside the transaction in case
        it was dispatched in between. */
-    let cartonId;
-    let cartonNumber;
-    if (appendTo) {
+    let cartonId = null;
+    let cartonNumber = "";
+    if (noCarton) {
+      /* nothing to allocate: no box, no number */
+    } else if (appendTo) {
       const target = await PackingCarton.findOne({ companyId: companyOf(req), cartonNumber: appendTo })
         .select("_id cartonNumber status manufacturingOrderId moNumber customerName").lean();
       if (!target) {
@@ -1090,16 +1136,6 @@ router.post("/done", ...canRecord, async (req, res) => {
       if (target.status !== "packed") {
         return res.status(409).json({ success: false, code: "CARTON_DISPATCHED",
           message: `Carton ${appendTo} has already been dispatched — it cannot take more pieces.` });
-      }
-      if (String(target.manufacturingOrderId || "") !== orderId) {
-        /* Customer names are part of the message on purpose: three order
-           numbers are shared by two different orders each (services/requestId.js),
-           so "holds MO-REQ-2026-0003; these belong to MO-REQ-2026-0003" is a
-           true refusal that reads like a bug without them. */
-        const cartonSide = [target.moNumber, target.customerName].filter(Boolean).join(" · ") || "a different order";
-        const pieceSide = mo ? [`MO-${mo.requestId}`, mo.customerInfo?.name].filter(Boolean).join(" · ") : "another order";
-        return res.status(400).json({ success: false, code: "CARTON_OTHER_ORDER",
-          message: `Carton ${appendTo} holds ${cartonSide}; these pieces belong to ${pieceSide}. A carton holds one order.` });
       }
       cartonId = target._id;
       cartonNumber = target.cartonNumber;
@@ -1115,7 +1151,7 @@ router.post("/done", ...canRecord, async (req, res) => {
       await session.withTransaction(async () => {
         result = await applyPackingSession({
           session, companyId: companyOf(req), groups, notes, packagedBy, packedBy, now,
-          cartonId, cartonNumber, appendTo, mo,
+          cartonId, cartonNumber, appendTo, mosById, noCarton,
         });
       });
     } finally {
@@ -1128,6 +1164,19 @@ router.post("/done", ...canRecord, async (req, res) => {
         code: "NOTHING_NEW",
         message: "Nothing new to pack — every scanned piece is already in a carton.",
         summary: result.summary,
+      });
+    }
+
+    if (result.noCarton) {
+      return res.json({
+        success: true,
+        noCarton: true,
+        message: `${result.added} piece${result.added !== 1 ? "s" : ""} recorded as packed — no carton`,
+        summary: result.summary,
+        appended: false,
+        added: result.added,
+        carton: null,
+        lines: (result.lines || []).map((l) => ({ workOrderId: l.workOrderId, workOrderNumber: l.workOrderNumber, productName: l.productName, quantity: l.quantity, unitNumbers: l.unitNumbers, employee: l.employee || null })),
       });
     }
 
@@ -1148,6 +1197,8 @@ router.post("/done", ...canRecord, async (req, res) => {
         moNumber: c.moNumber,
         poNumber: c.poNumber,
         customerName: c.customerName,
+        orders: c.orders || [],
+        mixed: (c.orders || []).length > 1,
         packedAt: c.packedAt,
         packedBy: c.packedBy,
         sessions: (c.additions || []).length,
@@ -1188,6 +1239,7 @@ router.get("/cartons", ...canRead, async (req, res) => {
       const rx = new RegExp(escapeRegex(needle), "i");
       filter.$or = [
         { cartonNumber: rx }, { poNumber: rx }, { moNumber: rx }, { customerName: rx },
+        { "orders.moNumber": rx }, { "orders.poNumber": rx }, { "orders.customerName": rx }, { "lines.moNumber": rx },
         { "lines.workOrderNumber": rx }, { "lines.workOrderShortId": rx },
         { "lines.productName": rx }, { "lines.employee.employeeName": rx },
         { "packedBy.name": rx },

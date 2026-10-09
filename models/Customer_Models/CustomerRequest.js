@@ -478,6 +478,9 @@ const quotationItemSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+    /* true when the sales person set the rate by hand on the PI (9 Oct 2026);
+       the quotation routes then keep it instead of the price slab. */
+    gstManual: { type: Boolean, default: false },
     priceBeforeGST: {
       type: Number,
       min: 0,
@@ -1384,9 +1387,31 @@ customerRequestSchema.add({
     new mongoose.Schema(
       {
         requestNumber: { type: String, trim: true, default: "" },
-        status: { type: String, enum: ["open", "partially_issued", "issued", "cancelled"], default: "open" },
+        /* ── TWO KINDS OF REQUEST SHARE THIS ARRAY (7 Oct 2026) ─────────────
+           `source: "ppc"` (the default, every request before this date) asks
+           the Store to ISSUE material from stock against the order; its
+           status is derived from StockIssuance. `source: "merchandising"`
+           asks the Store to BRING material IN for the order — the Store
+           records goods receipts against it, so its lines carry a received
+           figure and its status is derived from those. The PPC views skip
+           merchandising requests; the Store's Purchase register lists them. */
+        source: { type: String, enum: ["ppc", "merchandising"], default: "ppc" },
+        companyId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        status: {
+          type: String,
+          enum: ["draft", "open", "partially_issued", "issued", "partially_received", "received", "cancelled"],
+          default: "open",
+        },
+        /* Merchandising requests only: a DRAFT is the merchandiser's own —
+           editable, withdrawable, invisible to the Store — until submitted. */
+        submittedAt: { type: Date, default: null },
+        submittedBy: materialRequestPerson,
+        updatedAt: { type: Date, default: null },
         reason: { type: String, trim: true, default: "" },
         neededBy: { type: Date, default: null },
+        /* A merchandising request's replay key: the same key on the same
+           order answers the request already raised instead of a second one. */
+        idempotencyKey: { type: String, trim: true, default: "" },
         lines: [
           new mongoose.Schema(
             {
@@ -1398,6 +1423,26 @@ customerRequestSchema.add({
               quantity: { type: Number, required: true, min: 0 },
               unit: { type: String, trim: true, default: "" },
               note: { type: String, trim: true, default: "" },
+              /* Merchandising requests only: what the Store has received
+                 against this line, in the line's unit. */
+              receivedQuantity: { type: Number, default: 0, min: 0 },
+            },
+            { _id: true },
+          ),
+        ],
+        /* Merchandising requests only: one row per goods receipt recorded. */
+        receipts: [
+          new mongoose.Schema(
+            {
+              goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+              receiptNumber: { type: String, trim: true, default: "" },
+              receivedAt: { type: Date, default: Date.now },
+              byName: { type: String, trim: true, default: "" },
+              lines: [{
+                lineId: { type: mongoose.Schema.Types.ObjectId },
+                quantity: { type: Number, default: 0 },
+                unit: { type: String, trim: true, default: "" },
+              }],
             },
             { _id: true },
           ),

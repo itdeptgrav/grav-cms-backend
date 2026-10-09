@@ -11,6 +11,9 @@
 // No historical record is touched by any of this.
 "use strict";
 process.env.SALARY_ENCRYPTION_KEY = process.env.SALARY_ENCRYPTION_KEY || "0".repeat(64);
+/* These tests describe the STRICT rule; the deployment runs lenient by
+   default since 9 Oct 2026 (see workOrderStyleLink.service.js). */
+process.env.SALES_RELEASE_REQUIRE_STYLE = "1";
 
 const mongoose = require("mongoose");
 

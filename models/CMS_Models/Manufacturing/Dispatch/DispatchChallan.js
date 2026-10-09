@@ -11,6 +11,9 @@ const challanProductSchema = new mongoose.Schema(
     workOrderNumber:  { type: String, default: "" },
     productName:      { type: String, required: true },
     productRef:       { type: String, default: "" },
+    /* The product photo as it stood at dispatch (8 Oct 2026) — the challan
+       PDF prints it. Blank on challans made before. */
+    productImage:     { type: String, default: "" },
     variantAttributes: [
       {
         name:  { type: String },
@@ -97,6 +100,7 @@ const dispatchChallanSchema = new mongoose.Schema(
                 productName:     { type: String, default: "" },
                 productRef:      { type: String, default: "" },
                 variantText:     { type: String, default: "" },
+                productImage:    { type: String, default: "" },
                 quantity:        { type: Number, default: 0 },
                 employeeName:    { type: String, default: "" },
                 employeeUIN:     { type: String, default: "" },

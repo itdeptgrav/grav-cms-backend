@@ -58,6 +58,11 @@ const cartonLineSchema = new mongoose.Schema(
     workOrderShortId: { type: String, trim: true, default: "" },
 
     stockItemId: { type: mongoose.Schema.Types.ObjectId, ref: "StockItem" },
+    /* The order this line's work order belongs to (8 Oct 2026): a carton may
+       now hold several orders, so each line says whose it is. Absent on
+       lines written before — read the carton's head order for those. */
+    manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null },
+    moNumber: { type: String, trim: true, default: "" },
     productName: { type: String, trim: true, default: "" },
     productReference: { type: String, trim: true, default: "" },
     variantId: { type: String, trim: true, default: "" },
@@ -128,6 +133,23 @@ const packingCartonSchema = new mongoose.Schema(
     customerName: { type: String, trim: true, default: "" },
     requestType: { type: String, trim: true, default: "" },
 
+    /* ── A CARTON MAY HOLD SEVERAL ORDERS (8 Oct 2026, owner) ─────────────
+       "One carton, one order" was the rule since cartons were introduced;
+       the owner removed it: pieces of several POs can go in one box. The
+       head fields above stay the FIRST order (every older reader keeps
+       working); this list is every order with pieces inside, and each line
+       carries its own. `orders.length > 1` is a mixed carton. */
+    orders: {
+      type: [new mongoose.Schema({
+        manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null },
+        moNumber: { type: String, trim: true, default: "" },
+        poNumber: { type: String, trim: true, default: "" },
+        customerName: { type: String, trim: true, default: "" },
+        requestType: { type: String, trim: true, default: "" },
+      }, { _id: false })],
+      default: [],
+    },
+
     lines: { type: [cartonLineSchema], default: [] },
     totalQuantity: { type: Number, default: 0, min: 0 },
     workOrderCount: { type: Number, default: 0, min: 0 },
@@ -165,6 +187,18 @@ const packingCartonSchema = new mongoose.Schema(
        2026) so the carton page and list can say "left on DC-… by …" without
        a join. Set only by the carton-dispatch route. */
     dispatchChallanNumber: { type: String, trim: true, default: "" },
+    /* A mixed carton leaves on one challan PER ORDER inside it (each order's
+       history stays its own); the head challan above is the one of the order
+       it was dispatched from, these are all of them. */
+    dispatchChallans: {
+      type: [new mongoose.Schema({
+        challanId: { type: mongoose.Schema.Types.ObjectId, ref: "DispatchChallan", default: null },
+        challanNumber: { type: String, trim: true, default: "" },
+        manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        moNumber: { type: String, trim: true, default: "" },
+      }, { _id: false })],
+      default: [],
+    },
     dispatchedBy: { type: packedBySchema, default: null },
   },
   { timestamps: true },

@@ -23,7 +23,7 @@
 const mongoose = require("mongoose");
 
 /* ── THE LIFECYCLE ──────────────────────────────────────────────────────────
- *   DRAFT               created from the approval, not yet issued
+ *   DRAFT               created (from an approval, or directly by Store), not yet issued
  *   ISSUED              sent to the supplier
  *   IN_PROGRESS         Store started it / supplier is working
  *   COMPLETION_REPORTED the supplier says the agreed service is done
@@ -120,8 +120,18 @@ const serviceOrderSchema = new mongoose.Schema(
     /* ── THE APPROVAL THIS FULFILS ────────────────────────────────────────
        Unique among non-null values (partial index below), so one approved
        request produces at most one service order. */
-    spendRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "SpendRequest", required: true },
+    spendRequestId: { type: mongoose.Schema.Types.ObjectId, ref: "SpendRequest", default: null },
     spendRequestNumber: { type: String, trim: true, default: "" },
+
+    /* ── WHERE THE ORDER CAME FROM (7 Oct 2026) ───────────────────────────
+       "spend_request" — made from an approved request (the original path,
+       and what every order before this date is: they all carry a
+       spendRequestId). "direct" — raised by Store itself on the Create
+       service order form, with no request behind it (owner: "directly he
+       can create the service order as he is a Store person"). A direct
+       order is accepted by Store, since there is no other requesting
+       department to do it. */
+    origin: { type: String, enum: ["spend_request", "direct"], default: "spend_request" },
 
     /* Supplier snapshots — one supplier per order (see the conversion rule). */
     vendor: { type: mongoose.Schema.Types.ObjectId, ref: "Vendor", default: null },

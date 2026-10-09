@@ -53,24 +53,28 @@ async function resolveQcActor(req) {
 
   const u = req.qcUser || {};
   const email = String(u.email || "").toLowerCase();
-  const role = u.isAdmin ? "owner" : await getRole(SLUG, email);
-  const owner = Boolean(u.isAdmin) || role === "owner";
 
   const now = new Date();
-  /* An active roster row, in force right now. The window is inclusive at both
-     ends and open-ended when either bound is absent, which is how the owner
-     rosters somebody "from now until I say otherwise". */
-  const checkerRow = email
-    ? await QCRawItemSetting.findOne({
-        kind: "checker", email, isActive: true,
-        $or: [{ validFrom: null }, { validFrom: { $lte: now } }],
-        $and: [{ $or: [{ validTo: null }, { validTo: { $gte: now } }] }],
-      }).lean()
-    : null;
-
-  const emp = email
-    ? await Employee.findOne({ email }).select("firstName middleName lastName biometricId").lean()
-    : null;
+  /* The three reads do not depend on one another, so they go out together
+     (8 Oct 2026): one round trip's worth of waiting on every QC request
+     instead of three in a row.
+     The roster row: an active one, in force right now. The window is inclusive
+     at both ends and open-ended when either bound is absent, which is how the
+     owner rosters somebody "from now until I say otherwise". */
+  const [role, checkerRow, emp] = await Promise.all([
+    u.isAdmin ? "owner" : getRole(SLUG, email),
+    email
+      ? QCRawItemSetting.findOne({
+          kind: "checker", email, isActive: true,
+          $or: [{ validFrom: null }, { validFrom: { $lte: now } }],
+          $and: [{ $or: [{ validTo: null }, { validTo: { $gte: now } }] }],
+        }).lean()
+      : null,
+    email
+      ? Employee.findOne({ email }).select("firstName middleName lastName biometricId").lean()
+      : null,
+  ]);
+  const owner = Boolean(u.isAdmin) || role === "owner";
   const name = emp
     ? [emp.firstName, emp.middleName, emp.lastName].filter(Boolean).join(" ").trim() || u.name
     : u.name;

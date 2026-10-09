@@ -115,6 +115,11 @@ const salesJourneySchema = new mongoose.Schema(
     // name its origin without a second query.
     leadId: { type: mongoose.Schema.Types.ObjectId, ref: "Lead", index: true, sparse: true },
     leadRef: { type: String, trim: true },
+    /* The Customer this Journey was made FROM by the pipeline import
+       (services/sales/customerPipelineImport.js, 8 Oct 2026). Set once, by
+       the import only — traceability; idempotency is one Journey per Account. */
+    importedFromCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null },
+    importedFromCustomerCode: { type: String, trim: true, default: "" },
     /**
      * OPTIONAL since 22 Aug 2026, and no longer asked for at creation.
      *

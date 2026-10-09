@@ -113,7 +113,12 @@ function requestView(r, issueRows) {
 async function viewOf(order) {
   const issuances = await StockIssuance.find({ manufacturingOrder: order._id }).sort({ createdAt: 1 }).lean();
   const rows = issueRowsOf(issuances);
-  const requests = (order.materialRequests || []).map((r) => requestView(r, rows)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  /* Merchandising's requests ask the Store to bring material IN and are
+     received, not issued (7 Oct 2026); they live on the Store's Purchase
+     register, not here. */
+  const requests = (order.materialRequests || [])
+    .filter((r) => str(r.source || "ppc") !== "merchandising")
+    .map((r) => requestView(r, rows)).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
   const free = rows.filter((x) => !x.materialRequestId);
   return {
     order: { moId: String(order._id), requestId: str(order.requestId), moNumber: order.requestId ? `MO-${order.requestId}` : "", customerName: str(order.customerInfo?.name), status: str(order.status), products: (order.items || []).map((i) => str(i.stockItemName)).filter(Boolean) },

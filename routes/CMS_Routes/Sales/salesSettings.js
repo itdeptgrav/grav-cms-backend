@@ -59,6 +59,7 @@ router.patch("/", salesAuth, async (req, res) => {
       const emailSvc = require("../../../utils/salesEmailService");
       if (typeof emailSvc.invalidateCache === "function") emailSvc.invalidateCache();
     } catch (_) {}
+    try { require("../../../services/sales/piProductGate").forgetPiProductScope(); } catch (_) {}
 
     res.json({ success: true, message: "Settings saved successfully", settings });
   } catch (err) {

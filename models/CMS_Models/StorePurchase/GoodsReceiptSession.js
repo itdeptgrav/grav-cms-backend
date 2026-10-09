@@ -85,6 +85,15 @@ const goodsReceiptSessionSchema = new mongoose.Schema(
     customerMaterialId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerMaterialExpectation", default: null },
     customerDocumentRef: { type: String, trim: true, default: "" },
     customerLineRef: { type: String, trim: true, default: "" },
+    /* A third kind (7 Oct 2026): a line of a merchandiser's material request
+       against a released order. The request lives on the order
+       (`CustomerRequest.materialRequests[]`), so the count names the order,
+       the request and the request line. Company-owned stock — no customer
+       claim, no supplier. */
+    materialRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    materialRequestNumber: { type: String, trim: true, default: "" },
+    materialLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    orderRequestId: { type: mongoose.Schema.Types.ObjectId, default: null },
     /* The stored-id join to the PO line. Never a name, never an array index:
        a line reordered in the editor must not take another line's count. */
     poItemId: { type: mongoose.Schema.Types.ObjectId, default: null },

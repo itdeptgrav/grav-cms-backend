@@ -30,6 +30,7 @@ const CustomerRequest = require("../../../../models/Customer_Models/CustomerRequ
 const WorkOrder = require("../../../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const EmployeeProductionProgress = require("../../../../models/CMS_Models/Manufacturing/Production/Tracking/EmployeeProductionProgress");
 const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+const PackingCarton = require("../../../../models/CMS_Models/Manufacturing/Packaging/PackingCarton");
 const access = require("./packagingAccess");
 /* 143 of 152 work orders have no stored number (the model only assigns one to
    NEW records), so every WO number leaving this file is the display form. */
@@ -147,6 +148,39 @@ router.get("/manufacturing-orders", ...canRead, async (req, res) => {
 
     const total = enriched.length;
     const paged = enriched.slice(skip, skip + limitNum);
+
+    /* ── THE CARTONS, ON THE ROW (8 Oct 2026) ──────────────────────────────
+       The list said packed and dispatched and nothing between: how many
+       sealed boxes are waiting is what Dispatch needs to know before opening
+       an order. One grouped count over this page's orders, additive. */
+    if (paged.length) {
+      /* A carton may hold several orders, so it is counted for every order
+         whose pieces it carries, and the pieces are the LINES of that order,
+         never the whole box. A line written before lines carried an order
+         belongs to the carton's head order. */
+      const ids = paged.map((o) => o._id);
+      const grouped = await PackingCarton.aggregate([
+        { $match: { companyId: companyOf(req), $or: [{ manufacturingOrderId: { $in: ids } }, { "orders.manufacturingOrderId": { $in: ids } }] } },
+        { $unwind: "$lines" },
+        { $addFields: { lineOrder: { $ifNull: ["$lines.manufacturingOrderId", "$manufacturingOrderId"] } } },
+        { $match: { lineOrder: { $in: ids } } },
+        { $group: { _id: { mo: "$lineOrder", status: "$status" }, cartonIds: { $addToSet: "$_id" }, pieces: { $sum: "$lines.quantity" }, unweighedIds: { $addToSet: { $cond: [{ $eq: ["$weightKg", null] }, "$_id", null] } } } },
+      ]);
+      const byMo = new Map();
+      for (const g of grouped) {
+        const k = String(g._id.mo);
+        const row = byMo.get(k) || { cartonsReady: 0, cartonsDispatched: 0, piecesReady: 0, piecesInDispatchedCartons: 0, cartonsUnweighed: 0 };
+        const cartons = (g.cartonIds || []).length;
+        const unweighed = (g.unweighedIds || []).filter(Boolean).length;
+        if (g._id.status === "dispatched") { row.cartonsDispatched += cartons; row.piecesInDispatchedCartons += g.pieces; }
+        else { row.cartonsReady += cartons; row.piecesReady += g.pieces; row.cartonsUnweighed += unweighed; }
+        byMo.set(k, row);
+      }
+      for (const o of paged) {
+        const c = byMo.get(String(o._id)) || { cartonsReady: 0, cartonsDispatched: 0, piecesReady: 0, piecesInDispatchedCartons: 0, cartonsUnweighed: 0 };
+        Object.assign(o, c, { packedNotInCarton: Math.max(0, o.packagedQuantity - c.piecesReady - c.piecesInDispatchedCartons) });
+      }
+    }
 
     return res.json({
       success: true,

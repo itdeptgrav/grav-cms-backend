@@ -42,7 +42,21 @@ const ENTITY = "GOODS_RECEIPT";
 // stock WITHOUT synchronising the owning lot, corrupting ownership/location
 // integrity. So these routes refuse a customer-owned receipt outright. Returns
 // true (and sends the 400) when the caller should stop.
-function refuseCustomerOwned(res, grn) {
+function refuseCustomerOwned(res, grn, op = "") {
+  /* A material-request receipt (7 Oct 2026) is the same case for a different
+     reason: nothing was bought, there is no supplier to inspect against or
+     return to, and the stock was posted when the receipt was recorded. */
+  /* A material-request GRN goes through inspection, quarantine and put-away
+     like a purchase GRN (8 Oct 2026, owner). It has no supplier, so only a
+     SUPPLIER RETURN is refused. */
+  if (grn && grn.sourceType === GoodsReceipt.SOURCE_TYPE.MATERIAL_REQUEST && op === "supplier-return") {
+    res.status(400).json({
+      success: false,
+      reason: "NO_SUPPLIER",
+      message: "This receipt is against a material request, so there is no supplier to return rejected stock to.",
+    });
+    return true;
+  }
   if (grn && grn.sourceType === GoodsReceipt.SOURCE_TYPE.CUSTOMER_MATERIAL) {
     res.status(400).json({
       success: false,
@@ -239,6 +253,36 @@ router.get("/workspace", requireCapability(CAPABILITIES.READ), async (req, res) 
 });
 
 // GET /:grnId — one receipt with all lines and linked movement evidence.
+/* ── THE GRN AS A DOCUMENT (7 Oct 2026) ────────────────────────────────────
+   `/for-source` lists the GRNs of one purchase order or material request (the
+   detail pages link to them); `/:grnId/document` describes any GRN with its
+   source, for the GRN view page and its PDF. Declared before `/:grnId` so
+   "for-source" is never read as an id. */
+const grnDocument = require("../../../services/storePurchase/goodsReceiptDocument.service");
+router.get("/for-source", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const purchaseOrderId = mongoose.isValidObjectId(req.query.purchaseOrderId) ? req.query.purchaseOrderId : null;
+    const materialRequestId = mongoose.isValidObjectId(req.query.materialRequestId) ? req.query.materialRequestId : null;
+    if (!purchaseOrderId && !materialRequestId) return res.status(400).json({ success: false, message: "Name a purchase order or a material request." });
+    const receipts = await grnDocument.listForSource(req.tenant, { purchaseOrderId, materialRequestId });
+    res.json({ success: true, receipts });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[goods-receipts] for-source error:", err);
+    res.status(500).json({ success: false, message: "Server error while listing the goods receipts" });
+  }
+});
+router.get("/:grnId/document", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const out = await grnDocument.document(req.tenant, req.params.grnId);
+    res.json({ success: true, ...out });
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err);
+    console.error("[goods-receipts] document error:", err);
+    res.status(500).json({ success: false, message: "Server error while loading the goods receipt" });
+  }
+});
+
 router.get("/:grnId", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.grnId)) return res.status(404).json({ success: false, message: "Goods receipt not found" });
@@ -258,14 +302,20 @@ router.get("/:grnId/control", requireCapability(CAPABILITIES.READ), async (req, 
     const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
     if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
 
-    const [inspection, putaways, dispositions, ctx, supplierReturns] = await Promise.all([
+    const material = grn.sourceType === GoodsReceipt.SOURCE_TYPE.MATERIAL_REQUEST;
+    const [storeInspection, putaways, dispositions, ctx, supplierReturns, qc] = await Promise.all([
       GoodsReceiptInspection.findOne({ companyId: req.tenant.companyId, goodsReceiptId: grn._id }).lean(),
       GoodsReceiptPutaway.find({ companyId: req.tenant.companyId, goodsReceiptId: grn._id }).sort({ createdAt: 1 }).lean(),
       GoodsReceiptDisposition.find({ companyId: req.tenant.companyId, goodsReceiptId: grn._id }).sort({ createdAt: 1 }).lean(),
       loadWarehouseContext(req.tenant, grn),
       loadGrnSupplierReturns(req.tenant, grn),
+      /* QC's raw-material check is the inspection of a material-request GRN
+         (8 Oct 2026): complete → it stands as the inspection; part-way → the
+         receipt waits, and the progress is said. */
+      material ? require("../../../services/storePurchase/qcInspectionBridge").qcStandingOf(grn) : null,
     ]);
-    const c = control.deriveControl(grn, inspection, putaways, ctx, { dispositions, supplierReturns });
+    const inspection = storeInspection || qc?.inspection || null;
+    const c = control.deriveControl(grn, inspection, putaways, { ...ctx, noSupplier: material }, { dispositions, supplierReturns });
 
     // The receipt's supplier returns + their replacement facts, linked (not
     // recomputed) to the existing supplier-return lifecycle on the PO.
@@ -283,11 +333,19 @@ router.get("/:grnId/control", requireCapability(CAPABILITIES.READ), async (req, 
       success: true,
       goodsReceipt: {
         id: String(grn._id), receiptNumber: grn.receiptNumber, poNumber: grn.poNumber, purchaseOrderId: grn.purchaseOrderId ? String(grn.purchaseOrderId) : null,
+        sourceType: grn.sourceType || "PURCHASE_ORDER",
+        materialRequest: grn.sourceType === GoodsReceipt.SOURCE_TYPE.MATERIAL_REQUEST ? {
+          requestId: grn.materialRequest?.requestId ? String(grn.materialRequest.requestId) : null,
+          requestNumber: grn.materialRequest?.requestNumber || grn.sourceDocumentNumber || "",
+          orderRef: grn.materialRequest?.orderRef || "",
+        } : null,
         supplierName: grn.supplierName, receiptDate: grn.receiptDate, invoiceNumber: grn.invoiceNumber,
         warehouseName: grn.warehouseName, receivingLocation: [grn.locationName, grn.locationCode].filter(Boolean).join(" · "),
       },
       stage: c.stage, flags: c.flags, counts: c.counts, lines: c.lines,
-      inspection: inspection ? { inspectedAt: inspection.inspectedAt, inspectedByName: inspection.inspectedBy?.name || "", note: inspection.note || "" } : null,
+      inspection: inspection ? { inspectedAt: inspection.inspectedAt, inspectedByName: inspection.inspectedBy?.name || "", note: inspection.note || "", source: inspection.source || "store" } : null,
+      /* how far QC has got on a material-request GRN, inspected or not */
+      qcProgress: qc ? { complete: qc.progress.complete, anyChecked: qc.progress.anyChecked, text: qc.progress.text, lastAt: qc.progress.lastAt, checkers: qc.progress.checkers, lines: qc.progress.lines, href: `/qc/dashboard/orders/grn/${String(grn._id)}` } : null,
       putaways: putaways.map((p) => ({ id: String(p._id), goodsReceiptLineId: String(p.goodsReceiptLineId), itemName: p.itemName, quantity: p.quantity, unit: p.unit, toLocation: [p.toLocationName, p.toLocationCode].filter(Boolean).join(" · "), transferId: p.transferId ? String(p.transferId) : null, at: p.at })),
       // Immutable quarantine disposition history.
       dispositions: dispositions.map((d) => ({
@@ -319,6 +377,12 @@ router.post("/:grnId/inspection",
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
       if (refuseCustomerOwned(res, grn)) return;
+      /* A material-request GRN is inspected by QC, label by label, on the QC
+         dashboard (8 Oct 2026): the Store's own inspection form is not the
+         record for it, and two inspections of one receipt would disagree. */
+      if (grn.sourceType === GoodsReceipt.SOURCE_TYPE.MATERIAL_REQUEST) {
+        return res.status(400).json({ success: false, reason: "INSPECTED_BY_QC", message: "This receipt is against a material request, so QC inspects it label by label on the QC dashboard. Once every unit received is checked there, it stands here as the inspection." });
+      }
 
       if (req.idempotent?.recovering) {
         const existing = await GoodsReceiptInspection.findOne({ companyId: req.tenant.companyId, goodsReceiptId: grn._id, idempotencyKey: req.idempotent.key }).lean();
@@ -552,7 +616,7 @@ router.post("/:grnId/supplier-returns",
     try {
       const grn = await GoodsReceipt.findOne({ _id: req.params.grnId, ...tenantContext.tenantFilter(req.tenant) }).lean();
       if (!grn) return res.status(404).json({ success: false, message: "Goods receipt not found" });
-      if (refuseCustomerOwned(res, grn)) return;
+      if (refuseCustomerOwned(res, grn, "supplier-return")) return;
       const operationId = req.idempotent?.record?._id || null;
 
       if (req.idempotent?.recovering) {

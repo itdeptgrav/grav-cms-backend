@@ -813,6 +813,13 @@ const leadSchema = new mongoose.Schema(
 
     // ── Conversion — LEGACY (top-level). See file header. Not written by any
     // canonical code path in this chunk; kept for read compatibility only.
+    /* The Customer record this Lead was made FROM, by the pipeline import
+       (services/sales/customerPipelineImport.js, 8 Oct 2026). Set once, by
+       the import only; it is what makes the import idempotent. Distinct from
+       the legacy converted* fields below, which point the other way. */
+    importedFromCustomerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer", default: null, index: true },
+    importedFromCustomerCode: { type: String, trim: true, default: "" },
+
     convertedToCustomer: { type: Boolean, default: false },
     convertedCustomerId: {
       type: mongoose.Schema.Types.ObjectId,

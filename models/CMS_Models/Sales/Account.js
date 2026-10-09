@@ -418,8 +418,17 @@ accountSchema.pre("validate", function (next) {
 
 accountSchema.pre("save", async function (next) {
   if (!this.accountId) {
-    const count = await mongoose.model("CRMAccount").countDocuments();
-    this.accountId = `ACC-${String(count + 1).padStart(4, "0")}`;
+    /* ── THE NEXT NUMBER, NOT THE ROW COUNT ─────────────────────────────
+       This was `count + 1`. The moment one account is deleted (ACC-0003 is
+       gone from the live data) the count falls behind the numbers in use,
+       every later create mints an id that already exists, and the unique
+       index refuses it with E11000 — which is how linking 23 customers to
+       new accounts failed on the first one (7 Oct 2026). The highest number
+       in use, plus one, cannot collide with a gap. */
+    const rows = await mongoose.model("CRMAccount")
+      .find({ accountId: { $regex: /^ACC-\d+$/ } }).select("accountId").lean();
+    const top = rows.reduce((m, r) => Math.max(m, parseInt(String(r.accountId).slice(4), 10) || 0), 0);
+    this.accountId = `ACC-${String(top + 1).padStart(4, "0")}`;
   }
   next();
 });

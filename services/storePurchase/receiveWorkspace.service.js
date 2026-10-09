@@ -56,12 +56,16 @@ const SOURCE = Object.freeze({
   ALL: "all",
   PURCHASED: "purchased",
   CUSTOMER: "customer-owned",
+  /* Merchandising's material requests against released orders (7 Oct 2026):
+     company-owned stock with no supplier and no price. */
+  MATERIAL: "material-request",
 });
-const SOURCES = Object.freeze([SOURCE.ALL, SOURCE.PURCHASED, SOURCE.CUSTOMER]);
+const SOURCES = Object.freeze([SOURCE.ALL, SOURCE.PURCHASED, SOURCE.CUSTOMER, SOURCE.MATERIAL]);
 
 const SOURCE_TYPE = Object.freeze({
   PURCHASE: "PURCHASE_ORDER",
   CUSTOMER: "CUSTOMER_MATERIAL",
+  MATERIAL: "MATERIAL_REQUEST",
 });
 
 /* One next action per row, derived from authoritative flags only. The order is
@@ -79,6 +83,9 @@ const ACTION = Object.freeze({
   /* Customer-owned material has no purchased control pipeline — its one action
      is to open the customer-material document that owns its issue/return/labels. */
   VIEW_CUSTOMER: { code: "VIEW_CUSTOMER", label: "View customer-supplied receipt" },
+  /* Material requests: received on their own page, viewed as a GRN document. */
+  RECEIVE_MATERIAL: { code: "RECEIVE_MATERIAL", label: "Record receipt" },
+  VIEW_GRN: { code: "VIEW_GRN", label: "View GRN" },
 });
 
 /* Bounded by default. Stage is DERIVED for recorded receipts, so the scan is
@@ -152,7 +159,8 @@ function readQuery(q = {}) {
     ? rawSource
     : rawSource === "customer" ? SOURCE.CUSTOMER
       : rawSource === "purchase" ? SOURCE.PURCHASED
-        : SOURCE.ALL;
+        : rawSource === "material" ? SOURCE.MATERIAL
+          : SOURCE.ALL;
   const page = Math.max(1, parseInt(q.page, 10) || 1);
   const pageSize = Math.min(100, Math.max(1, parseInt(q.pageSize, 10) || 25));
   // Date range for RECORDED receipts (by receipt date). Deliberately NOT applied
@@ -245,14 +253,22 @@ function receiptRow(g, flags, counts, stage) {
     };
   }
 
+  /* -- MATERIAL REQUEST (8 Oct 2026, owner): the GRN is followed by the same
+     inspection -> quarantine -> put-away control as a purchase GRN, so it wears
+     the same stage, status and next action. Only the party (the order's
+     customer, not a supplier) and the reference (the request and its order)
+     differ, and there is no supplier invoice. */
+  const material = g.sourceType === SOURCE_TYPE.MATERIAL;
   const action = nextActionFor(flags);
   return {
     id: String(g._id),
-    sourceType: SOURCE.PURCHASED,
+    sourceType: material ? SOURCE.MATERIAL : SOURCE.PURCHASED,
     reference: g.receiptNumber || "",
-    partyLabel: g.supplierName || "",
-    partyKind: "supplier",
-    orderReference: g.poNumber || "",
+    partyLabel: material ? (g.__customerName || "") : (g.supplierName || ""),
+    partyKind: material ? "customer" : "supplier",
+    orderReference: material
+      ? [g.materialRequest?.requestNumber || g.sourceDocumentNumber, g.materialRequest?.orderRef].filter(Boolean).join(" \u00b7 ")
+      : (g.poNumber || ""),
     /* Absent stays absent — an invented date reads as a recorded one. */
     recordedDate: g.receiptDate || g.createdAt || null,
     lineCount: Array.isArray(g.lines) ? g.lines.length : 0,
@@ -269,7 +285,7 @@ function receiptRow(g, flags, counts, stage) {
     },
     counts: counts || {},
     nextAction: { ...action, href: `/store/dashboard/operations/goods-receipts/${String(g._id)}` },
-    invoiceNumber: g.invoiceNumber || "",
+    invoiceNumber: material ? "" : (g.invoiceNumber || ""),
     recordedByName: g.recordedBy?.name || "",
   };
 }
@@ -284,6 +300,7 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
   const extra = {};
   if (source === SOURCE.PURCHASED) extra.sourceType = SOURCE_TYPE.PURCHASE;
   if (source === SOURCE.CUSTOMER) extra.sourceType = SOURCE_TYPE.CUSTOMER;
+  if (source === SOURCE.MATERIAL) extra.sourceType = SOURCE_TYPE.MATERIAL;
   // From/To filter recorded receipts by their RECEIPT DATE (the same field the
   // legacy register filtered). Applied in the DB before the bounded scan so the
   // coverage note describes the dated set honestly.
@@ -303,6 +320,7 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
       { sourceDocumentNumber: rx },
       { "customerMaterial.customerLabel": rx }, { "customerMaterial.orderRef": rx },
       { "customerMaterial.customerReference": rx },
+      { "materialRequest.requestNumber": rx }, { "materialRequest.orderRef": rx },
     ];
   }
   const filter = scoped(tenant, extra);
@@ -312,7 +330,7 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
   const docs = await GoodsReceipt.find(filter)
     .select("receiptNumber poNumber purchaseOrderId supplierName supplierId receiptDate "
       + "warehouseName locationCode locationName warehouseId locationId invoiceNumber "
-      + "sourceType sourceDocumentId sourceDocumentNumber customerMaterial "
+      + "sourceType sourceDocumentId sourceDocumentNumber customerMaterial materialRequest "
       + "recordedBy lines createdAt")
     .sort({ receiptDate: -1, _id: -1 })
     .limit(cap)
@@ -330,6 +348,10 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
   ]);
 
   const inspByGrn = new Map(inspections.map((i) => [String(i.goodsReceiptId), i]));
+  /* QC's raw-material check stands as the inspection of a material-request
+     GRN the Store has not inspected itself (8 Oct 2026). */
+  const qcBridge = require("./qcInspectionBridge");
+  const qcByGrn = await qcBridge.qcStandingFor(docs.filter((d) => d.sourceType === SOURCE_TYPE.MATERIAL && !inspByGrn.has(String(d._id))));
   const group = (rows) => {
     const out = new Map();
     for (const r of rows) {
@@ -351,6 +373,17 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
     }
   }
 
+  /* The order's customer, for material-request receipts (the GRN names the
+     order, not the customer). One read for the page. */
+  const orderIds = [...new Set(docs.filter((d) => d.sourceType === SOURCE_TYPE.MATERIAL)
+    .map((d) => d.materialRequest?.customerRequestId).filter(Boolean).map(String))];
+  if (orderIds.length) {
+    const CustomerRequest = mongoose.models.CustomerRequest || require("../../models/Customer_Models/CustomerRequest");
+    const orders = await CustomerRequest.find({ _id: { $in: orderIds } }).select("customerInfo.name").lean();
+    const nameOf = new Map(orders.map((o) => [String(o._id), o.customerInfo?.name || ""]));
+    for (const d of docs) if (d.sourceType === SOURCE_TYPE.MATERIAL) d.__customerName = nameOf.get(String(d.materialRequest?.customerRequestId)) || "";
+  }
+
   const rows = docs.map((g) => {
     /* Customer-owned receipts have NO purchased control state — deriveControl is
        for the inspection/put-away/supplier-return pipeline, which they never
@@ -360,12 +393,19 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
     if (g.sourceType === SOURCE_TYPE.CUSTOMER) return receiptRow(g, {}, {}, STAGE.COMPLETED);
 
     const k = String(g._id);
+    const material = g.sourceType === SOURCE_TYPE.MATERIAL;
+    const qc = material ? qcByGrn.get(k) : null;
     /* The one authority on stage for a PURCHASED receipt. Not re-derived here. */
-    const c = control.deriveControl(g, inspByGrn.get(k) || null, putawaysByGrn.get(k) || [], {}, {
+    const c = control.deriveControl(g, inspByGrn.get(k) || qc?.inspection || null, putawaysByGrn.get(k) || [], { noSupplier: material }, {
       dispositions: dispsByGrn.get(k) || [],
       supplierReturns: returnsByGrn.get(k) || [],
     });
-    const flags = { ...c.flags, controlStage: c.stage };
+    /* While QC is part-way through a material-request GRN the stage is still
+       "awaiting inspection", said with how far QC has got. */
+    const controlStage = qc && !qc.inspection
+      ? (qc.progress.anyChecked ? `QC checking \u00b7 ${qc.progress.text}` : "Awaiting QC check")
+      : qc?.inspection && c.stage === control.STAGE?.AWAITING_PUTAWAY ? "Checked by QC \u00b7 awaiting put-away" : c.stage;
+    const flags = { ...c.flags, controlStage };
     return receiptRow(g, flags, c.counts, stageOfReceipt(c.flags));
   });
 
@@ -528,6 +568,38 @@ async function readExpectedCustomer(ctx, { search }) {
 }
 
 /**
+ * Material requests the Store still has to receive (7 Oct 2026): submitted
+ * (open or partly received) merchandising requests with a line pending. Read
+ * through the register service the Purchase page uses, so the two never
+ * disagree about which requests are outstanding.
+ */
+async function readExpectedMaterial(tenant, { search }) {
+  const mrReceipts = require("./materialRequestReceipt.service");
+  const all = await mrReceipts.registerRows(tenant, { stage: "on-order", status: "open", search });
+  const rows = all.filter((r) => num(r.linesAwaitingReceipt) > 0).map((r) => ({
+    id: r.id,
+    sourceType: SOURCE.MATERIAL,
+    reference: r.reference,
+    partyLabel: r.requestedFor || "",
+    partyKind: "customer",
+    orderReference: r.orderRef || "",
+    expectedDate: r.expectedDate || null,
+    recordedDate: null,
+    lineCount: num(r.linesAwaitingReceipt),
+    warehouseName: "",
+    locationLabel: "",
+    stage: STAGE.EXPECTED,
+    controlStage: "",
+    flags: {},
+    counts: {},
+    nextAction: { ...ACTION.RECEIVE_MATERIAL, href: `/store/dashboard/operations/material-requests/${r.id}/receive` },
+    invoiceNumber: "",
+    recordedByName: "",
+  }));
+  return { rows, coverage: { scannedCount: all.length, scanCap: 300, storedMatchCount: all.length, truncated: false } };
+}
+
+/**
  * The whole workspace, as one closed DTO.
  *
  * ── A FAILED SOURCE IS NEVER ZERO ROWS ──────────────────────────────────────
@@ -557,6 +629,7 @@ async function workspace(tenant, ctx, query = {}) {
 
   const wantPurchased = source === SOURCE.ALL || source === SOURCE.PURCHASED;
   const wantCustomer = source === SOURCE.ALL || source === SOURCE.CUSTOMER;
+  const wantMaterial = source === SOURCE.ALL || source === SOURCE.MATERIAL;
 
   const sources = {};
   let rows = [];
@@ -587,27 +660,20 @@ async function workspace(tenant, ctx, query = {}) {
   if (stage === STAGE.EXPECTED) {
     if (wantPurchased) rows = rows.concat(await attempt("expectedPurchased", () => readExpectedPurchased(tenant, { search })));
     if (wantCustomer) rows = rows.concat(await attempt("expectedCustomer", () => readExpectedCustomer(ctx, { search })));
+    if (wantMaterial) rows = rows.concat(await attempt("expectedMaterial", () => readExpectedMaterial(tenant, { search })));
     rows.sort(byExpectedDate);
   } else if (dateInvalid) {
     // Do not query an impossible range — that would return zero and read as
     // "no receipts exist". The page shows the validation message instead.
     rows = [];
   } else if (stage === STAGE.ALL) {
-    /* ── EVERYTHING, IN THE ORDER A RECEIVER WORKS (1 Oct 2026) ──────────
-       Expected arrivals first (earliest due first), then the recorded
-       receipts that still need work, then the completed ones — each group in
-       its own tab's order. A date range filters the RECORDED rows by receipt
-       date, as on those tabs; an expected arrival has no receipt date, so
-       while a range is set none is listed rather than one being guessed in. */
-    let expected = [];
-    if (!(dateFrom || dateTo)) {
-      if (wantPurchased) expected = expected.concat(await attempt("expectedPurchased", () => readExpectedPurchased(tenant, { search })));
-      if (wantCustomer) expected = expected.concat(await attempt("expectedCustomer", () => readExpectedCustomer(ctx, { search })));
-      expected.sort(byExpectedDate);
-    }
+    /* -- EVERY RECORDED GRN (8 Oct 2026, owner: "only the created GRN") ------
+       The Receive list shows goods receipts that exist. Arrivals still to be
+       received are not rows here; they are what "Record receipt" chooses from
+       (stage=expected, which the picker still reads). Needing work first, then
+       completed. */
     const recorded = await attempt("recordedReceipts", () => readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }));
-    const ordered = recorded.slice().sort((a, b) => (STAGE_ORDER[a.stage] ?? 9) - (STAGE_ORDER[b.stage] ?? 9));
-    rows = expected.concat(ordered);
+    rows = recorded.slice().sort((a, b) => (STAGE_ORDER[a.stage] ?? 9) - (STAGE_ORDER[b.stage] ?? 9));
   } else {
     const recorded = await attempt("recordedReceipts", () => readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }));
     rows = recorded.filter((r) => r.stage === stage);
@@ -661,7 +727,7 @@ async function workspace(tenant, ctx, query = {}) {
 }
 
 module.exports = {
-  workspace, readRecordedReceipts, readExpectedPurchased, readExpectedCustomer,
+  workspace, readRecordedReceipts, readExpectedPurchased, readExpectedCustomer, readExpectedMaterial,
   STAGE, STAGES, SOURCE, SOURCES, SOURCE_TYPE, ACTION,
   readQuery, nextActionFor, stageOfReceipt, receiptRow,
   dateBoundaries, IST_OFFSET, validDate,

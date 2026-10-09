@@ -67,6 +67,19 @@ const INDEXES = Object.freeze([
   },
   {
     collection: "goodsreceiptsessions",
+    name: "companyId_1_materialLineId_1",
+    key: { companyId: 1, materialLineId: 1 },
+    options: { unique: true, partialFilterExpression: { status: "OPEN", materialLineId: { $type: "objectId" } } },
+    why: "one open count per material-request line (7 Oct 2026)",
+  },
+  {
+    collection: "goodsreceiptsessions",
+    name: "companyId_1_materialRequestId_1_status_1",
+    key: { companyId: 1, materialRequestId: 1, status: 1 },
+    why: "every open count on one material request — its receive screen's read",
+  },
+  {
+    collection: "goodsreceiptsessions",
     name: "companyId_1_purchaseOrderId_1_status_1",
     key: { companyId: 1, purchaseOrderId: 1, status: 1 },
     why: "every open count on one order — what the receiving screen reads on load",
