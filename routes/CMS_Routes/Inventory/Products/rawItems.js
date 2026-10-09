@@ -1173,24 +1173,29 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
 
         /* Duplicates introduced by the request would collapse two variants
            into one and silently discard a balance. */
-        const seenIds = new Set();
-        const seenCombos = new Set();
+        /* The message names the variant and the earlier row, because
+           "variants[78] repeats a variant already listed" told a storekeeper
+           nothing (9 Oct 2026). The usual cause is a value typed twice under
+           one attribute — the form now refuses that before sending. */
+        const seenIds = new Map();
+        const seenCombos = new Map();
+        const label = (x) => (Array.isArray(x.combination) && x.combination.length ? x.combination.join(" / ") : "no options");
         for (let i = 0; i < variants.length; i += 1) {
           const v = variants[i] || {};
           const id = v._id ? String(v._id) : null;
           if (id && seenIds.has(id)) {
             return sendError(res, fail("VALIDATION",
-              `variants[${i}] repeats a variant already listed.`,
-              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_ID" }));
+              `Variant ${i + 1} (${label(v)}) is the same variant as variant ${seenIds.get(id) + 1} (${label(variants[seenIds.get(id)] || {})}). A value listed twice under one attribute names one variant twice — list each value once.`,
+              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_ID", duplicateOf: seenIds.get(id) }));
           }
-          if (id) seenIds.add(id);
-          const combo = JSON.stringify(v.combination || []);
+          if (id) seenIds.set(id, i);
+          const combo = JSON.stringify((v.combination || []).map((c) => String(c ?? "").trim()));
           if (seenCombos.has(combo)) {
             return sendError(res, fail("VALIDATION",
-              `variants[${i}] repeats an option combination already listed.`,
-              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_COMBINATION" }));
+              `Variant ${i + 1} (${label(v)}) has the same options as variant ${seenCombos.get(combo) + 1}. Two variants cannot share one combination — list each value once.`,
+              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_COMBINATION", duplicateOf: seenCombos.get(combo) }));
           }
-          seenCombos.add(combo);
+          seenCombos.set(combo, i);
         }
 
         const newVariants = variants.map(incoming => {
