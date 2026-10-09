@@ -2080,7 +2080,7 @@ async function createWorkOrderForVariant(request, stockItem, variantData, quanti
   const workOrder = new WorkOrder({
     customerRequestId: request._id,
     salesLineLink: linkFor(line),
-    sampleStyleId,
+    ...(sampleStyleId ? { sampleStyleId } : {}),
     stockItemId: stockItem._id,
     stockItemName: stockItem.name,
     stockItemReference: stockItem.reference || "",
@@ -3144,7 +3144,9 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
         salesLineLink: linkFor(item),
         /* IE Chunk 1D: the exact line's style, proved in the pre-flight above
            and written as part of this order's original save. */
-        sampleStyleId: styleByProduct.get(String(item.stockItemId)),
+        /* Absent, not null, when the line proved none (9 Oct 2026): the
+           schema's rule is that an unknown style stays absent. */
+        ...(styleByProduct.get(String(item.stockItemId)) ? { sampleStyleId: styleByProduct.get(String(item.stockItemId)) } : {}),
         stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
         variantId: variantData._id.toString(), variantAttributes,
         quantity: variant.quantity, customerId: request.customerId,

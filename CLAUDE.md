@@ -1461,6 +1461,24 @@ persons[].products[].productImage` (8 Oct 2026): the product photo as
 resolved at dispatch (`resolvePhotos`, variant image first), for the challan
 PDF. Blank on earlier challans.
 
+## Proceed to Production no longer needs an approved style (9 Oct 2026, owner)
+
+"Don't restrict this — on Proceed to Production don't check whether the
+product is sample-approved." The IE Chunk 1D refusals in
+`services/industrialEngineering/workOrderStyleLink.service.js`
+("the customer-request line for X names no approved style", "no line on the
+customer request is for X", "lines naming N different styles", "No approved
+style could be proved") are OFF unless `SALES_RELEASE_REQUIRE_STYLE=1`.
+`styleFromRequestLine` returns null for such a line (a `console.warn` names
+why); a line that names a style, or whose product `requestLineStyles`
+resolves to a settled one, still writes it. `assertStylesUsable([])` proves
+the company from the acting company, else the canonical primary company.
+The work order is then saved with `sampleStyleId` ABSENT (not null — the
+schema's rule for an unknown style), which IE / PPC already read as
+"unproven". Splits, returns and remakes still prove their style from the
+source work order. `test/industrial-engineering/ie-chunk-1d-linkage.test.js`
+sets the switch to 1 because it describes the strict rule.
+
 ## A PI line's GST may be set by hand (9 Oct 2026, owner)
 
 `quotationRoutes.js` `lineGstPercentage(item, unitPrice)`: a line with
