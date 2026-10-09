@@ -1461,6 +1461,79 @@ persons[].products[].productImage` (8 Oct 2026): the product photo as
 resolved at dispatch (`resolvePhotos`, variant image first), for the challan
 PDF. Blank on earlier challans.
 
+## Merchandising material requests: edit until received, QC on the lines, four letters with PDFs (10 Oct 2026, owner)
+
+- **Edit until the GRN.** `orderMaterialRequest.actionsOf`: `edit` (and
+  `withdraw`) hold for a draft AND for an open request with no receipt and
+  nothing received; `update` refuses after the first goods receipt ("…the
+  Store has recorded a goods receipt against it. Raise a further request").
+  An open request edited stays open (saved in place, not re-submitted).
+- **QC on the request.** `listForOrder` → `attachReceiptsAndQc`: the
+  MATERIAL_REQUEST goods receipts of each request are read with their lines,
+  `qcInspectionBridge.qcStandingFor` gives QC's standing per receipt, and
+  both are folded onto the view — `receipts[].qc {state, text, checkers}`,
+  `lines[].qc {received, checked, passed, defective, remaining, state}`
+  (summed over receipt lines by `sourceLineId`), `request.qc` totals. A failed
+  read leaves them absent, never zero.
+- **The merchandiser's own GRN read** (Store routes need `sp.read`, which
+  Merchandising does not hold): `GET /api/cms/merchandising/orders/:id/
+  material-requests/:rid/receipts/:grnId` → `{ document, qc }`
+  (`goodsReceiptDocument.document` on the merchandising company +
+  `qcRawItemGrns.grnDetail`), and `…/pdf` (a Buffer from
+  `services/mail/documentPdf.js`). Only a receipt recorded against THAT
+  request of THAT order is served.
+- **Four letters**, all `departmentNotify.notifyEvent`, fire-and-forget after
+  the commit, each with a PDF from `buildDocumentPdf` (one pdfkit builder:
+  letterhead from StoreSettings, title, facts, tables, notes):
+  `merch_material_request_submitted` → Store (hook: `orderRoute.js` create
+  with `submit` and `/submit`, not on replay; `materialRequestMail.service`);
+  `merch_material_request_received` → Merchandising + the raiser (`alsoTo`;
+  hook: `Inventory/Operations/materialRequests.js` after `svc.receive`);
+  `po_created_for_mrf` and `grn_recorded_for_mrf` → the MRF's requester
+  only (`departments: []` + `alsoTo`; `purchaseOrderMail.service`, hooks in
+  `purchaseOrders.js` after the PO populate and after `handleGoodsReceipt`'s
+  commit, and in `spendRequests.js` after `linkOrder`). `requesterOf(mrfId)`
+  resolves the e-mail: `requestedFor` → Employee, else the badge id, else the
+  ProjectManager who raised it, else `createdByRef`.
+- `notifyEvent` ctx gained **`alsoTo`** (adds named addresses; an event with
+  no departments reaches them alone) beside `onlyTo` (which replaces).
+- `selectableMrfs` also searches `requestedForName`; the form asks for
+  `limit=6` and a search term (see the CMS note).
+
+## Mail: the photo lives on the variant; owners receive their department's events (9 Oct 2026, owner)
+
+"The variant-wise detail is not showing properly … the product photo is not
+coming." Every one of the 2 153 product photos in this database sits on
+`StockItem.variants[].images`; the root `images[]` is empty on every
+product, and the production mails and the MO sheet read the root only.
+`services/mail/orderLinesMail.js` is now the one place that resolves a line's
+photo (`photoFor`: the variant matched by attributes → the first variant with
+a photo → the root; `thumb` re-encodes Cloudinary to a 120 px JPEG) and draws
+an order's lines (`productLinesHtml`: thumbnail, name, reference, ONE LINE
+PER VARIANT "Size: 30 × 10 pcs"; `workOrderRowsHtml`: variant + thumb on
+each work-order row). Read by `manufacturingOrderNotify` (the PM letter and
+the R&D / Merchandising / Sales notices share one `loadStock` read),
+`manufacturingOrderPdf` (photo fallback), `CustomerEmailService`
+(`sendRequestConfirmationEmail` — `items[].stockItemImages` is filled by
+nothing, so it was always blank; `sendSalesApprovalEmail` — a thumbnail per
+line) and `sampleStyleEmail.styleEmailContext` (the linked product's variant
+photos when the brief and the enquiry have none). The PI mail
+(`sendQuotationEmail`) already did all of this and is unchanged.
+
+Recipients (`departmentNotify.notifyEvent`): besides a department's primary
+people, everyone Access Control names OWNER of a listed department now
+receives its events (the 7 Oct 2026 PPC rule, applied to every event);
+editors/viewers and secondary grants still do not. Guards that can still
+silence a mail, all checked on 9 Oct 2026: `ENABLE_EMAILS` (true),
+`BREVO_API_KEY` (set), `departmentNotifications.disabledEvents` (empty),
+every sampling / production template `enabled` (on), customer
+`emailNotifications.<event>.enabled` (on), a customer with no e-mail, and
+"no one has access to [departments]" — the last is what an over-trimmed
+Access Control produces, and the server log names it. HR mail still falls
+back to the hardcoded `ray@grav.in` in `services/emailService.js`
+(`CEO_NOTIFICATION_EMAIL`) when `hrdepartments` is empty — not Access
+Control, not changed.
+
 ## Proceed to Production no longer needs an approved style (9 Oct 2026, owner)
 
 "Don't restrict this — on Proceed to Production don't check whether the

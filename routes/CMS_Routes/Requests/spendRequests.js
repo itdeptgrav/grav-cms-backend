@@ -1696,6 +1696,10 @@ router.post("/:id/purchase-order", async (req, res) => {
     }
 
     const linked = await linkOrder(doc, po, emp);
+    /* The MRF's requester is told the order was raised (10 Oct 2026). */
+    if (po?.sourceMrfId) {
+      require("../../../services/storePurchase/purchaseOrderMail.service").notifyPurchaseOrderCreatedForMrf(po._id).catch(() => {});
+    }
     return res.status(201).json(orderResponse(linked, po, "created"));
   } catch (e) {
     console.error("[spend] purchase-order:", e);

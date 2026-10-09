@@ -151,6 +151,14 @@ async function styleEmailContext(style, ctx) {
     : null;
   const bom = stockItemBom(stockItem);
   const variantTotal = (stockItem?.variants || []).length;
+  /* No reference photo on the brief or its enquiry? Then the linked
+     product's own photos (9 Oct 2026, owner: "the product photo is not
+     coming") — every product photo in this database sits on a VARIANT, so
+     the variants are walked, then the root. */
+  const gallery = images.length
+    ? images
+    : [...new Set([...(stockItem?.variants || []).flatMap((v) => v?.images || []), ...(stockItem?.images || [])].filter(Boolean))]
+      .slice(0, 6).map((url) => ({ url }));
 
   let customerName = account?.displayName || account?.companyName;
   if (!customerName) {
@@ -205,7 +213,7 @@ async function styleEmailContext(style, ctx) {
   return {
     customerName,
     account,
-    images,
+    images: gallery,
     stockItemId,
     stockItem,
     bom,
