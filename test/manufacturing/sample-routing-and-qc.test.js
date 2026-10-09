@@ -20,6 +20,9 @@
 "use strict";
 
 process.env.SALARY_ENCRYPTION_KEY = process.env.SALARY_ENCRYPTION_KEY || "0".repeat(64);
+/* This suite describes the STRICT route rule; the deployment runs lenient by
+   default since 9 Oct 2026 (SALES_RELEASE_REQUIRE_ROUTE unset). */
+process.env.SALES_RELEASE_REQUIRE_ROUTE = "1";
 
 const express = require("express");
 const mongoose = require("mongoose");

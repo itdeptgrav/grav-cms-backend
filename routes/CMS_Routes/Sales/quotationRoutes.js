@@ -3106,7 +3106,11 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
           productName: stockItem.name || item.stockItemName || "this product",
           reference: stockItem.reference || item.stockItemReference || "",
         });
-        continue;
+        /* 9 Oct 2026, owner: "don't restrict … for sent to production". The
+           work order is created with no operations unless
+           SALES_RELEASE_REQUIRE_ROUTE=1; the product is still named in the
+           answer so R&D can record its route afterwards. */
+        if (routeRequired()) continue;
       }
 
       let rawMaterials = [];
@@ -3253,6 +3257,11 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
  * R&D technical record, and a message that does not say so leaves somebody
  * clicking Approve again.
  */
+const routeRequired = () => process.env.SALES_RELEASE_REQUIRE_ROUTE === "1";
+/** The note a release carries when products went to production with no route (lenient mode). */
+const unroutedNote = (unroutedProducts) => (unroutedProducts.length
+  ? ` ${unroutedProducts.length} product${unroutedProducts.length === 1 ? " has" : "s have"} no operation route yet (${unroutedProducts.map((p) => p.productName).join(", ")}) — record the operations on the technical record in R&D so the floor can progress them.`
+  : "");
 const unroutedRefusal = (unroutedProducts) => ({
   success: false,
   code: "PRODUCTION_ROUTE_MISSING",
@@ -3363,7 +3372,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     /* ── A PRODUCT WITH NO ROUTE STOPS THE RELEASE ────────────────────
        Refused before `request.save()`, so nothing is recorded as released
        to production when part of it could not be. */
-    if (unroutedProducts.length) {
+    if (unroutedProducts.length && routeRequired()) {
       return res.status(409).json(unroutedRefusal(unroutedProducts));
     }
 
@@ -3373,6 +3382,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       ? `Quotation approved and ${createdWorkOrders.length} work order(s) created`
       : "Quotation approved but no work orders were created";
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+    msg += unroutedNote(unroutedProducts);
 
     try {
       await CustomerEmailService.sendSalesApprovalEmail(request, quotation);
@@ -3383,6 +3393,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      unroutedProducts: unroutedProducts.length > 0 ? unroutedProducts : undefined,
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
@@ -3439,7 +3450,7 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
 
     /* Same refusal on this door: an internal order is still production, and
        a product with no route cannot be produced. Before `request.save()`. */
-    if (unroutedProducts.length) {
+    if (unroutedProducts.length && routeRequired()) {
       return res.status(409).json(unroutedRefusal(unroutedProducts));
     }
 
@@ -3455,10 +3466,12 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
 
     let msg = `Internal Order approved. ${createdWorkOrders.length} work order(s) sent to production`;
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+    msg += unroutedNote(unroutedProducts);
 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      unroutedProducts: unroutedProducts.length > 0 ? unroutedProducts : undefined,
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
