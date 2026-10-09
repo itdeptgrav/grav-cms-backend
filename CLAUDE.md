@@ -1461,6 +1461,31 @@ persons[].products[].productImage` (8 Oct 2026): the product photo as
 resolved at dispatch (`resolvePhotos`, variant image first), for the challan
 PDF. Blank on earlier challans.
 
+## One identity per raw-item variant (9 Oct 2026, owner)
+
+`PUT /api/cms/raw-items/:id` matched each incoming variant row to a stored
+one by id, else by exact combination, and wrote `_id: existing._id`. Two
+rows could resolve to ONE stored variant — the CMS form carried a rename
+into the row (keeping its id) while the person was still typing past an
+existing value, so "Green" → "Green " → … → "Green Khaki" took Green's id
+along and a fresh "Green" row then matched the stored Green by combination
+— and the item was saved with one id on two variants, and the balance on
+both. Every later edit was refused: "variants[78] repeats a variant already
+listed" (RAW-BUT-BUT-977 on production, 8–9 Oct 2026).
+
+`services/inventory/variantIdentity.js` (tested, `variantIdentity.test.mjs`)
+is now the pairing: `assignIds(rows, stored)` claims by COMBINATION first
+(trimmed), then by id for a still-unclaimed stored row (a true rename), else
+the row is a new variant (fresh id, no balance). Every stored row is claimed
+once, every saved row has its own id, and an item already holding
+duplicates is repaired by its next save (a `console.warn` names it;
+`duplicateIds`). The route no longer refuses a repeated id; it still
+refuses two rows with the same options (`DUPLICATE_VARIANT_COMBINATION`,
+naming both). The CMS side: `isTrueRename` / `uniqueVariantIds` /
+`attributeValues` in `components/store/item-master/form.mjs`. **Deploy
+both** — the hosted backend alone shows the clearer refusal, the form fix
+stops it recurring, and the owner's item is repaired by saving it once.
+
 ## Every customer onto the pipeline; the PI product scope is a setting (8 Oct 2026, owner)
 
 **The pipeline is the Sales Journeys page** (`/sales/dashboard/journeys`,
