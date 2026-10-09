@@ -44,6 +44,7 @@ const orders = require("../../../services/maintenance/maintenanceOrders.service"
 const settings = require("../../../services/maintenance/maintenanceSettings");
 const serviceTerms = require("../../../services/maintenance/maintenanceServiceTerms");
 const driveFiles = require("../../../services/maintenance/maintenanceDrive");
+const reportPdf = require("../../../services/maintenance/maintenanceReportPdf");
 const MaintenanceOrder = require("../../../models/CMS_Models/Maintenance/MaintenanceOrder");
 const multer = require("multer");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
@@ -106,6 +107,43 @@ router.post("/orders", requireMaintenance("editor"),
   reply("raise the order", (req) => orders.createOrder(req.body?.orderType, req.body, req.user), { status: (o) => (o.created ? 201 : 200), viewer: false }));
 
 router.get("/orders/:id", requireMaintenance("viewer"), reply("read the order", (req) => orders.orderDetail(req.params.id)));
+
+/* ─── Maintenance Reports (4 Oct 2026) ─────────────────────────────────
+   Written only by the job's "Submit report" step; read here, never edited. */
+router.get("/reports", requireMaintenance("viewer"), reply("list the maintenance reports", (req) => orders.listReports({
+  search: req.query.search, from: req.query.from, to: req.query.to, subject: req.query.subject,
+  maintenanceType: req.query.maintenanceType, finalStatus: req.query.finalStatus, type: req.query.type,
+  page: req.query.page, limit: req.query.limit,
+})));
+router.get("/reports/:id", requireMaintenance("viewer"), reply("read the maintenance report", (req) => orders.reportDetail(req.params.id)));
+/* Checked / approved — once, by a Maintenance owner; it changes nothing in the report. */
+router.post("/reports/:id/approve", requireMaintenance("owner"),
+  reply("approve the maintenance report", (req) => orders.approveReport(req.params.id, req.body, req.user)));
+
+/* The report as a PDF — the document people keep (owner, 4 Oct 2026). Drawn
+   from the stored, write-once report, so it is the same every time. */
+router.get("/reports/:id/pdf", requireMaintenance("viewer"), async (req, res) => {
+  try {
+    const { report } = await orders.reportDetail(req.params.id);
+    /* Before / after photos drawn into the PDF; one that Drive cannot give in
+       time is only listed. Drive not configured: the PDF lists them all. */
+    const images = await reportPdf.evidenceImages(report, driveFiles.streamFile).catch(() => ({ before: [], after: [] }));
+    const pdf = await reportPdf.buildReportPdf(report, { images });
+    const name = reportPdf.pdfFileName(report);
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `attachment; filename="${name}"`);
+    /* The CMS reads the file name across origins (localhost:3001 → :5000). */
+    res.setHeader("Access-Control-Expose-Headers", "Content-Disposition");
+    res.setHeader("Content-Length", pdf.length);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.end(pdf);
+  } catch (err) {
+    const status = err?.status || 500;
+    if (status >= 500) console.error("[maintenance] report pdf failed:", err?.message);
+    return res.status(status).json({ success: false, code: err?.code || "REPORT_PDF_FAILED", message: status >= 500 ? "The report PDF could not be made. Try again." : err.message });
+  }
+});
 
 router.post("/orders/:id/steps/:action", requireMaintenance("editor"),
   reply("record the step", (req) => orders.stepOrder(req.params.id, req.params.action, req.body, req.user)));

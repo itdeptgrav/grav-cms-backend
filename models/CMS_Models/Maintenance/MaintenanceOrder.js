@@ -55,6 +55,15 @@ const ORDER_INDEXES = Object.freeze([
   Object.freeze({ key: { "subject.machine": 1, openedAt: -1 }, options: { name: "subject_machine_openedAt" } }),
   Object.freeze({ key: { "subject.item": 1, openedAt: -1 }, options: { name: "subject_item_openedAt" } }),
   Object.freeze({ key: { orderType: 1, status: 1, openedAt: -1 }, options: { name: "type_status_openedAt" } }),
+  /* 4 Oct 2026: the Maintenance Reports. A report number is unique across
+     every job; the list reads newest submitted first. Not "required" — the
+     counter already hands out each number once, and a database without these
+     indexes must not stop Maintenance working. */
+  Object.freeze({
+    key: { "finalReport.reportNumber": 1 },
+    options: { name: "finalReport_reportNumber_unique", unique: true, partialFilterExpression: { "finalReport.reportNumber": { $exists: true } } },
+  }),
+  Object.freeze({ key: { "finalReport.submittedAt": -1 }, options: { name: "finalReport_submittedAt", partialFilterExpression: { "finalReport.reportNumber": { $exists: true } } } }),
 ]);
 
 const actorSchema = new mongoose.Schema(
@@ -136,6 +145,11 @@ const serviceTermsSchema = new mongoose.Schema(
    optional; nothing here is a commitment — an estimate is an estimate. */
 const PRIORITIES = Object.freeze(["low", "normal", "high", "urgent"]);
 const MAINTENANCE_TYPES = Object.freeze(["breakdown", "preventive", "routine", "inspection", "installation", "other"]);
+/* What the machine is left as, on its report (words in maintenanceOrderFlow.FINAL_STATUS). */
+const FINAL_STATUSES = Object.freeze(["operational", "monitor", "limited", "not-repaired", "out-of-service"]);
+/* A job closed before reports existed never had its final status said; its
+   back-filled report says "not recorded" rather than guessing one. */
+const BACKFILL_ONLY = Object.freeze(["unrecorded"]);
 const detailsSchema = new mongoose.Schema(
   {
     priority: { type: String, enum: PRIORITIES, default: "normal" },
@@ -197,6 +211,56 @@ const reportSchema = new mongoose.Schema(
   { _id: false },
 );
 
+/* THE MAINTENANCE REPORT (owner, 4 Oct 2026): one per job, written once when
+   the job is closed, never changed. It reuses what the job already holds —
+   the problem, the times, the machine, `report` (diagnosis = root cause,
+   work performed, notes = remarks) and `partsUsed`, all written in the same
+   act — and adds only what a report says that a job does not. */
+/* The machine or asset as it stood when the report was written — so the PDF
+   says the make, model, serial and department it had THEN, whatever the
+   register says later. */
+const reportAssetSchema = new mongoose.Schema(
+  {
+    name: { type: String, trim: true, default: "" },
+    code: { type: String, trim: true, default: "" },
+    barcode: { type: String, trim: true, default: "" },
+    type: { type: String, trim: true, default: "" },
+    makeModel: { type: String, trim: true, default: "" },
+    serialNumber: { type: String, trim: true, default: "" },
+    department: { type: String, trim: true, default: "" },
+    location: { type: String, trim: true, default: "" },
+  },
+  { _id: false },
+);
+
+const finalReportSchema = new mongoose.Schema(
+  {
+    reportNumber: { type: String, required: true, trim: true },
+    asset: { type: reportAssetSchema, default: undefined },
+    testResult: { type: String, trim: true, maxlength: 1000, default: "" },
+    /* Required on the form; "" only on a back-filled report whose job never said. */
+    maintenanceType: { type: String, enum: [...MAINTENANCE_TYPES, ""], default: "" },
+    resolution: { type: String, trim: true, maxlength: 4000, default: "" },
+    finalStatus: { type: String, enum: [...FINAL_STATUSES, ...BACKFILL_ONLY], required: true },
+    recommendations: { type: String, trim: true, maxlength: 4000, default: "" },
+    nextMaintenanceDate: { type: Date, default: undefined },
+    /* Who did the work — a person, by id, not only by name. */
+    technician: { type: actorSchema, required: true },
+    submittedAt: { type: Date, required: true },
+    submittedBy: { type: actorSchema, required: true },
+    /* "submitted": written on the report form. "backfill": a job closed
+       before reports existed, its report built from the work report written
+       at the time (scripts/migrations/maintenance-reports-backfill.js). */
+    source: { type: String, enum: ["submitted", "backfill"], default: "submitted" },
+    /* Checked / approved: once, by a Maintenance owner, after submission. It
+       is the only thing ever added to a report, and it changes nothing in it. */
+    approvedAt: { type: Date, default: undefined },
+    approvedBy: { type: actorSchema, default: undefined },
+    approvalNote: { type: String, trim: true, maxlength: 1000, default: undefined },
+  },
+  { _id: false },
+);
+
 const eventSchema = new mongoose.Schema(
   {
     at: { type: Date, required: true },
@@ -239,6 +303,7 @@ const orderSchema = new mongoose.Schema(
     repairMinutes: { type: Number, min: 0, default: undefined },
     report: { type: reportSchema, default: undefined },
     partsUsed: { type: [partSchema], default: undefined },
+    finalReport: { type: finalReportSchema, default: undefined },
     /* "Close" (service) / "Complete" (product). */
     closedAt: { type: Date, default: undefined },
     closedBy: { type: actorSchema, default: undefined },
@@ -277,7 +342,7 @@ const REFUSAL =
 /* What a step may write. Everything else on an order is immutable. */
 const LIFECYCLE = new Set([
   "status", "assignedTo", "inMaintenanceAt", "inMaintenanceBy", "workStartedAt", "workStartedBy",
-  "workDoneAt", "workDoneBy", "repairMinutes", "report", "partsUsed", "closedAt", "closedBy",
+  "workDoneAt", "workDoneBy", "repairMinutes", "report", "partsUsed", "finalReport", "closedAt", "closedBy",
   "cancelledAt", "cancelledBy", "cancelReason", "updatedAt",
 ]);
 /* `attachments` only grows: a photo or document may be added to a job at any
@@ -295,8 +360,33 @@ function updateIsStepOnly(update) {
   });
 }
 
+/* A report is written ONCE. Any write that sets the report's content must
+   be addressed to a job that has no report yet, so not even a direct model
+   call can rewrite one. */
+const REPORT_FIELDS = new Set(["report", "partsUsed", "finalReport"]);
+const REPORT_REFUSAL = "A maintenance report is written once, when its job is closed, and never changed.";
+function setsReport(update) {
+  const set = { ...(update?.$set || {}), ...Object.fromEntries(Object.entries(update || {}).filter(([k]) => !k.startsWith("$"))) };
+  return Object.keys(set).some((k) => REPORT_FIELDS.has(rootOf(k)));
+}
+function addressedToUnreported(filter) {
+  const f = filter?.["finalReport.reportNumber"];
+  return Boolean(f && typeof f === "object" && f.$exists === false);
+}
+/* The one later addition: the approval, set once on a report that has none. */
+const APPROVAL_FIELDS = new Set(["finalReport.approvedAt", "finalReport.approvedBy", "finalReport.approvalNote"]);
+function isApprovalOnly(update, filter) {
+  const keys = Object.keys(update?.$set || {}).filter((k) => k !== "updatedAt");
+  const once = filter?.["finalReport.approvedAt"];
+  return keys.length > 0 && keys.every((k) => APPROVAL_FIELDS.has(k))
+    && Boolean(once && typeof once === "object" && once.$exists === false);
+}
+
 orderSchema.pre(["updateOne", "updateMany", "findOneAndUpdate"], function guardSteps(next) {
   if (!updateIsStepOnly(this.getUpdate())) return next(new Error(REFUSAL));
+  if (setsReport(this.getUpdate()) && !addressedToUnreported(this.getFilter()) && !isApprovalOnly(this.getUpdate(), this.getFilter())) {
+    return next(new Error(REPORT_REFUSAL));
+  }
   return next();
 });
 orderSchema.pre(
@@ -316,3 +406,4 @@ module.exports.ORDER_INDEXES = ORDER_INDEXES;
 module.exports.updateIsStepOnly = updateIsStepOnly;
 module.exports.PRIORITIES = PRIORITIES;
 module.exports.MAINTENANCE_TYPES = MAINTENANCE_TYPES;
+module.exports.FINAL_STATUSES = FINAL_STATUSES;

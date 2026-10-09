@@ -98,6 +98,12 @@ const key = () => `form-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const hash = (o) => crypto.createHash("sha256").update(JSON.stringify(o)).digest("hex");
 const create = (token, body) => call("/orders", { token, method: "POST", body: { idempotencyKey: key(), ...body } });
 const step = (token, id, action, body = {}) => call(`/orders/${id}/steps/${action}`, { token, method: "POST", body });
+/* The Maintenance Report: the least a report needs, and "repair completed,
+   then report" in one go (4 Oct 2026). */
+const REPORT = { maintenanceType: "breakdown", rootCause: "Worn part found", workPerformed: "Part replaced", resolution: "Working again, tested", finalStatus: "operational",
+  assetRef: "UNIT-07" /* only read for a free-form job, which names its own equipment */ };
+const report = (token, id, body = {}) => step(token, id, "report", { ...REPORT, ...body });
+const finish = async (token, id, body = {}) => { await step(token, id, "done"); return report(token, id, body); };
 const tagOf = async (token, m) => (await call(`/sewing-machines/${m._id}/tag`, { token, method: "POST" })).body.tag.code;
 /* Puts the repair clock's start back in time, through the step-only guard. */
 const startedMinutesAgo = (id, min) => MaintenanceOrder.updateOne({ _id: id }, { $set: { workStartedAt: new Date(Date.now() - min * 60000) } });
@@ -144,7 +150,7 @@ describe("Settings: Allowed Product Types", () => {
 });
 
 describe("Service Orders: Maintenance's own repair jobs", () => {
-  test("Draft → In progress → Repair completed → Closed, with the repair time from two timestamps", async () => {
+  test("Open → In progress → Repair completed (report pending) → report → Closed, with the repair time from two timestamps", async () => {
     const tech = await person({ grant: "editor", name: "Ravi" });
     const m = await machine("SM-001 Juki");
     const code = await tagOf(tech.token, m);
@@ -160,24 +166,37 @@ describe("Service Orders: Maintenance's own repair jobs", () => {
     expect(started.body.order).toMatchObject({ status: "IN_PROGRESS", workStartedBy: { name: tech.fullName }, assignedTo: { name: tech.fullName } });
     await startedMinutesAgo(id, 85);
 
-    expect((await step(tech.token, id, "done", { diagnosis: "Worn hook" })).status).toBe(400); // no work performed
-    const done = await step(tech.token, id, "done", {
-      diagnosis: "Needle bar bent", workPerformed: "Replaced the needle bar and re-timed the hook", notes: "Check in a week",
-      partsUsed: [{ name: "Needle bar", quantity: 1, unit: "Pcs" }, { name: "" }],
-    });
+    /* Repair completed: the clock stops; nothing is asked; the report is next. */
+    const done = await step(tech.token, id, "done");
     expect(done.status).toBe(200);
-    expect(done.body.order).toMatchObject({ status: "DONE", repairMinutes: 85, repairDuration: "1 hr 25 min",
-      report: { diagnosis: "Needle bar bent", workPerformed: "Replaced the needle bar and re-timed the hook" },
-      partsUsed: [{ name: "Needle bar", quantity: 1, unit: "Pcs", item: null }] });
+    expect(done.body.order).toMatchObject({ status: "DONE", statusLabel: "Report pending", repairMinutes: 85, repairDuration: "1 hr 25 min", report: null, finalReport: null });
+    expect(done.body.order.actions.map((a) => a.key)).toEqual(["report"]);
     const stored = await MaintenanceOrder.findById(id).lean();
     expect(stored.workStartedAt).toBeInstanceOf(Date);
     expect(stored.workDoneAt).toBeInstanceOf(Date);
     expect(Math.round((stored.workDoneAt - stored.workStartedAt) / 60000)).toBe(stored.repairMinutes);
 
-    const closed = await step(tech.token, id, "close");
-    expect(closed.body.order).toMatchObject({ status: "CLOSED", closedBy: { name: tech.fullName }, actions: [] });
-    for (const a of ["start", "done", "close", "cancel"]) expect((await step(tech.token, id, a, { reason: "x x x" })).status).toBe(409);
-    expect(closed.body.order.events.map((e) => e.action)).toEqual(["created", "start", "done", "close"]);
+    /* No bare Close: the old step name is the report, and an empty report is refused. */
+    const bare = await step(tech.token, id, "close");
+    expect(bare.status).toBe(400);
+    expect((await MaintenanceOrder.findById(id).lean()).status).toBe("DONE");
+
+    const closed = await step(tech.token, id, "report", {
+      maintenanceType: "breakdown", rootCause: "Needle bar bent", workPerformed: "Replaced the needle bar and re-timed the hook",
+      resolution: "Machine stitches cleanly", finalStatus: "operational", recommendations: "Check the hook in a week",
+      nextMaintenanceDate: "2099-01-15", remarks: "Operator informed",
+      partsUsed: [{ name: "Needle bar", quantity: 1, unit: "Pcs" }, { name: "" }],
+    });
+    expect(closed.status).toBe(200);
+    expect(closed.body.order).toMatchObject({ status: "CLOSED", closedBy: { name: tech.fullName }, actions: [], reportNumber: "MR-0001",
+      report: { diagnosis: "Needle bar bent", workPerformed: "Replaced the needle bar and re-timed the hook", notes: "Operator informed" },
+      partsUsed: [{ name: "Needle bar", quantity: 1, unit: "Pcs", item: null }],
+      finalReport: { reportNumber: "MR-0001", maintenanceType: "breakdown", finalStatus: "operational", finalStatusLabel: "Operational",
+        resolution: "Machine stitches cleanly", recommendations: "Check the hook in a week", technician: { name: tech.fullName }, submittedBy: { name: tech.fullName }, source: "submitted" } });
+    expect(new Date(closed.body.order.finalReport.nextMaintenanceDate).toISOString().slice(0, 10)).toBe("2099-01-15");
+    for (const a of ["start", "done", "report", "close", "cancel"]) expect((await step(tech.token, id, a, { ...REPORT, reason: "x x x" })).status).toBe(409);
+    expect(closed.body.order.events.map((e) => e.action)).toEqual(["created", "start", "done", "report"]);
+    expect(closed.body.order.events.at(-1).note).toBe("MR-0001");
   });
 
   test("the same machine's next problem is a NEW order; the first is never reopened or changed", async () => {
@@ -186,16 +205,14 @@ describe("Service Orders: Maintenance's own repair jobs", () => {
     const first = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Needle mechanism" })).body.order;
     await step(tech.token, first.id, "start");
     await startedMinutesAgo(first.id, 85);
-    await step(tech.token, first.id, "done", { workPerformed: "Needle assembly repaired" });
-    await step(tech.token, first.id, "close");
+    await finish(tech.token, first.id, { workPerformed: "Needle assembly repaired" });
     const frozen = await MaintenanceOrder.findById(first.id).lean();
 
     const second = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Timing off again" })).body.order;
     expect(second.orderNumber).toBe("MSO-0002");
     await step(tech.token, second.id, "start");
     await startedMinutesAgo(second.id, 45);
-    await step(tech.token, second.id, "done", { workPerformed: "Timing adjustment" });
-    await step(tech.token, second.id, "close");
+    await finish(tech.token, second.id, { workPerformed: "Timing adjustment" });
 
     expect(await MaintenanceOrder.findById(first.id).lean()).toEqual(frozen);
     const page = await call(`/subjects/machine/${m._id}`, { token: tech.token });
@@ -213,7 +230,7 @@ describe("Service Orders: Maintenance's own repair jobs", () => {
     expect(c.body.order).toMatchObject({ status: "CANCELLED", cancelReason: "Raised on the wrong machine" });
     const o2 = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Real problem" })).body.order;
     await step(tech.token, o2.id, "start");
-    await step(tech.token, o2.id, "done", { workPerformed: "Fixed" });
+    await step(tech.token, o2.id, "done");
     expect((await step(tech.token, o2.id, "cancel", { reason: "too late" })).status).toBe(409);
   });
 
@@ -278,9 +295,9 @@ describe("Service Maintenance is free-form; a machine is optional", () => {
 
     expect((await step(tech.token, o.id, "start")).body.order.status).toBe("IN_PROGRESS");
     await startedMinutesAgo(o.id, 40);
-    const done = await step(tech.token, o.id, "done", { workPerformed: "Gas refilled, filters cleaned" });
+    const done = await step(tech.token, o.id, "done");
     expect(done.body.order.repairDuration).toBe("40 min");
-    expect((await step(tech.token, o.id, "close")).body.order.status).toBe("CLOSED");
+    expect((await report(tech.token, o.id, { workPerformed: "Gas refilled, filters cleaned" })).body.order.status).toBe("CLOSED");
 
     const detail = await call(`/orders/${o.id}`, { token: tech.token });
     expect(detail.status).toBe(200);
@@ -514,8 +531,7 @@ describe("Job details and attachments", () => {
     const tech = await person({ grant: "editor" });
     const o = (await create(tech.token, { orderType: "service", service: { title: "Generator" }, problem: "Service due", attachments: [driveFile(1)] })).body.order;
     await step(tech.token, o.id, "start");
-    await step(tech.token, o.id, "done", { workPerformed: "Oil and filter changed" });
-    await step(tech.token, o.id, "close");
+    await finish(tech.token, o.id, { workPerformed: "Oil and filter changed" });
     const before = await MaintenanceOrder.findById(o.id).lean();
     const r = await call(`/orders/${o.id}/attachments`, { token: tech.token, method: "POST", body: { attachments: [{ ...driveFile(3), name: "invoice.pdf", mimeType: "application/pdf" }] } });
     expect(r.status).toBe(200);
@@ -542,12 +558,14 @@ describe("Job details and attachments", () => {
     expect((await MaintenanceOrder.findById(o.id).lean()).attachments).toHaveLength(60);
   });
 
-  /* 4 Oct 2026: "Mark done" takes proof of the work — any document or photo. */
-  test("Mark done keeps its proof files with the report, marked as proof, in the same write", async () => {
+  /* 4 Oct 2026: proof of the work — any document or photo — goes with the
+     Maintenance Report (it went with "Mark done" until the report existed). */
+  test("the report keeps its proof files, marked as proof, in the same write", async () => {
     const tech = await person({ grant: "editor" });
     const o = (await create(tech.token, { orderType: "service", service: { title: "Boiler" }, problem: "Pressure low", attachments: [driveFile(1)] })).body.order;
     await step(tech.token, o.id, "start");
-    const r = await step(tech.token, o.id, "done", {
+    await step(tech.token, o.id, "done");
+    const r = await report(tech.token, o.id, {
       workPerformed: "Valve replaced and pressure tested",
       attachments: [
         { ...driveFile(2), name: "service-report.pdf", mimeType: "application/pdf" },
@@ -556,35 +574,32 @@ describe("Job details and attachments", () => {
       ],
     });
     expect(r.status).toBe(200);
-    expect(r.body.order.status).toBe("DONE");
+    expect(r.body.order.status).toBe("CLOSED");
     expect(r.body.order.attachments.map((a) => [a.name, a.stage, a.uploadedBy])).toEqual([
       ["photo-1.jpg", "raised", tech.fullName],
       ["service-report.pdf", "proof", tech.fullName],
       ["readings.xlsx", "proof", tech.fullName],
       ["after.jpg", "proof", tech.fullName],
     ]);
-    expect(r.body.order.events.at(-1)).toMatchObject({ action: "done", to: "DONE", note: "proof: service-report.pdf, readings.xlsx, after.jpg" });
-    expect(r.body.order.report.workPerformed).toBe("Valve replaced and pressure tested");
+    expect(r.body.order.events.at(-1)).toMatchObject({ action: "report", to: "CLOSED", note: "MR-0001 · proof: service-report.pdf, readings.xlsx, after.jpg" });
+    const view = await call(`/reports/${o.id}`, { token: tech.token });
+    expect(view.body.report.proof.map((a) => a.name)).toEqual(["service-report.pdf", "readings.xlsx", "after.jpg"]);
   });
 
-  test("proof is optional; a broken proof file refuses the step and the job stays In progress", async () => {
+  test("proof is optional; a broken proof file refuses the report, uses no number, and the job stays Report pending", async () => {
     const tech = await person({ grant: "editor" });
-    const plain = (await create(tech.token, { orderType: "service", service: { title: "Fan" }, problem: "Noisy" })).body.order;
-    await step(tech.token, plain.id, "start");
-    const done = await step(tech.token, plain.id, "done", { workPerformed: "Bearing greased" });
-    expect(done.status).toBe(200);
-    expect(done.body.order.attachments).toEqual([]);
-    expect(done.body.order.events.at(-1).note).toBe("");
-
     const o = (await create(tech.token, { orderType: "service", service: { title: "Pump" }, problem: "Leak" })).body.order;
     await step(tech.token, o.id, "start");
-    const bad = await step(tech.token, o.id, "done", { workPerformed: "Seal changed", attachments: [{ fileId: "x", name: "half.pdf" }] });
+    await step(tech.token, o.id, "done");
+    const bad = await report(tech.token, o.id, { attachments: [{ fileId: "x", name: "half.pdf" }] });
     expect(bad.status).toBe(400);
     expect(bad.body.message).toBe("A file did not finish uploading. Remove it and add it again.");
     const kept = await MaintenanceOrder.findById(o.id).lean();
-    expect(kept.status).toBe("IN_PROGRESS");
+    expect(kept.status).toBe("DONE");
     expect(kept.attachments).toEqual([]);
-    expect(kept.report?.workPerformed || "").toBe("");
+    expect(kept.finalReport).toBeUndefined();
+    const ok = await report(tech.token, o.id);
+    expect(ok.body.order).toMatchObject({ status: "CLOSED", reportNumber: "MR-0001", attachments: [] });
   });
 
   test("proof counts toward the sixty-file limit; other steps ignore attachments", async () => {
@@ -596,12 +611,12 @@ describe("Job details and attachments", () => {
     const started = await step(tech.token, o.id, "start", { attachments: [driveFile(70)] });
     expect(started.status).toBe(200);
     expect(started.body.order.attachments).toHaveLength(60);
-    const over = await step(tech.token, o.id, "done", { workPerformed: "Reset", attachments: [driveFile(71)] });
+    expect((await step(tech.token, o.id, "done", { attachments: [driveFile(71)] })).body.order.attachments).toHaveLength(60);
+    const over = await report(tech.token, o.id, { attachments: [driveFile(72)] });
     expect(over.status).toBe(409);
     expect(over.body.message).toBe("A job keeps at most 60 files.");
-    expect((await MaintenanceOrder.findById(o.id).lean()).status).toBe("IN_PROGRESS");
-    const ok = await step(tech.token, o.id, "done", { workPerformed: "Reset" });
-    expect(ok.status).toBe(200);
+    expect((await MaintenanceOrder.findById(o.id).lean()).status).toBe("DONE");
+    expect((await report(tech.token, o.id)).status).toBe(200);
   });
 });
 
@@ -622,7 +637,7 @@ describe("overdue jobs", () => {
     await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "No date" });
     const lateDone = (await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "Late but done", details: { targetDate: day(-1) } })).body.order;
     await step(tech.token, lateDone.id, "start");
-    await step(tech.token, lateDone.id, "done", { workPerformed: "Fixed" });
+    await step(tech.token, lateDone.id, "done");
 
     const list = await call("/orders?type=product", { token: tech.token });
     expect(list.body.overdue).toBe(1);
@@ -635,23 +650,24 @@ describe("overdue jobs", () => {
 });
 
 describe("the simplified statuses", () => {
-  test("a job stored as SOLVED reads, counts, filters and closes as Done", async () => {
+  test("a job stored as SOLVED reads, counts and filters as Report pending, and closes only with its report", async () => {
     const tech = await person({ grant: "editor" });
     const m = await machine("SM-LEG");
     const o = (await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "Legacy" })).body.order;
     await step(tech.token, o.id, "start");
-    await step(tech.token, o.id, "done", { workPerformed: "Fixed" });
+    await step(tech.token, o.id, "done");
     await MaintenanceOrder.collection.updateOne({ _id: new mongoose.Types.ObjectId(o.id) }, { $set: { status: "SOLVED" } });
     const read = await call(`/orders/${o.id}`, { token: tech.token });
-    expect(read.body.order).toMatchObject({ status: "DONE", statusLabel: "Done", isOpen: false });
-    expect(read.body.order.actions.map((a) => a.key)).toEqual(["close"]);
+    expect(read.body.order).toMatchObject({ status: "DONE", statusLabel: "Report pending", isOpen: false });
+    expect(read.body.order.actions.map((a) => a.key)).toEqual(["report"]);
     expect((await call("/orders?type=product", { token: tech.token })).body.counts).toEqual({ DONE: 1 });
     expect((await call("/orders?type=product&status=DONE", { token: tech.token })).body.orders.map((x) => x.id)).toEqual([o.id]);
     expect((await call(`/subjects/machine/${m._id}`, { token: tech.token })).body.stats.repairs).toBe(1);
-    expect((await step(tech.token, o.id, "complete")).body.order.status).toBe("CLOSED"); // the old step name
+    expect((await step(tech.token, o.id, "complete")).status).toBe(400); // the old step name now means the report…
+    expect((await step(tech.token, o.id, "complete", REPORT)).body.order.status).toBe("CLOSED"); // …and closes with one
   });
 
-  test("every new job is born Open, and the only steps are Start, Mark done, Close and Cancel", async () => {
+  test("every new job is born Open, and the only steps are Start, Repair completed, Submit report and Cancel", async () => {
     const tech = await person({ grant: "editor" });
     const m = await machine("SM-NEW");
     for (const orderType of ["service", "product"]) {
@@ -685,9 +701,8 @@ describe("Product Orders: an exact existing machine or item, put into maintenanc
     const id = made.body.order.id;
     expect((await step(tech.token, id, "start")).body.order.status).toBe("IN_PROGRESS");
     await startedMinutesAgo(id, 130);
-    expect((await step(tech.token, id, "done", {})).status).toBe(400);
-    expect((await step(tech.token, id, "done", { workPerformed: "Motor brushes replaced" })).body.order).toMatchObject({ status: "DONE", repairDuration: "2 hr 10 min" });
-    expect((await step(tech.token, id, "close")).body.order.status).toBe("CLOSED");
+    expect((await step(tech.token, id, "done")).body.order).toMatchObject({ status: "DONE", repairDuration: "2 hr 10 min" });
+    expect((await report(tech.token, id, { workPerformed: "Motor brushes replaced" })).body.order).toMatchObject({ status: "CLOSED", reportNumber: "MR-0001" });
 
     expect(await Machine.countDocuments()).toBe(machinesBefore);
     expect(await Machine.findById(m._id).select("+maintenanceTag").lean()).toEqual(machineBefore);
@@ -811,5 +826,224 @@ describe("History, overview and the guards", () => {
     expect((await create(viewer.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Squeak" })).status).toBe(403);
     expect((await step(viewer.token, o.id, "start")).status).toBe(403);
     expect((await call("/orders?type=service", { token: outsider.token })).status).toBe(403);
+  });
+});
+
+/* ── MAINTENANCE REPORTS (owner, 4 Oct 2026) ─────────────────────────────────
+   One completed job = one report, numbered MR-…, written once, never changed;
+   a machine can have any number; the overview lists them across machines. */
+describe("Maintenance Reports", () => {
+  test("the report form is checked whole, in words; a refused form changes nothing and uses no number", async () => {
+    const tech = await person({ grant: "editor" });
+    const o = (await create(tech.token, { orderType: "service", service: { title: "Compressor" }, problem: "No pressure" })).body.order;
+    await step(tech.token, o.id, "start");
+    expect((await report(tech.token, o.id)).status).toBe(409); // not before the repair is completed
+    await step(tech.token, o.id, "done");
+    const cases = [
+      [{ maintenanceType: "" }, "Choose the maintenance type."],
+      [{ maintenanceType: "magic" }, "Choose the maintenance type."],
+      [{ rootCause: "" }, "Write the diagnosis / root cause."],
+      [{ workPerformed: "x" }, "Write what work was performed."],
+      [{ finalStatus: "fine" }, "Choose the machine's final status."],
+      [{ resolution: "" }, "Write the solution / resolution."],
+      [{ assetRef: "" }, "Write the asset / equipment ID (for example, the unit's tag or serial number)."],
+      [{ nextMaintenanceDate: "soon" }, "The next maintenance date is not a date."],
+      [{ nextMaintenanceDate: "2000-01-01" }, "The next maintenance date cannot be before the repair was completed."],
+    ];
+    for (const [extra, message] of cases) {
+      const r = await report(tech.token, o.id, extra);
+      expect(r.status).toBe(400);
+      expect(r.body.message).toBe(message);
+    }
+    expect((await MaintenanceOrder.findById(o.id).lean()).status).toBe("DONE");
+    expect((await report(tech.token, o.id)).body.order.reportNumber).toBe("MR-0001");
+  });
+
+  test("the maintenance type defaults to the job's own; the technician to whoever it is assigned to, or a chosen person by id", async () => {
+    const tech = await person({ grant: "editor", name: "Ravi" });
+    const o = (await create(tech.token, { orderType: "service", service: { title: "Fan" }, problem: "Noisy", details: { maintenanceType: "preventive" } })).body.order;
+    await step(tech.token, o.id, "start");
+    await step(tech.token, o.id, "done");
+    const r = await report(tech.token, o.id, { maintenanceType: "" });
+    expect(r.body.order.finalReport).toMatchObject({ maintenanceType: "preventive", maintenanceTypeLabel: "Preventive", technician: { name: tech.fullName } });
+    expect(r.body.order.finalReport.technician.id).toBeTruthy();
+  });
+
+  test("two jobs on one machine: two reports, the first never changed; both in the machine's history and the report list; times right", async () => {
+    const tech = await person({ grant: "editor" });
+    const m = await machine("SM-001 Juki");
+    const other = await machine("SM-002 Brother");
+    const first = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Needle mechanism jammed" })).body.order;
+    await step(tech.token, first.id, "start");
+    await startedMinutesAgo(first.id, 85);
+    const r1 = await finish(tech.token, first.id, { rootCause: "Worn internal component", workPerformed: "Component replaced and timing adjusted" });
+    expect(r1.body.order).toMatchObject({ reportNumber: "MR-0001", repairDuration: "1 hr 25 min" });
+    const frozen = await MaintenanceOrder.findById(first.id).lean();
+
+    const second = (await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "Motor noise" })).body.order;
+    await step(tech.token, second.id, "start");
+    await startedMinutesAgo(second.id, 130);
+    expect((await finish(tech.token, second.id, { maintenanceType: "preventive", workPerformed: "Motor bearings replaced" })).body.order.reportNumber).toBe("MR-0002");
+    const third = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(other._id) }, problem: "Thread breaking" })).body.order;
+    await step(tech.token, third.id, "start");
+    await finish(tech.token, third.id, { finalStatus: "monitor" });
+
+    expect(await MaintenanceOrder.findById(first.id).lean()).toEqual(frozen);
+
+    const page = await call(`/subjects/machine/${m._id}`, { token: tech.token });
+    expect(page.body.history.map((h) => [h.orderNumber, h.reportNumber, h.repairDuration, h.status])).toEqual([
+      [second.orderNumber, "MR-0002", "2 hr 10 min", "CLOSED"], [first.orderNumber, "MR-0001", "1 hr 25 min", "CLOSED"],
+    ]);
+
+    const all = await call("/reports", { token: tech.token });
+    expect(all.body.reports.map((r) => [r.reportNumber, r.subject.name, r.orderNumber])).toEqual([
+      ["MR-0003", "SM-002 Brother", third.orderNumber], ["MR-0002", "SM-001 Juki", second.orderNumber], ["MR-0001", "SM-001 Juki", first.orderNumber],
+    ]);
+    expect(all.body.subjects.map((x) => [x.name, x.reports])).toEqual([["SM-001 Juki", 2], ["SM-002 Brother", 1]]);
+    const byMachine = await call(`/reports?subject=machine:${m._id}`, { token: tech.token });
+    expect(byMachine.body.reports.map((r) => r.reportNumber)).toEqual(["MR-0002", "MR-0001"]);
+    expect((await call("/reports?maintenanceType=preventive", { token: tech.token })).body.reports.map((r) => r.reportNumber)).toEqual(["MR-0002"]);
+    expect((await call("/reports?finalStatus=monitor", { token: tech.token })).body.reports.map((r) => r.reportNumber)).toEqual(["MR-0003"]);
+    expect((await call("/reports?search=worn%20internal", { token: tech.token })).body.reports.map((r) => r.reportNumber)).toEqual(["MR-0001"]);
+    expect((await call("/reports?type=product", { token: tech.token })).body.reports.map((r) => r.reportNumber)).toEqual(["MR-0002"]);
+    const istToday = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+    expect((await call(`/reports?from=${istToday}&to=${istToday}`, { token: tech.token })).body.pagination.total).toBe(3);
+    expect((await call("/reports?to=2020-01-01", { token: tech.token })).body.pagination.total).toBe(0);
+
+    /* One report, by the job's id or by its number — with stable ids. */
+    const one = await call(`/reports/${first.id}`, { token: tech.token });
+    expect(one.body.report).toMatchObject({ reportNumber: "MR-0001", orderId: first.id, orderNumber: first.orderNumber, orderType: "service",
+      subject: { kind: "machine", id: String(m._id), name: "SM-001 Juki" }, problem: "Needle mechanism jammed", rootCause: "Worn internal component",
+      workPerformed: "Component replaced and timing adjusted", repairMinutes: 85, repairDuration: "1 hr 25 min", finalStatus: "operational", finalStatusLabel: "Operational" });
+    expect(one.body.report.technician.id).toBeTruthy();
+    expect(one.body.subjectReports.map((x) => x.reportNumber)).toEqual(["MR-0002", "MR-0001"]);
+    expect((await call("/reports/mr-0002", { token: tech.token })).body.report.orderId).toBe(second.id);
+    expect((await call("/reports/MR-9999", { token: tech.token })).status).toBe(404);
+    expect((await call(`/reports/${new mongoose.Types.ObjectId()}`, { token: tech.token })).status).toBe(404);
+
+    /* The overview: totals, today, machines repaired more than once, the latest. */
+    const ov = (await call("/overview", { token: tech.token })).body;
+    expect(ov.reports).toMatchObject({ total: 3, today: 3, repeatMachines: 1 });
+    expect(ov.reports.recent.map((r) => r.reportNumber)).toEqual(["MR-0003", "MR-0002", "MR-0001"]);
+  });
+
+  test("a report is written once: no step, no direct write, can change it", async () => {
+    const tech = await person({ grant: "editor" });
+    const o = (await create(tech.token, { orderType: "service", service: { title: "Fan" }, problem: "Noisy" })).body.order;
+    await step(tech.token, o.id, "start");
+    await finish(tech.token, o.id);
+    const before = await MaintenanceOrder.findById(o.id).lean();
+    expect((await report(tech.token, o.id, { workPerformed: "Something else entirely" })).status).toBe(409);
+    await expect(MaintenanceOrder.updateOne({ _id: o.id }, { $set: { "finalReport.finalStatus": "out-of-service" } })).rejects.toThrow(/written once/);
+    await expect(MaintenanceOrder.updateOne({ _id: o.id }, { $set: { report: { workPerformed: "rewritten" } } })).rejects.toThrow(/written once/);
+    await expect(MaintenanceOrder.updateOne({ _id: o.id }, { $set: { partsUsed: [] } })).rejects.toThrow(/written once/);
+    await expect(MaintenanceOrder.updateOne({ _id: o.id }, { $unset: { finalReport: 1 } })).rejects.toThrow(/never replaced or deleted/);
+    expect(await MaintenanceOrder.findById(o.id).lean()).toEqual(before);
+  });
+
+  /* 4 Oct 2026: the report people keep is a PDF, one per job. */
+  test("each report downloads as its own PDF, the same document every time; no report, no PDF", async () => {
+    const tech = await person({ grant: "editor" });
+    const viewer = await person({ grant: "viewer" });
+    const m = await machine("SM-001 Juki");
+    const o = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(m._id) }, problem: "Needle mechanism jammed" })).body.order;
+    const pdf = (token, id) => fetch(`${base}/reports/${id}/pdf`, { headers: { Authorization: `Bearer ${token}` } });
+    await step(tech.token, o.id, "start");
+    expect((await pdf(tech.token, o.id)).status).toBe(404); // no report yet
+    await finish(tech.token, o.id, { rootCause: "Worn internal component", partsUsed: [{ name: "Needle bar", quantity: 1, unit: "Pcs" }] });
+    const r = await pdf(viewer.token, o.id);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("application/pdf");
+    expect(r.headers.get("content-disposition")).toBe('attachment; filename="MR-0001_MSO-0001_SM-001-Juki.pdf"');
+    const bytes = Buffer.from(await r.arrayBuffer());
+    expect(bytes.subarray(0, 5).toString()).toBe("%PDF-");
+    expect(bytes.length).toBeGreaterThan(2000);
+    expect((await pdf(tech.token, "MR-0001")).status).toBe(200);
+    expect((await pdf(tech.token, "MR-0404")).status).toBe(404);
+    expect((await fetch(`${base}/reports/${o.id}/pdf`)).status).toBe(401);
+  });
+
+  test("creating a job, scanning a barcode or cancelling never makes a report; a viewer reads reports and cannot submit one", async () => {
+    const tech = await person({ grant: "editor" });
+    const viewer = await person({ grant: "viewer" });
+    const m = await machine("SM-RPT");
+    const code = await tagOf(tech.token, m);
+    await call(`/subjects/resolve?code=${encodeURIComponent(code)}`, { token: tech.token });
+    const o = (await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "Check" })).body.order;
+    const c = (await create(tech.token, { orderType: "service", service: { title: "Raised by mistake" }, problem: "x x x" })).body.order;
+    await step(tech.token, c.id, "cancel", { reason: "Raised by mistake" });
+    expect(await MaintenanceOrder.countDocuments({ "finalReport.reportNumber": { $exists: true } })).toBe(0);
+    expect((await call("/reports", { token: viewer.token })).body.reports).toEqual([]);
+    await step(tech.token, o.id, "start");
+    await step(tech.token, o.id, "done");
+    expect((await report(viewer.token, o.id)).status).toBe(403);
+    expect((await report(tech.token, o.id)).status).toBe(200);
+    expect((await call(`/reports/${o.id}`, { token: viewer.token })).status).toBe(200);
+  });
+});
+
+/* ── THE REPORT'S REQUIRED FACTS, THE PDF'S SECTIONS, THE APPROVAL (owner, 4 Oct 2026) ── */
+describe("Maintenance Reports — required facts, asset details, approval", () => {
+  test("a report cannot be finalised without the machine's ID; a free-form job names its own equipment", async () => {
+    const tech = await person({ grant: "editor" });
+    const noId = await machine("Unnumbered", { serialNumber: "" }).catch(() => null);
+    if (noId) {
+      const o = (await create(tech.token, { orderType: "service", subject: { kind: "machine", id: String(noId._id) }, problem: "Noisy" })).body.order;
+      await step(tech.token, o.id, "start");
+      await step(tech.token, o.id, "done");
+      const r = await report(tech.token, o.id);
+      expect(r.status).toBe(400);
+      expect(r.body.message).toBe("This machine / asset has no ID in the register. Add its ID there, then submit the report.");
+      expect((await MaintenanceOrder.findById(o.id).lean()).status).toBe("DONE");
+    }
+    const f = (await create(tech.token, { orderType: "service", service: { title: "AC unit – office" }, problem: "Not cooling" })).body.order;
+    await step(tech.token, f.id, "start");
+    const r2 = await finish(tech.token, f.id, { assetRef: "AC-OFF-02", assetMakeModel: "Daikin FTKF50" });
+    expect(r2.body.order.finalReport.asset).toMatchObject({ name: "AC unit – office", code: "AC-OFF-02", makeModel: "Daikin FTKF50" });
+  });
+
+  test("the asset as it stood when the report was written: ID, barcode, make/model, serial, the job's department", async () => {
+    const tech = await person({ grant: "editor" });
+    const m = await machine("SM-ASSET", { model: "Juki DDL-8700" });
+    const code = await tagOf(tech.token, m);
+    const o = (await create(tech.token, { orderType: "product", subject: { kind: "machine", id: String(m._id) }, problem: "Oil leak", details: { department: "Sewing" } })).body.order;
+    await step(tech.token, o.id, "start");
+    await startedMinutesAgo(o.id, 50);
+    const r = await finish(tech.token, o.id, { testResult: "Ran 10 minutes, no leak" });
+    expect(r.body.order.finalReport).toMatchObject({ testResult: "Ran 10 minutes, no leak",
+      asset: { name: "SM-ASSET", code: m.serialNumber, barcode: code, makeModel: "Juki DDL-8700", serialNumber: m.serialNumber, department: "Sewing", location: "Sewing Section A" } });
+    /* Renaming the machine later does not change the report. */
+    await Machine.updateOne({ _id: m._id }, { $set: { name: "Renamed", model: "Other" } });
+    const view = (await call(`/reports/${o.id}`, { token: tech.token })).body.report;
+    expect(view.asset).toMatchObject({ name: "SM-ASSET", makeModel: "Juki DDL-8700" });
+    expect(view.repairMinutes).toBe(50);
+    /* Downtime is reported → repair completed (here the test moved only the start back). */
+    expect(view.downtimeMinutes).toBe(Math.round((new Date(view.completedAt) - new Date(view.reportedAt)) / 60000));
+    expect(view.reportedBy.name).toBe(tech.fullName);
+    expect(view.revision).toBe("Original — never revised · awaiting approval");
+  });
+
+  test("checked / approved: once, by an owner; it changes nothing the report says", async () => {
+    const tech = await person({ grant: "editor" });
+    const owner = await person({ grant: "owner", name: "Head" });
+    const o = (await create(tech.token, { orderType: "service", service: { title: "Boiler" }, problem: "Pressure low" })).body.order;
+    await step(tech.token, o.id, "start");
+    await finish(tech.token, o.id);
+    const before = await MaintenanceOrder.findById(o.id).lean();
+    expect((await call(`/reports/${o.id}/approve`, { token: tech.token, method: "POST", body: {} })).status).toBe(403);
+    const ok = await call(`/reports/${o.id}/approve`, { token: owner.token, method: "POST", body: { note: "Checked on site" } });
+    expect(ok.status).toBe(200);
+    expect(ok.body.report).toMatchObject({ approvedBy: { name: owner.fullName }, approvalNote: "Checked on site", revision: "Original — never revised · approved" });
+    const again = await call(`/reports/${o.id}/approve`, { token: owner.token, method: "POST", body: {} });
+    expect(again.status).toBe(409);
+    const after = await MaintenanceOrder.findById(o.id).lean();
+    const { approvedAt, approvedBy, approvalNote, ...rest } = after.finalReport;
+    expect(rest).toEqual(before.finalReport);
+    expect(after.report).toEqual(before.report);
+    expect(after.events.at(-1)).toMatchObject({ action: "report-approved", note: "MR-0001 — Checked on site" });
+    /* An approval-shaped write cannot smuggle in a change to the report. */
+    await expect(MaintenanceOrder.updateOne({ _id: o.id, "finalReport.approvedAt": { $exists: false } }, { $set: { "finalReport.finalStatus": "out-of-service" } })).rejects.toThrow(/written once/);
+    const pdf = await fetch(`${base}/reports/${o.id}/pdf`, { headers: { Authorization: `Bearer ${owner.token}` } });
+    expect(pdf.status).toBe(200);
   });
 });

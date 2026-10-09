@@ -1230,7 +1230,62 @@ machine, an item or a barcode. Its own data is its orders.
   `attached` event); `$push` only, at most 20 a call and 60 a job (the cap is
   part of the write filter; proof is checked against it before the step).
   Other steps ignore `attachments`. Verified live 4 Oct 2026 (MSO-0015: a PDF,
-  an .xlsx and a photo as proof, read back byte-for-byte).
+  an .xlsx and a photo as proof, read back byte-for-byte). Since the reports
+  (below) proof goes with **Submit report**, not with Repair completed.
+- **MAINTENANCE REPORTS (owner, 4 Oct 2026): one completed job = one report.**
+  The flow is Open → Start → In progress → **Repair completed** (stops the
+  clock, asks nothing; stored `DONE`, labelled "Report pending") → **Submit
+  report** (`POST /orders/:id/steps/report`, DONE → CLOSED). There is NO bare
+  Close: `close` / `complete` are legacy names for `report` and need its body.
+  The report is `finalReport` on the job itself (no new collection — the
+  cluster cap): `reportNumber` MR-0001… (counter `maintenance:MR` in
+  `crm_sequences`, taken only after the form is accepted), maintenanceType,
+  resolution, finalStatus (`flow.FINAL_STATUS`; `unrecorded` only on a
+  backfill), recommendations, nextMaintenanceDate, technician (actor WITH id;
+  defaults to the assignee), submittedAt/By, source. It REUSES the job's
+  `report` (diagnosis = root cause, workPerformed, notes = remarks),
+  `partsUsed`, times and subject — written in the same guarded write. **Write
+  once**: the model refuses any `$set` of `report` / `partsUsed` /
+  `finalReport` unless the filter carries `"finalReport.reportNumber":
+  {$exists: false}`. Reads: `GET /reports` (search, `from`/`to` = completed
+  day IST, `subject=machine:<id>`, maintenanceType, finalStatus, type; plus
+  the `subjects` that have reports), `GET /reports/:id` (job id or MR number;
+  with `subjectReports`), and **`GET /reports/:id/pdf`** — the report people
+  keep, drawn by `services/maintenance/maintenanceReportPdf.js` (pdfkit, A4,
+  a Unicode system font when present, signature lines, page footers) from the
+  stored record only, `attachment; filename="MR-0001_MSO-0001_<machine>.pdf"`,
+  `Access-Control-Expose-Headers: Content-Disposition` on that route only.
+  `GET /overview` gained `reports: {total, today, repeatMachines,
+  averageMinutes, recent}`. Indexes `finalReport_reportNumber_unique` +
+  `finalReport_submittedAt` (partial, not "required") are added by
+  `ensureOrderStorage`. Jobs closed before reports got one from
+  `scripts/migrations/maintenance-reports-backfill.js` (dry run / `--apply`;
+  `source: "backfill"`, final status "Not recorded", never guessed) — applied
+  on the local DB (MR-0001…0013). Verified live 4 Oct 2026 on SNLS1 + BARTACK_01
+  (MSO-0016/MR-0014, MPO-0010/MR-0015, MSO-0017/MR-0016; 19/19).
+- **Required to finalise a report (owner, 4 Oct 2026)**: the machine / asset
+  ID (the register's — a machine without one is refused with "add its ID
+  there"; a free-form job types its own `assetRef`), maintenance type,
+  diagnosis, work performed, **solution / resolution**, final machine status,
+  the repair's start AND completion times, and a technician. "Not recorded"
+  is printed only for optional facts or a backfilled legacy report.
+  `finalReport.asset` snapshots the asset at report time (name, ID, barcode,
+  type, make/model = machine `model`, serial = `serialNumber`, the job's
+  `details.department`, location) so a later rename does not change it;
+  `testResult` is optional. **Checked / approved**: `POST /reports/:id/approve`
+  (owner only, once; `approvedAt/By/Note`); the model allows exactly that
+  `$set` when the filter carries `"finalReport.approvedAt": {$exists:
+  false}` — nothing else in a report can change. The PDF follows the owner's
+  structure: Header (report no., order no., machine status + approval
+  pills) · Asset details · Maintenance details · Time (reported, start,
+  completion, total downtime = reported→completion, actual repair time =
+  start→completion) · People (reported by, technician, checked/approved by)
+  · Outcome (final status, test result, next date, recommendations) ·
+  Evidence (before = job photos, after = proof photos, DRAWN in via
+  `evidenceImages` from Drive, ≤5 each, ≤4 MB, 8 s each — a miss is only
+  listed; every attachment listed) · Audit (created, completed, approved,
+  report no., revision status) · signature lines. Re-verified live 23/23
+  (MR-0017…0019).
 - **Files** (`services/maintenance/maintenanceDrive.js`, routes `POST /files`
   editor, `GET /files/:fileId` viewer): uploaded with the backend's own
   `GOOGLE_SERVICE_ACCOUNT_KEY` into a private Drive folder "Maintenance" (under

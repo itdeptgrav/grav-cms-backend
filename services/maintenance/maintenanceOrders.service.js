@@ -68,6 +68,16 @@ async function nextOrderNumber(type) {
   return flow.formatOrderNumber(type, doc.seq);
 }
 
+/* One sequence for every Maintenance Report, both kinds: MR-0001, MR-0002… */
+async function nextReportNumber() {
+  const doc = await Counter.findOneAndUpdate(
+    { key: `maintenance:${flow.REPORT_PREFIX}` },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true, setDefaultsOnInsert: true },
+  ).lean();
+  return flow.formatReportNumber(doc.seq);
+}
+
 /* ─── Small helpers ─────────────────────────────────────────────────────── */
 
 const text = (v) => (typeof v === "string" ? v.trim() : "");
@@ -203,6 +213,38 @@ async function searchSubjects(q) {
 /* ─── Order views ───────────────────────────────────────────────────────── */
 
 const who = (a) => (a ? { name: a.name || a.email || "", email: a.email || "" } : null);
+/* A person on a report keeps their id: a report names people by record. */
+const whoWithId = (a) => (a ? { id: a.id ? String(a.id) : null, name: a.name || a.email || "", email: a.email || "" } : null);
+
+const maintenanceTypeWord = (t) => ({
+  /* The screens' own words (components/maintenance/orderFlow.mjs MAINTENANCE_TYPE). */
+  breakdown: "Breakdown / repair", preventive: "Preventive", routine: "Routine check", inspection: "Inspection",
+  installation: "Installation", other: "Other",
+})[t] || "";
+
+/* The report's own facts — what a job does not already hold. */
+function finalReportView(f) {
+  if (!f?.reportNumber) return null;
+  return {
+    reportNumber: f.reportNumber,
+    maintenanceType: f.maintenanceType,
+    maintenanceTypeLabel: maintenanceTypeWord(f.maintenanceType),
+    resolution: f.resolution || "",
+    finalStatus: f.finalStatus,
+    finalStatusLabel: flow.FINAL_STATUS[f.finalStatus] || (f.finalStatus === "unrecorded" ? "Not recorded" : f.finalStatus),
+    recommendations: f.recommendations || "",
+    nextMaintenanceDate: f.nextMaintenanceDate || null,
+    technician: whoWithId(f.technician),
+    submittedAt: f.submittedAt,
+    submittedBy: whoWithId(f.submittedBy),
+    source: f.source || "submitted",
+    testResult: f.testResult || "",
+    asset: f.asset ? { ...f.asset } : null,
+    approvedAt: f.approvedAt || null,
+    approvedBy: whoWithId(f.approvedBy),
+    approvalNote: f.approvalNote || "",
+  };
+}
 
 /* Orders raised before the details existed have none: every fact is then
    its empty value, never invented. */
@@ -267,6 +309,9 @@ function orderView(o) {
     repairDuration: flow.formatDuration(repairMinutes),
     report: o.report ? { diagnosis: o.report.diagnosis || "", workPerformed: o.report.workPerformed || "", notes: o.report.notes || "" } : null,
     partsUsed: (o.partsUsed || []).map((p) => ({ item: p.item ? String(p.item) : null, name: p.name, quantity: p.quantity, unit: p.unit || "" })),
+    /* The job's Maintenance Report, once submitted (null before). */
+    finalReport: finalReportView(o.finalReport),
+    reportNumber: o.finalReport?.reportNumber || null,
     closedAt: o.closedAt || null,
     closedBy: who(o.closedBy),
     cancelledAt: o.cancelledAt || null,
@@ -299,6 +344,69 @@ function legacyView(r, subjectName = "") {
 }
 
 const historyEntry = (o) => ({ ...orderView(o), entryType: "order", summary: o.report?.workPerformed || "" });
+
+/**
+ * THE MAINTENANCE REPORT, as one document: the report's own facts beside
+ * everything it reuses from its job. Every reference is a stable id — the
+ * job, the machine or item, the people — with the names kept as they were.
+ */
+function reportView(o) {
+  const v = orderView(o);
+  const f = v.finalReport;
+  if (!f) return null;
+  return {
+    id: v.id, // the job's id: one job, one report
+    reportNumber: f.reportNumber,
+    orderId: v.id,
+    orderNumber: v.orderNumber,
+    orderType: v.orderType,
+    title: v.title,
+    subject: v.subject, // kind, id, name, code, barcode, type, location — as raised
+    service: v.service,
+    maintenanceType: f.maintenanceType,
+    maintenanceTypeLabel: f.maintenanceTypeLabel,
+    problem: v.problem,
+    rootCause: v.report?.diagnosis || "",
+    workPerformed: v.report?.workPerformed || "",
+    resolution: f.resolution,
+    partsUsed: v.partsUsed,
+    startedAt: v.workStartedAt,
+    completedAt: v.workDoneAt,
+    repairMinutes: v.repairMinutes,
+    repairDuration: v.repairDuration,
+    technician: f.technician,
+    finalStatus: f.finalStatus,
+    finalStatusLabel: f.finalStatusLabel,
+    recommendations: f.recommendations,
+    nextMaintenanceDate: f.nextMaintenanceDate,
+    remarks: v.report?.notes || "",
+    createdBy: v.openedBy,
+    openedAt: v.openedAt,
+    submittedAt: f.submittedAt,
+    submittedBy: f.submittedBy,
+    source: f.source,
+    proof: v.attachments.filter((a) => a.stage === "proof"),
+    attachments: v.attachments,
+    status: v.status,
+    statusLabel: v.statusLabel,
+    /* The PDF's sections (owner, 4 Oct 2026). */
+    asset: f.asset || {
+      name: v.subject.kind === "none" ? v.title : v.subject.name, code: v.subject.code, barcode: v.subject.barcode, type: v.subject.type,
+      makeModel: "", serialNumber: "", department: v.details.department, location: v.subject.location || v.service?.location || "",
+    },
+    testResult: f.testResult,
+    /* Reported: when the problem was raised (a product job: handed over). */
+    reportedAt: o.inMaintenanceAt || o.openedAt,
+    reportedBy: v.inMaintenanceBy || v.openedBy,
+    /* Downtime: reported → repair completed. Actual repair time: start → completion. */
+    downtimeMinutes: flow.minutesBetween(o.inMaintenanceAt || o.openedAt, o.workDoneAt),
+    closedAt: v.closedAt,
+    approvedAt: f.approvedAt,
+    approvedBy: f.approvedBy,
+    approvalNote: f.approvalNote,
+    revision: f.approvedAt ? "Original — never revised · approved" : "Original — never revised · awaiting approval",
+  };
+}
 
 /* ─── Staff: who an order can be assigned to ────────────────────────────── */
 
@@ -603,6 +711,119 @@ async function loadOrder(id) {
   return o;
 }
 
+/**
+ * The machine or asset a report is about, as it stands when the report is
+ * written: the register's current facts (make / model, serial number), the
+ * job's own department and the barcode it was raised with. A record the
+ * register no longer has falls back to how it was when the job was raised.
+ * A free-form job's equipment is named on the form (`assetRef`).
+ */
+async function reportAssetFor(order, b = {}) {
+  const at = order.subjectAtOpen || {};
+  const department = order.details?.department || "";
+  if (order.subject?.kind === "none") {
+    return { name: order.serviceInfo?.title || at.name || "", code: text(b.assetRef).slice(0, 120), barcode: "", type: order.serviceInfo?.category || "",
+      makeModel: text(b.assetMakeModel).slice(0, 160), serialNumber: "", department, location: order.serviceInfo?.location || "" };
+  }
+  const now = await subjectFor(order.subject.kind, subjectIdOf(order)).catch(() => null);
+  const m = now?.machine;
+  return {
+    name: now?.name || at.name || "",
+    code: now?.code || at.code || "",
+    barcode: order.subject.barcode || now?.barcode || "",
+    type: now?.type || at.type || "",
+    makeModel: m?.model || "",
+    serialNumber: m?.serialNumber || "",
+    department,
+    location: now?.location || at.location || "",
+  };
+}
+
+/* A day picked on a form ("2026-11-04") as its UTC midnight, like target dates. */
+function dayFrom(v) {
+  const t = text(v);
+  if (!t) return { value: undefined };
+  const d = /^\d{4}-\d{2}-\d{2}$/.test(t) ? new Date(`${t}T00:00:00.000Z`) : new Date(t);
+  return Number.isNaN(d.getTime()) ? { error: true } : { value: d };
+}
+
+/**
+ * The Maintenance Report form, checked. Required: the maintenance type, the
+ * root cause, the work performed and the machine's final status; the
+ * technician defaults to whoever the job is assigned to (else who completed
+ * the repair). Proof files go with it. Refused whole, in words.
+ */
+async function reportFrom(body, order, user, now) {
+  const b = body && typeof body === "object" ? body : {};
+  const errors = [];
+  const long = (field, value, label) => {
+    const v = text(value);
+    if (v.length > LIMITS.REPORT_MAX) errors.push({ field, message: `Keep the ${label} under ${LIMITS.REPORT_MAX} characters.` });
+    return v.slice(0, LIMITS.REPORT_MAX);
+  };
+  const maintenanceType = text(b.maintenanceType) || order.details?.maintenanceType || "";
+  if (!MaintenanceOrder.MAINTENANCE_TYPES.includes(maintenanceType)) errors.push({ field: "maintenanceType", message: "Choose the maintenance type." });
+  const diagnosis = long("rootCause", b.rootCause ?? b.diagnosis, "root cause");
+  if (diagnosis.length < LIMITS.TEXT_MIN) errors.push({ field: "rootCause", message: "Write the diagnosis / root cause." });
+  const workPerformed = long("workPerformed", b.workPerformed, "work performed");
+  if (workPerformed.length < LIMITS.TEXT_MIN) errors.push({ field: "workPerformed", message: "Write what work was performed." });
+  const finalStatus = text(b.finalStatus);
+  if (!flow.FINAL_STATUS[finalStatus]) errors.push({ field: "finalStatus", message: "Choose the machine's final status." });
+  const resolution = long("resolution", b.resolution, "solution");
+  if (resolution.length < LIMITS.TEXT_MIN) errors.push({ field: "resolution", message: "Write the solution / resolution." });
+  const testResult = text(b.testResult).slice(0, 1000);
+  const recommendations = long("recommendations", b.recommendations, "recommendations");
+  const notes = long("remarks", b.remarks ?? b.notes, "remarks");
+  const next = dayFrom(b.nextMaintenanceDate);
+  if (next.error) errors.push({ field: "nextMaintenanceDate", message: "The next maintenance date is not a date." });
+  else if (next.value && order.workDoneAt && next.value < todayIST(new Date(order.workDoneAt))) {
+    errors.push({ field: "nextMaintenanceDate", message: "The next maintenance date cannot be before the repair was completed." });
+  }
+  /* The repair's own times are the report's start and completion. */
+  if (!order.workStartedAt || !order.workDoneAt) {
+    errors.push({ field: "times", message: "This job has no recorded repair start and completion time, so its report cannot be finalised." });
+  }
+  /* The machine or asset, as it stands now — with its ID, which a report may
+     not be without. A free-form service job names its own equipment. */
+  const asset = await reportAssetFor(order, b);
+  if (!asset.code) {
+    errors.push(order.subject?.kind === "none"
+      ? { field: "assetRef", message: "Write the asset / equipment ID (for example, the unit's tag or serial number)." }
+      : { field: "assetRef", message: "This machine / asset has no ID in the register. Add its ID there, then submit the report." });
+  }
+  const { attachments: proof, errors: fileErrors } = attachmentsFrom(b.attachments, user, "proof");
+  errors.push(...fileErrors);
+  if (errors.length) throw fail(400, "INVALID_REPORT", errors[0].message, { errors });
+  if ((order.attachments || []).length + proof.length > LIMITS.ATTACH_PER_ORDER) {
+    throw fail(409, "TOO_MANY_ATTACHMENTS", `A job keeps at most ${LIMITS.ATTACH_PER_ORDER} files.`);
+  }
+  const technician = b.technicianId
+    ? await assigneeFrom(b.technicianId, user)
+    : (order.assignedTo?.name ? order.assignedTo : order.workDoneBy || actorOf(user));
+  if (!(technician?.name || technician?.email)) throw fail(400, "INVALID_REPORT", "Choose the maintenance technician.", { errors: [{ field: "technicianId", message: "Choose the maintenance technician." }] });
+  return {
+    report: { diagnosis, workPerformed, notes },
+    partsUsed: partsFrom(b.partsUsed),
+    proof,
+    finalReport: {
+      /* Numbered last, once everything above is accepted, so a refused form
+         uses up no number. */
+      reportNumber: await nextReportNumber(),
+      asset,
+      testResult,
+      maintenanceType,
+      resolution,
+      finalStatus,
+      recommendations,
+      ...(next.value ? { nextMaintenanceDate: next.value } : {}),
+      technician: { id: technician.id || null, name: technician.name || technician.email || "", email: technician.email || "" },
+      submittedAt: now,
+      submittedBy: actorOf(user),
+      source: "submitted",
+    },
+  };
+}
+
 /** One step of an order's lifecycle. Forward only, once, atomically. */
 async function stepOrder(id, action, body, user) {
   await requireOrderStorage();
@@ -624,28 +845,22 @@ async function stepOrder(id, action, body, user) {
     if (!order.assignedTo?.name) set.assignedTo = actor; // whoever starts it, unless someone was named
   }
   if (step.clock === "stop") {
-    const workPerformed = text(body?.workPerformed);
-    if (workPerformed.length < LIMITS.TEXT_MIN) throw fail(400, "REPORT_REQUIRED", "Write what was done.");
-    const diagnosis = text(body?.diagnosis);
-    const notes = text(body?.notes);
-    for (const [k, v] of Object.entries({ diagnosis, workPerformed, notes })) {
-      if (v.length > LIMITS.REPORT_MAX) throw fail(400, "REPORT_TOO_LONG", `Keep the ${k} under ${LIMITS.REPORT_MAX} characters.`);
-    }
+    /* Repair completed: the clock stops when the work did. The report is the
+       next step, so the time spent writing it is not repair time. */
     set.workDoneAt = now;
     set.workDoneBy = actor;
     set.repairMinutes = flow.minutesBetween(order.workStartedAt, now) ?? 0;
-    set.report = { diagnosis, workPerformed, notes };
-    const parts = partsFrom(body?.partsUsed);
-    if (parts.length) set.partsUsed = parts;
-    /* Proof of the work — any document or photo — kept with the job. */
-    const { attachments, errors } = attachmentsFrom(body?.attachments, user, "proof");
-    if (errors.length) throw fail(400, "INVALID_ATTACHMENT", errors[0].message, { errors });
-    if ((order.attachments || []).length + attachments.length > LIMITS.ATTACH_PER_ORDER) {
-      throw fail(409, "TOO_MANY_ATTACHMENTS", `A job keeps at most ${LIMITS.ATTACH_PER_ORDER} files.`);
-    }
-    proof = attachments;
   }
-  if (action === "close") { set.closedAt = now; set.closedBy = actor; }
+  if (action === "report") {
+    const r = await reportFrom(body, order, user, now);
+    set.report = r.report;
+    if (r.partsUsed.length) set.partsUsed = r.partsUsed;
+    set.finalReport = r.finalReport;
+    set.closedAt = now;
+    set.closedBy = actor;
+    proof = r.proof;
+    note = r.finalReport.reportNumber;
+  }
   if (action === "cancel") {
     const reason = text(body?.reason);
     if (reason.length < LIMITS.TEXT_MIN) throw fail(400, "REASON_REQUIRED", "Say why this order is being cancelled.");
@@ -656,7 +871,8 @@ async function stepOrder(id, action, body, user) {
   }
 
   const updated = await MaintenanceOrder.findOneAndUpdate(
-    { _id: order._id, status: order.status },
+    /* A report lands only on a job that has none: written once. */
+    { _id: order._id, status: order.status, ...(set.finalReport ? { "finalReport.reportNumber": { $exists: false } } : {}) },
     { $set: set, $push: {
       events: { at: now, by: actor, action, from: order.status, to: step.to, note: proof.length ? `${note ? `${note} · ` : ""}proof: ${proof.map((a) => a.name).join(", ")}`.slice(0, 2000) : note },
       ...(proof.length ? { attachments: { $each: proof } } : {}),
@@ -842,6 +1058,114 @@ async function history({ type = "", status = "", search = "", subjectKind = "" }
   return { entries, storage: { ordersReady: ready } };
 }
 
+/* ─── Maintenance Reports ───────────────────────────────────────────────── */
+
+const HAS_REPORT = { "finalReport.reportNumber": { $exists: true } };
+
+function reportFilter({ search = "", from = "", to = "", subject = "", maintenanceType = "", finalStatus = "", type = "" } = {}) {
+  const filter = { ...HAS_REPORT };
+  if (flow.isOrderType(type)) filter.orderType = type;
+  if (MaintenanceOrder.MAINTENANCE_TYPES.includes(maintenanceType)) filter["finalReport.maintenanceType"] = maintenanceType;
+  if (flow.FINAL_STATUS[finalStatus]) filter["finalReport.finalStatus"] = finalStatus;
+  const [kind, id] = String(subject || "").split(":");
+  if (["machine", "item"].includes(kind) && isId(id)) filter[`subject.${kind}`] = new mongoose.Types.ObjectId(id);
+  /* The date is the day the repair was COMPLETED, on India's calendar. */
+  const IST = 330 * 60000;
+  const start = dayFrom(from).value;
+  const end = dayFrom(to).value;
+  if (start || end) {
+    filter.workDoneAt = {
+      ...(start ? { $gte: new Date(start.getTime() - IST) } : {}),
+      ...(end ? { $lt: new Date(end.getTime() + 86400000 - IST) } : {}),
+    };
+  }
+  const needle = String(search || "").trim();
+  if (needle) {
+    const rx = new RegExp(needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
+    filter.$or = [
+      { "finalReport.reportNumber": rx }, { orderNumber: rx }, { "subjectAtOpen.name": rx }, { "subjectAtOpen.code": rx },
+      { "subject.barcode": rx }, { "serviceInfo.title": rx }, { problem: rx }, { "report.diagnosis": rx },
+      { "report.workPerformed": rx }, { "finalReport.resolution": rx }, { "finalReport.technician.name": rx },
+    ];
+  }
+  return filter;
+}
+
+/**
+ * Every Maintenance Report across all machines and assets, newest first,
+ * with the machines that have reports (for the filter) and a few totals.
+ */
+async function listReports({ page = 1, limit = 20, ...query } = {}) {
+  const ready = await storage.orderStorageReady();
+  const p = Math.max(1, parseInt(page, 10) || 1);
+  const l = Math.min(LIST_MAX, Math.max(1, parseInt(limit, 10) || 20));
+  if (!ready) return { reports: [], pagination: { page: 1, limit: l, total: 0, totalPages: 1 }, subjects: [], storage: { ordersReady: false } };
+  const filter = reportFilter(query);
+  const [total, rows, subjects] = await Promise.all([
+    MaintenanceOrder.countDocuments(filter),
+    MaintenanceOrder.find(filter).sort({ "finalReport.submittedAt": -1, _id: -1 }).skip((p - 1) * l).limit(l).lean(),
+    MaintenanceOrder.aggregate([
+      { $match: { ...HAS_REPORT, "subject.kind": { $in: ["machine", "item"] } } },
+      { $group: { _id: { kind: "$subject.kind", id: { $ifNull: ["$subject.machine", "$subject.item"] } }, name: { $last: "$subjectAtOpen.name" }, code: { $last: "$subjectAtOpen.code" }, reports: { $sum: 1 } } },
+      { $sort: { name: 1 } },
+      { $limit: 500 },
+    ]),
+  ]);
+  return {
+    reports: rows.map(reportView),
+    pagination: { page: p, limit: l, total, totalPages: Math.max(1, Math.ceil(total / l)) },
+    subjects: subjects.map((x) => ({ value: `${x._id.kind}:${x._id.id}`, kind: x._id.kind, id: String(x._id.id), name: x.name || "", code: x.code || "", reports: x.reports })),
+    storage: { ordersReady: true },
+  };
+}
+
+/**
+ * Checked / approved — once, by a Maintenance owner, after the report is
+ * submitted. It adds who and when (and an optional note) and changes nothing
+ * the report says.
+ */
+async function approveReport(idOrNumber, body, user) {
+  await requireOrderStorage();
+  const key = String(idOrNumber || "").trim();
+  const o = isId(key) ? await MaintenanceOrder.findById(key).lean() : await MaintenanceOrder.findOne({ "finalReport.reportNumber": key.toUpperCase() }).lean();
+  if (!o?.finalReport?.reportNumber) throw fail(404, "REPORT_NOT_FOUND", "No maintenance report has this reference.");
+  if (o.finalReport.approvedAt) throw fail(409, "REPORT_ALREADY_APPROVED", `${o.finalReport.reportNumber} was already approved by ${o.finalReport.approvedBy?.name || "someone"}.`);
+  const note = text(body?.note).slice(0, 1000);
+  const now = new Date();
+  const actor = actorOf(user);
+  const updated = await MaintenanceOrder.findOneAndUpdate(
+    { _id: o._id, "finalReport.reportNumber": o.finalReport.reportNumber, "finalReport.approvedAt": { $exists: false } },
+    {
+      $set: { "finalReport.approvedAt": now, "finalReport.approvedBy": actor, ...(note ? { "finalReport.approvalNote": note } : {}) },
+      $push: { events: { at: now, by: actor, action: "report-approved", from: o.status, to: o.status, note: `${o.finalReport.reportNumber}${note ? ` — ${note}` : ""}` } },
+    },
+    { new: true },
+  ).lean();
+  if (!updated) throw fail(409, "REPORT_ALREADY_APPROVED", `${o.finalReport.reportNumber} was approved by someone else just now.`);
+  return { report: reportView(updated), order: orderView(updated) };
+}
+
+/** One report, by its job's id or its report number. */
+async function reportDetail(idOrNumber) {
+  await requireOrderStorage();
+  const key = String(idOrNumber || "").trim();
+  const o = isId(key)
+    ? await MaintenanceOrder.findById(key).lean()
+    : await MaintenanceOrder.findOne({ "finalReport.reportNumber": key.toUpperCase() }).lean();
+  const report = o ? reportView(o) : null;
+  if (!report) throw fail(404, "REPORT_NOT_FOUND", "No maintenance report has this reference.");
+  /* How many reports this machine has, and which came before and after. */
+  let siblings = [];
+  if (o.subject.kind !== "none") {
+    const field = o.subject.kind === "machine" ? "subject.machine" : "subject.item";
+    siblings = (await MaintenanceOrder.find({ [field]: o.subject.machine || o.subject.item, ...HAS_REPORT })
+      .select("finalReport.reportNumber finalReport.submittedAt orderNumber orderType workDoneAt repairMinutes problem")
+      .sort({ "finalReport.submittedAt": -1 }).limit(HISTORY_MAX).lean())
+      .map((x) => ({ id: String(x._id), reportNumber: x.finalReport.reportNumber, orderNumber: x.orderNumber, orderType: x.orderType, completedAt: x.workDoneAt || null, repairMinutes: Number.isFinite(x.repairMinutes) ? x.repairMinutes : null, repairDuration: flow.formatDuration(x.repairMinutes), problem: x.problem }));
+  }
+  return { report, subjectReports: siblings };
+}
+
 /** The dashboard's figures. */
 async function overview() {
   const ready = await storage.orderStorageReady();
@@ -852,8 +1176,10 @@ async function overview() {
     allowedTypes: visible,
     storage: { ordersReady: ready },
   };
-  if (!ready) return { ...base, service: {}, product: {}, overdue: { service: 0, product: 0 }, repairs30: { count: 0, averageMinutes: null, averageDuration: null }, inMaintenance: [], recent: [] };
-  const [byStatus, done30, inMaintenance, recent, overdueService, overdueProduct] = await Promise.all([
+  const noReports = { total: 0, today: 0, repeatMachines: 0, averageMinutes: null, recent: [] };
+  if (!ready) return { ...base, service: {}, product: {}, overdue: { service: 0, product: 0 }, repairs30: { count: 0, averageMinutes: null, averageDuration: null }, inMaintenance: [], recent: [], reports: noReports };
+  const today = todayIST();
+  const [byStatus, done30, inMaintenance, recent, overdueService, overdueProduct, reportTotal, reportToday, repeat, reportAvg, recentReports] = await Promise.all([
     MaintenanceOrder.aggregate([{ $group: { _id: { t: "$orderType", s: "$status" }, n: { $sum: 1 } } }]),
     MaintenanceOrder.find({ workDoneAt: { $gte: since } }).select("repairMinutes").lean(),
     MaintenanceOrder.find({ $or: [
@@ -864,6 +1190,18 @@ async function overview() {
     /* 4 Oct 2026: the overview's "Overdue" card — the register's own rule. */
     MaintenanceOrder.countDocuments({ orderType: "service", ...overdueFilter() }),
     MaintenanceOrder.countDocuments({ orderType: "product", ...overdueFilter() }),
+    /* The reports: how many, how many today (India), machines repaired more
+       than once, the average repair time over every report, the latest. */
+    MaintenanceOrder.countDocuments(HAS_REPORT),
+    MaintenanceOrder.countDocuments({ ...HAS_REPORT, "finalReport.submittedAt": { $gte: new Date(today.getTime() - 330 * 60000) } }),
+    MaintenanceOrder.aggregate([
+      { $match: { ...HAS_REPORT, "subject.kind": { $in: ["machine", "item"] } } },
+      { $group: { _id: { $ifNull: ["$subject.machine", "$subject.item"] }, n: { $sum: 1 } } },
+      { $match: { n: { $gte: 2 } } },
+      { $count: "machines" },
+    ]),
+    MaintenanceOrder.aggregate([{ $match: { ...HAS_REPORT, repairMinutes: { $type: "number" } } }, { $group: { _id: null, avg: { $avg: "$repairMinutes" } } }]),
+    MaintenanceOrder.find(HAS_REPORT).sort({ "finalReport.submittedAt": -1 }).limit(5).lean(),
   ]);
   const service = {};
   const product = {};
@@ -879,6 +1217,13 @@ async function overview() {
     service,
     product,
     overdue: { service: overdueService, product: overdueProduct },
+    reports: {
+      total: reportTotal,
+      today: reportToday,
+      repeatMachines: repeat[0]?.machines || 0,
+      averageMinutes: Number.isFinite(reportAvg[0]?.avg) ? Math.round(reportAvg[0].avg) : null,
+      recent: recentReports.map(reportView),
+    },
     repairs30: { count: done30.length, averageMinutes: avg, averageDuration: flow.formatDuration(avg) },
     inMaintenance: inMaintenance.map(orderView),
     recent: recent.map(orderView),
@@ -901,4 +1246,8 @@ module.exports = {
   listOrders,
   history,
   overview,
+  listReports,
+  reportDetail,
+  approveReport,
+  reportView,
 };

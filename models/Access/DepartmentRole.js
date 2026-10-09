@@ -63,22 +63,6 @@ const departmentRoleSchema = new mongoose.Schema(
 
     role: { type: String, enum: ROLE_KEYS, required: true },
 
-    /* Company-scoped grants live on the existing role row so deployments at
-       their collection limit can adopt them without creating another MongoDB
-       collection. `role` and `isActive` above remain the legacy global grant;
-       a company entry, including an inactive tombstone, overrides it for apps
-       that have cut over. */
-    companyGrants: [{
-      companyId: { type: mongoose.Schema.Types.ObjectId, ref: "Acc_Company", required: true },
-      role: { type: String, enum: ROLE_KEYS, required: true },
-      isActive: { type: Boolean, default: true },
-      reason: { type: String, trim: true, required: true },
-      grantedBy: { type: mongoose.Schema.Types.ObjectId },
-      grantedAt: { type: Date },
-      revokedBy: { type: mongoose.Schema.Types.ObjectId },
-      revokedAt: { type: Date },
-    }],
-
     /* ── WHICH BUDGET DEPARTMENTS THIS GRANT COVERS ───────────────────────────
      * Only meaningful on the `budget` grant, and the whole point of it: giving
      * somebody the Budget app used to say nothing about WHOSE budget they may
@@ -94,29 +78,6 @@ const departmentRoleSchema = new mongoose.Schema(
      * shared admin route stays one route. */
     budgetDepartments: {
       type: [{ type: String, lowercase: true, trim: true }],
-      default: undefined,
-    },
-
-    /* ── WHICH CCTV CAMERAS THIS GRANT COVERS, AND WHAT ON EACH ─────────────
-     * Only meaningful on the `cctv` grant — a module whose slug is fixed in
-     * code (services/cctv/cctvAccess.service.js); there is no CCTV department.
-     * One entry per camera the person may use, keyed by the CCTV app's STABLE
-     * camera key "<nvr>:<channel>" ("nvr2:8"), never by a list position, with
-     * what they may do there: live video, sound (live and recorded), recorded
-     * playback. A camera that is not listed does not exist for them. Empty
-     * means empty: CCTV opens and says no camera has been assigned — it never
-     * falls back to every camera.
-     *
-     * Written only by services/access/accessGrantAdmin.service.js, like the
-     * role itself, so every change is in the grant audit chain. */
-    cctvCameras: {
-      type: [{
-        _id: false,
-        key: { type: String, required: true, lowercase: true, trim: true },
-        live: { type: Boolean, default: false },
-        audio: { type: Boolean, default: false },
-        playback: { type: Boolean, default: false },
-      }],
       default: undefined,
     },
 

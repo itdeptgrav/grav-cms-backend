@@ -10,8 +10,17 @@
 // PRODUCT MAINTENANCE  MPO-0001  One exact existing machine or Item Master
 //                                item, handed to Maintenance.
 //
-//   Open ──Start──▶ In progress ──Mark done (report)──▶ Done ──Close──▶ Closed
+//   Open ──Start──▶ In progress ──Repair completed──▶ Report pending
+//        ──Submit report (MR-0001)──▶ Closed
 //     └──────────── Cancel (reason) ─────────▶ Cancelled
+//
+// ── ONE REPORT PER JOB (owner, 4 Oct 2026) ──────────────────────────────────
+// A job is closed ONLY by submitting its Maintenance Report: there is no bare
+// "Close" any more. "Repair completed" stops the repair clock at the moment
+// the work ended (so writing the report later does not count as repair time)
+// and leaves the job "Report pending" (stored DONE). The report is numbered
+// MR-0001…, written once onto its own job and never changed; the machine's
+// next problem is a new job with a new report.
 //
 // The owner asked for fewer statuses: the first version had five for a service
 // job (Draft, In progress, Repair completed, Closed, Cancelled) and six for a
@@ -34,7 +43,7 @@ const STATUSES = Object.freeze(["OPEN", "IN_PROGRESS", "DONE", "CLOSED", "CANCEL
 const STATUS_LABEL = Object.freeze({
   OPEN: "Open",
   IN_PROGRESS: "In progress",
-  DONE: "Done",
+  DONE: "Report pending",
   CLOSED: "Closed",
   CANCELLED: "Cancelled",
 });
@@ -68,8 +77,8 @@ const INITIAL = Object.freeze({ service: "OPEN", product: "OPEN" });
  */
 const STEPS = Object.freeze({
   start: Object.freeze({ from: Object.freeze(["OPEN"]), to: "IN_PROGRESS", label: "Start", clock: "start" }),
-  done: Object.freeze({ from: Object.freeze(["IN_PROGRESS"]), to: "DONE", label: "Mark done", clock: "stop", needs: Object.freeze(["workPerformed"]) }),
-  close: Object.freeze({ from: Object.freeze(["DONE"]), to: "CLOSED", label: "Close", final: true }),
+  done: Object.freeze({ from: Object.freeze(["IN_PROGRESS"]), to: "DONE", label: "Repair completed", clock: "stop" }),
+  report: Object.freeze({ from: Object.freeze(["DONE"]), to: "CLOSED", label: "Submit report", needs: Object.freeze(["report"]), final: true }),
   cancel: Object.freeze({ from: Object.freeze(["OPEN", "IN_PROGRESS"]), to: "CANCELLED", label: "Cancel", needs: Object.freeze(["reason"]), final: true }),
 });
 const ACTIONS = Object.freeze({ service: STEPS, product: STEPS });
@@ -80,7 +89,8 @@ const LEGACY_ACTION = Object.freeze({
   "start-work": "start",
   "complete-repair": "done",
   solve: "done",
-  complete: "close",
+  complete: "report",
+  close: "report",
 });
 
 /* Still being worked — "open". */
@@ -136,6 +146,22 @@ function formatDuration(minutes) {
   return `${mins} min`;
 }
 
+/** "MR-0001": a Maintenance Report's number. One sequence for both kinds. */
+const REPORT_PREFIX = "MR";
+function formatReportNumber(seq) {
+  return `${REPORT_PREFIX}-${String(seq).padStart(4, "0")}`;
+}
+
+/* What the machine is left as, said on the report. Recorded, never written
+   to the machine register. */
+const FINAL_STATUS = Object.freeze({
+  operational: "Operational",
+  monitor: "Operational — keep under watch",
+  limited: "Working with limits",
+  "not-repaired": "Not repaired — needs more work",
+  "out-of-service": "Out of service",
+});
+
 /** "MSO-0001" from a type and a sequence number. */
 function formatOrderNumber(type, seq) {
   return `${PREFIX[type]}-${String(seq).padStart(4, "0")}`;
@@ -186,5 +212,8 @@ module.exports = {
   minutesBetween,
   formatDuration,
   formatOrderNumber,
+  formatReportNumber,
+  REPORT_PREFIX,
+  FINAL_STATUS,
   repairStats,
 };

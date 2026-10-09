@@ -5,11 +5,11 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const flow = require("./maintenanceOrderFlow");
 
-test("both kinds go Open → In progress → Done → Closed, and no further", () => {
+test("both kinds go Open → In progress → Report pending → (report) → Closed, and no further", () => {
   for (const type of ["service", "product"]) {
     assert.equal(flow.INITIAL[type], "OPEN", type);
     let s = "OPEN";
-    for (const [action, to] of [["start", "IN_PROGRESS"], ["done", "DONE"], ["close", "CLOSED"]]) {
+    for (const [action, to] of [["start", "IN_PROGRESS"], ["done", "DONE"], ["report", "CLOSED"]]) {
       const r = flow.stepFor(type, s, action);
       assert.equal(r.ok, true, `${type}: ${action} from ${s}`);
       assert.equal(r.step.to, to);
@@ -17,7 +17,8 @@ test("both kinds go Open → In progress → Done → Closed, and no further", (
     }
     assert.deepEqual(flow.availableActions(type, "CLOSED"), []);
     assert.deepEqual(flow.availableActions(type, "CANCELLED"), []);
-    for (const a of ["start", "done", "close", "cancel"]) assert.equal(flow.stepFor(type, "CLOSED", a).ok, false, a);
+    for (const a of ["start", "done", "report", "close", "cancel"]) assert.equal(flow.stepFor(type, "CLOSED", a).ok, false, a);
+    assert.deepEqual(flow.availableActions(type, "DONE").map((a) => a.key), ["report"], "the ONLY way out of Report pending is the report");
   }
   assert.deepEqual(flow.STATUSES, ["OPEN", "IN_PROGRESS", "DONE", "CLOSED", "CANCELLED"]);
 });
@@ -37,10 +38,15 @@ test("steps cannot be skipped or repeated", () => {
   assert.equal(flow.stepFor("service", "OPEN", "teleport").ok, false);
 });
 
-test("the clock starts on Start and stops on Mark done, which needs the report", () => {
+test("the clock starts on Start and stops on Repair completed; closing needs the report", () => {
   assert.equal(flow.ACTIONS.service.start.clock, "start");
   assert.equal(flow.ACTIONS.service.done.clock, "stop");
-  assert.deepEqual(flow.ACTIONS.service.done.needs, ["workPerformed"]);
+  assert.equal(flow.ACTIONS.service.done.needs, undefined, "Repair completed asks for nothing — the report comes next");
+  assert.deepEqual(flow.ACTIONS.service.report.needs, ["report"]);
+  assert.equal(flow.ACTIONS.service.close, undefined, "there is no bare Close");
+  assert.equal(flow.STATUS_LABEL.DONE, "Report pending");
+  assert.equal(flow.formatReportNumber(1), "MR-0001");
+  assert.equal(flow.formatReportNumber(12345), "MR-12345");
   assert.equal(flow.ACTIONS.product, flow.ACTIONS.service, "one set of steps for both kinds");
 });
 
@@ -53,7 +59,8 @@ test("the first version's statuses and step names are read as the new ones", () 
   /* An old job, an old button: still the right step. */
   assert.equal(flow.stepFor("product", "WORK_IN_PROGRESS", "solve").action, "done");
   assert.equal(flow.stepFor("service", "IN_PROGRESS", "complete-repair").step.to, "DONE");
-  assert.equal(flow.stepFor("product", "SOLVED", "complete").action, "close");
+  assert.equal(flow.stepFor("product", "SOLVED", "complete").action, "report", "an old Close button now means the report");
+  assert.equal(flow.stepFor("service", "DONE", "close").action, "report");
   assert.deepEqual(flow.availableActions("service", "DRAFT").map((a) => a.key), ["start", "cancel"]);
 });
 
