@@ -370,6 +370,14 @@ describe("idempotent replay", () => {
   // before the ledger writes, so a failure part-way makes the deduction
   // at-most-once — a retry recovers (reconciliation) and NEVER re-moves stock.
   test("standalone: a mid-issue failure marks the effect; the retry recovers and does not re-issue", async () => {
+    /* Forced, not assumed: the suite runs on a replica set, where the injected
+       failure simply rolls the whole issue back and the retry is a clean first
+       attempt. This test only ever passed on that replica set because every
+       issue answered 500 ("req is not defined" in applyIssue, fixed 9 Oct 2026)
+       — it proved nothing about standalone recovery until it ran standalone. */
+    const unitOfWork = require("../../services/storePurchase/unitOfWork.service");
+    unitOfWork.__setTransactionSupport(false);
+    try {
     const s = await seed({ stockQty: 40, requestedQty: 10 });
     const key = newKey();
     const body = [{ itemId: s.itemId, issuedQty: 10, warehouseId: String(s.wh._id), locationId: String(s.locA._id) }];
@@ -389,5 +397,8 @@ describe("idempotent replay", () => {
     expect(afterRetry).toBe(afterFail);            // no further deduction
     expect(afterRetry).toBeGreaterThanOrEqual(30); // moved at most once (never 20)
     expect((await MRF.findById(s.mrf._id).lean()).items[0].issuedQty || 0).toBe(0);
+    } finally {
+      unitOfWork.__setTransactionSupport(null); // re-probe for the tests after this one
+    }
   });
 });

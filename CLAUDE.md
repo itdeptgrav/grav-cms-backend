@@ -1501,3 +1501,50 @@ journey and 24 stray Leads at the time. Several customers share a
 `flag.piAllProducts`: `piProductGate.piAllProducts()` is async, reads the
 setting (5 s cache, `forgetPiProductScope()` on a settings save) and falls back
 to `SALES_PI_ALL_PRODUCTS` only while the setting is absent.
+
+## MRF item-wise approval — an approved line goes to the Store at once (9 Oct 2026)
+
+The manager decides each line of a material request on its own (Cowork's
+Approvals tab → `PATCH /api/cowork/mrf/:id/item-decisions`, same handlers on
+`/api/cms/mrf`). Rules: `services/mrfItemApproval.service.js` (pure, tested by
+`services/mrfItemApproval.test.js`); routes tested end to end through both
+doors by `test/store-purchase/mrf-item-approval.route.test.js`.
+
+- **`MRF.status` is still the Store's lifecycle and gained no values.** The
+  first approved line sets `tlApproved` and `status: "APPROVED"` — the request
+  is with the Store while other lines still wait. How far the manager got is
+  `MRF.approvalStatus` (AWAITING_APPROVAL · PARTIALLY_PROCESSED · APPROVED ·
+  PARTIALLY_APPROVED · REJECTED · CANCELLED). All lines rejected → `REJECTED`.
+- **Each line carries `items[].approval`** (decision, requestedQty = what was
+  asked, approvedQty, rejectedQty, reason, decidedBy/Name/Id, decidedAt) and
+  writes an `ITEM_APPROVED` / `ITEM_REJECTED` event (`statusHistory[].itemId`).
+  A rejection, and approving less than asked, need a reason. Decided lines are
+  final (409 `INVALID_TRANSITION`).
+- **A reduced approval rewrites the line's `requestedQty` to the approved
+  figure** — every Store path issues/reserves/buys against `requestedQty`;
+  the asked figure stays in `approval.requestedQty`.
+- **Old requests have no `approval`**; `lineApproval()` derives it from the
+  tl* fields (and the "Approved with N item(s) rejected" event). Never read
+  `approval.decision` raw — use `lineApproval` / `isWithStore` /
+  `isAwaitingApproval`. `scripts/migrations/mrf-item-approval-backfill.js`
+  writes the derived records down (dry run by default; `--apply`).
+- **The Store sees approved lines only.** `GET /api/cms/inventory/mrf`,
+  `/:id` and `/:id/stock-check` strip waiting and manager-rejected lines for a
+  Store reader (`storeView`) and send `heldByManager: { awaiting, rejected }`.
+  Issue, reserve, availability, auto-reserve, the reservation queue,
+  customer-supplied routing, fulfilment planning (`storeFulfilment.remainingOn`),
+  PO prefill (`outstandingLines`) and requisitions all refuse or skip a line
+  still waiting. Unfulfilled closes only the Store's lines; the last waiting
+  line decided settles the status (`settleStoreStatus`).
+- `tl-approve` / `tl-reject` are now "Approve all / Reject all the lines still
+  waiting" — same bodies, same history action names, same notifications for a
+  whole-request decision; the CMS Material Requests app is unchanged.
+- **The decision is re-read and re-applied INSIDE each transaction attempt**
+  (`decideLines`). `unitOfWork.run` retries a transient conflict by calling
+  `mutate` again, and saving the same mongoose document a second time writes
+  nothing — the history commits, the caller hears success, the decision is
+  lost. Any other `commitMrf` caller that can conflict has the same hazard.
+- Mongoose pluralises `MRF` to the collection **`mrves`**, not `mrfs`.
+- `GET /api/cowork/mrf/:id` used `access.canApprove` with `access` undefined
+  and answered 500 on every read; fixed (`canApprove` = approver with a line
+  still waiting).

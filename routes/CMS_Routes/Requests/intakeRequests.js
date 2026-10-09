@@ -42,6 +42,7 @@ const mongoose = require("mongoose");
 const IntakeRequest = require("../../../models/CMS_Models/Requests/IntakeRequest");
 const SpendRequest = require("../../../models/CMS_Models/Requests/SpendRequest");
 const MRF = require("../../../models/CMS_Models/Inventory/Operations/MRF");
+const itemApproval = require("../../../services/mrfItemApproval.service");
 const RawItem = require("../../../models/CMS_Models/Inventory/Products/RawItem");
 const Vendor = require("../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
 const Employee = require("../../../models/Employee");
@@ -810,7 +811,12 @@ function mrfRow(m) {
     ),
     estimate: null,
     status: m.status,
-    stageLabel: intake.MRF_STAGE_LABEL[m.status] || m.status,
+    stageLabel: (() => {
+      const waiting = itemApproval.approvalSummary(m).awaiting;
+      return waiting && m.status !== "PENDING"
+        ? `Partly approved — ${waiting} item${waiting === 1 ? "" : "s"} still waiting`
+        : intake.MRF_STAGE_LABEL[m.status] || m.status;
+    })(),
     settled: intake.SETTLED_MRF.includes(m.status),
     /* Raised when the requester still had to choose. Saying so is honest about
        what these rows are; leaving it blank would imply nobody decided. */
@@ -1817,7 +1823,13 @@ router.get("/approvals", async (req, res) => {
         const c = intake.tlRouting.tlQueueClause({ viewer, statuses: ["PENDING"] });
         if (!c) return [];
         const renamed = {
-          status: c.status,
+          /* "Waiting for this manager" is a LINE fact now: a request reaches
+             the Store when its first line is approved and stays in this queue
+             while any other line still waits (mrfItemApproval.service). */
+          $and: [
+            itemApproval.approvalStatusMatch(itemApproval.AWAITING_STATUSES),
+            { status: { $nin: ["CANCELLED", "REJECTED"] } },
+          ],
           $or: c.$or.map((branch) =>
             branch.$and
               ? {
