@@ -43,6 +43,7 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+const { boundedRecordedAt } = require("../../../../services/manufacturing/recordedAt");
 const router = express.Router();
 
 const { verifyCmsToken, readToken } = require("../../../../config/jwt");
@@ -650,7 +651,8 @@ router.post("/save", requireChecker, async (req, res) => {
     const prior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: mo._id, superseded: { $ne: true } });
     if (prior && !recheck) return res.status(409).json({ success: false, code: "ALREADY_CHECKED", message: `This raw item was already ${prior.status} on ${moNumberOf(mo)} by ${prior.inspectedByName || "QC"}. Check it again to replace that verdict.`, prior: recordView(prior) });
 
-    const now = new Date();
+    // A check kept on a device while the server was down carries when it was made.
+    const now = boundedRecordedAt(req.body?.recordedAt);
     const doc = await QCRawItemInspection.create({
       date: shift.istDayKeyOf(now), hourKey: shift.shiftBuckets()[shift.bucketIndexOf(now)]?.key || "",
       manufacturingOrderId: mo._id, moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "", isJobWork: isJobWork(mo),
