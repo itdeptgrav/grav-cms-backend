@@ -1479,6 +1479,19 @@ schema's rule for an unknown style), which IE / PPC already read as
 source work order. `test/industrial-engineering/ie-chunk-1d-linkage.test.js`
 sets the switch to 1 because it describes the strict rule.
 
+**…nor an operation route (same evening, owner, REQ-2026-0027: "4 products
+have no operation route").** `createWorkOrdersAndProgress` still collects
+`unroutedProducts`, but unless `SALES_RELEASE_REQUIRE_ROUTE=1` it creates
+the work order anyway with `operations: []`, and both doors
+(`sales-approve`, `mark-internal-order`) answer 200 with the products named
+in `message` (`unroutedNote`) and `unroutedProducts`. What this costs, and
+is already handled downstream: a scan on such an order is refused by the
+production scanner (`productionCompletionRoutes`: "has no operation route …
+re-plan this order"), QC refuses to inspect its pieces, and PPC shows the
+CMS's stranded-order panel ("This order has no operation route"). R&D
+records the operations and the order is re-planned.
+`test/manufacturing/sample-routing-and-qc.test.js` sets the switch to 1.
+
 ## A PI line's GST may be set by hand (9 Oct 2026, owner)
 
 `quotationRoutes.js` `lineGstPercentage(item, unitPrice)`: a line with
