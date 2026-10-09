@@ -176,7 +176,7 @@ describe("capabilities that must stay separate", () => {
 
   test("attendance correction and attendance close are distinct authorities", () => {
     const correct = capsFor("PUT", "/hr/attendance/day-override");
-    const close = capsFor("POST", "/hr/attendance/sync-period");
+    const close = capsFor("DELETE", "/hr/attendance/remove-from-month");
 
     expect(correct).toContain(CAPABILITIES.ATTENDANCE_CORRECT);
     expect(close).toContain(CAPABILITIES.ATTENDANCE_CLOSE);

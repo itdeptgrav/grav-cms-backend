@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:37.918Z",
+ "productRef": "PROD-BOT-FROOFFTRO-194",
+ "stockItem": {
+  "_id": "6974c93428f083586d38dcd2",
+  "reference": "PROD-BOT-FROOFFTRO-194",
+  "name": "Front Office Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

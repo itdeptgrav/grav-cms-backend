@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:51.810Z",
+ "productRef": "PROD-SHI-MTSHI-7348",
+ "stockItem": {
+  "_id": "6a70469ada9bed3e006b5415",
+  "reference": "PROD-SHI-MTSHI-7348",
+  "name": "MT Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

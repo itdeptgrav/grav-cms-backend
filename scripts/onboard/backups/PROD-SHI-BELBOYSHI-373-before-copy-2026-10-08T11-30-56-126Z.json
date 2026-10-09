@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:56.128Z",
+ "productRef": "PROD-SHI-BELBOYSHI-373",
+ "stockItem": {
+  "_id": "6974c35028f083586d38db2a",
+  "reference": "PROD-SHI-BELBOYSHI-373",
+  "name": "Bell Boy Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

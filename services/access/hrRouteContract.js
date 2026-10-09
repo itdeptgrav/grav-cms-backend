@@ -255,8 +255,8 @@ const DECLARATIONS = [
     persona: "attendance approver",
     note: "Removes a person from a whole month of attendance. Period-shaped, so it takes the CLOSE capability rather than the correction one — the separation tests pin this.",
   }),
-  D("POST", "/hr/attendance/sync-period", [C.HR_ACCESS, C.ATTENDANCE_CLOSE], {
-    persona: "attendance approver",
+  D("POST", "/hr/attendance/sync-period", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "any HR user (owner's decision, 7 Oct 2026: everyone in HR may resync)",
     note: "Re-derives a whole period from the biometric source. Exempt from the approval queue as a machine operation (server.js), which is exactly why it needs the higher capability here.",
   }),
   D("GET", "/hr/attendance/sync-period/:jobId", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),

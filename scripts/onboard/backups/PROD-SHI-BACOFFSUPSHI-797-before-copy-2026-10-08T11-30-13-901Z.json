@@ -1,0 +1,77 @@
+{
+ "takenAt": "2026-10-08T11:30:13.902Z",
+ "productRef": "PROD-SHI-BACOFFSUPSHI-797",
+ "stockItem": {
+  "_id": "69730c64cb185373c591d3b4",
+  "reference": "PROD-SHI-BACOFFSUPSHI-797",
+  "name": "Back Office Supervisor Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": {
+  "_id": "6ac5ce188f83e6d8557008e4",
+  "stockItemId": "69730c64cb185373c591d3b4",
+  "sizePatterns": [],
+  "setupCompleted": false,
+  "designatedGroup": "chest",
+  "yokeGradeProfile": {
+   "mode": "UNCONFIRMED",
+   "anchorSize": "M",
+   "depthStep": null,
+   "armholeRule": null,
+   "confirmedBy": null,
+   "confirmedAt": null,
+   "notes": ""
+  },
+  "svgFileUrl": null,
+  "svgPublicId": null,
+  "svgFileName": null,
+  "originalFilename": null,
+  "svgFileSizeBytes": null,
+  "svgUploadedAt": null,
+  "unitsPerInch": 25.4,
+  "basePatternSize": "M",
+  "garmentType": "SHIRT",
+  "patternEngineVersion": "V3",
+  "pieceRoles": [],
+  "isActive": true,
+  "version": 1,
+  "lastConfiguredBy": null,
+  "lastConfiguredAt": null,
+  "configSnapshot": null,
+  "measurementPartRules": null,
+  "savedViewport": {
+   "scale": null,
+   "x": null,
+   "y": null
+  },
+  "globalRotation": {
+   "angle": 0,
+   "pivotX": 0,
+   "pivotY": 0
+  },
+  "patternTitle": "",
+  "patternDescription": "",
+  "patternNotes": "",
+  "patternTags": [],
+  "patternRevision": "1.0",
+  "patternDesigner": "",
+  "basePaths": [],
+  "measureGroups": [],
+  "keyframes": [],
+  "seamEdges": [],
+  "foldAxes": [],
+  "customMeasurements": [],
+  "createdAt": "2026-10-07T04:44:08.946Z",
+  "updatedAt": "2026-10-07T04:44:09.284Z",
+  "__v": 0
+ }
+}

@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:52.050Z",
+ "productRef": "PROD-BOT-DRITRO-674",
+ "stockItem": {
+  "_id": "69732724cb185373c591d5a3",
+  "reference": "PROD-BOT-DRITRO-674",
+  "name": "Driver Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:59.360Z",
+ "productRef": "PROD-BOT-HOUASSTRO-1167",
+ "stockItem": {
+  "_id": "69be96f3ee24effd3573d625",
+  "reference": "PROD-BOT-HOUASSTRO-1167",
+  "name": "Housekeeping Supervisor Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

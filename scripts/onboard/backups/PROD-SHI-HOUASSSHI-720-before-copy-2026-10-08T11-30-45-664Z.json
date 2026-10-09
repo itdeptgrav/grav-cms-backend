@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:45.666Z",
+ "productRef": "PROD-SHI-HOUASSSHI-720",
+ "stockItem": {
+  "_id": "697320a6cb185373c591d45e",
+  "reference": "PROD-SHI-HOUASSSHI-720",
+  "name": "Housekeeping Associate Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

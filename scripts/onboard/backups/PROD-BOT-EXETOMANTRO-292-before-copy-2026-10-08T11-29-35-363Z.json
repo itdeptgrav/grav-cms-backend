@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:35.365Z",
+ "productRef": "PROD-BOT-EXETOMANTRO-292",
+ "stockItem": {
+  "_id": "69724f87c156e7d5ce977e72",
+  "reference": "PROD-BOT-EXETOMANTRO-292",
+  "name": "Executive to Managers Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

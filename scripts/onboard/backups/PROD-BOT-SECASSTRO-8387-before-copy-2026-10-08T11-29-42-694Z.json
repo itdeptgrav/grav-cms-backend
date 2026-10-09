@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:42.695Z",
+ "productRef": "PROD-BOT-SECASSTRO-8387",
+ "stockItem": {
+  "_id": "69bbdb611c32e4f8d5b314ac",
+  "reference": "PROD-BOT-SECASSTRO-8387",
+  "name": "Security Executive to Manager Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:30.990Z",
+ "productRef": "PROD-SHI-E&MSUPSHI-519",
+ "stockItem": {
+  "_id": "6975a95ecd0afcc274c2080c",
+  "reference": "PROD-SHI-E&MSUPSHI-519",
+  "name": "E&M Supervisor Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}
