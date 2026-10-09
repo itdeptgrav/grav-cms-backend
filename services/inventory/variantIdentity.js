@@ -20,6 +20,14 @@
 //           Green whatever id the form sent;
 //   pass 2  a row carrying the ID of a still-unclaimed stored variant claims
 //           it — a true rename ("Green" → "Green Khaki", no Green left);
+//   pass 3  a row KIN to a still-unclaimed stored variant claims it: an
+//           attribute was added or removed, so every combination changed
+//           length (["Fancy Corner","Green"] → ["Fancy Corner","Green","18L"]);
+//           the first row built from the old variant keeps its identity and
+//           balance, the other sizes are new. Without this, adding Size to an
+//           item gave every variant a fresh id and dropped its stock — and
+//           stickers, aliases and conversions are stored against those ids
+//           (the owner, 9 Oct 2026).
 //   else    the row is a NEW variant: fresh id, no balance, no aliases.
 //
 // A stored variant that nobody claims is dropped, as before. An item saved
@@ -34,6 +42,15 @@ const combo = (v) => (Array.isArray(v?.combination) ? v.combination.map((c) => s
 const sameCombination = (a, b) => {
   const x = combo(a), y = combo(b);
   return x.length > 0 && x.length === y.length && x.every((c, i) => c === y[i]);
+};
+/** The shorter combination is the longer one with values inserted, in order. */
+const kinCombination = (a, b) => {
+  const x = combo(a).filter(Boolean), y = combo(b).filter(Boolean);
+  if (!x.length || !y.length || x.length === y.length) return false;
+  const [short, long] = x.length < y.length ? [x, y] : [y, x];
+  let i = 0;
+  for (const v of long) if (i < short.length && v === short[i]) i += 1;
+  return i === short.length;
 };
 
 /**
@@ -57,6 +74,11 @@ function assignIds(rows = [], stored = []) {
     const at = list.findIndex((e, k) => !claimed.has(k) && sid(e?._id) === id);
     if (at >= 0) { claimed.add(at); pairing[i] = at; }
   });
+  input.forEach((incoming, i) => {
+    if (pairing[i] !== null) return;
+    const at = list.findIndex((e, k) => !claimed.has(k) && kinCombination(e, incoming));
+    if (at >= 0) { claimed.add(at); pairing[i] = at; }
+  });
 
   const used = new Set();
   return input.map((incoming, i) => {
@@ -78,4 +100,4 @@ function duplicateIds(stored = []) {
   return [...seen.entries()].filter(([, n]) => n > 1).map(([id]) => id);
 }
 
-module.exports = { assignIds, duplicateIds, sameCombination };
+module.exports = { assignIds, duplicateIds, sameCombination, kinCombination };

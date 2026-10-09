@@ -1486,6 +1486,20 @@ naming both). The CMS side: `isTrueRename` / `uniqueVariantIds` /
 both** — the hosted backend alone shows the clearer refusal, the form fix
 stops it recurring, and the owner's item is repaired by saving it once.
 
+**An attribute added or removed keeps every identity (same day, owner:
+"stickers and so much information are stored against the variant ids").**
+`assignIds` has a third pass: a row KIN to an unclaimed stored variant (the
+shorter combination is the longer with values inserted, in order —
+`kinCombination`) claims it, so adding Size to Vendor × Colour keeps Green's
+id and balance on Green × the first size and makes the other sizes new;
+removing an attribute keeps the first stored kin and drops the rest (the
+form names them first). Before this, every variant came back new and its
+stock, aliases and conversions were dropped. Order of claims: exact
+combination → the row's own id (a true rename) → kin → new. Both repos were
+pushed at 11:53 IST on 9 Oct 2026 with the first two fixes; the production
+server at api.grav.in was still answering with the pre-fix wording an hour
+later — it is restarted by hand, not by the push.
+
 ## Every customer onto the pipeline; the PI product scope is a setting (8 Oct 2026, owner)
 
 **The pipeline is the Sales Journeys page** (`/sales/dashboard/journeys`,

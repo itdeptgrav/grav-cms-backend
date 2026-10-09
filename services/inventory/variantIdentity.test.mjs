@@ -50,6 +50,25 @@ test("an item already saved with one id on two variants is matched row by row an
   assert.equal(new Set(ids(out)).size, 2);
 });
 
+test("adding an attribute keeps each stored identity and balance on the first row built from it", () => {
+  const stored = [row(X, 100, "Fancy Corner", "Green"), row(Y, 7, "Fancy Corner", "Blue")];
+  const out = assignIds([
+    { combination: ["Fancy Corner", "Green", "18L"] }, { combination: ["Fancy Corner", "Green", "14L"] },
+    { combination: ["Fancy Corner", "Blue", "18L"] }, { combination: ["Fancy Corner", "Blue", "14L"] },
+  ], stored);
+  assert.deepEqual(ids(out).map((v) => ([X, Y].includes(v) ? v : "new")), [X, "new", Y, "new"]);
+  assert.equal(out[0].existing.quantity, 100);
+  assert.equal(out[1].existing, null);
+});
+
+test("removing an attribute keeps the first stored kin; a true rename by id still wins over kin", () => {
+  const stored = [row(X, 5, "Fancy Corner", "Green", "18L"), row(Y, 9, "Fancy Corner", "Green", "14L")];
+  const out = assignIds([{ combination: ["Fancy Corner", "Green"] }], stored);
+  assert.equal(ids(out)[0], X);
+  const renamed = assignIds([{ _id: Y, combination: ["Fancy Corner", "Olive", "14L"] }, { combination: ["Fancy Corner", "Green"] }], stored);
+  assert.deepEqual(ids(renamed), [Y, X], "Olive keeps Y by id; the short Green row takes the remaining kin, X");
+});
+
 test("a stored variant is claimed once even when two rows name its combination", () => {
   const stored = [row(X, 5, "Fancy Corner", "Green", "18L")];
   const out = assignIds([{ _id: X, combination: ["Fancy Corner", "Green", "18L"] }, { _id: X, combination: ["Fancy Corner", "Green", "18L"] }], stored);
