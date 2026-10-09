@@ -478,6 +478,9 @@ const quotationItemSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+    /* true when the sales person set the rate by hand on the PI (9 Oct 2026);
+       the quotation routes then keep it instead of the price slab. */
+    gstManual: { type: Boolean, default: false },
     priceBeforeGST: {
       type: Number,
       min: 0,

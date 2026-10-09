@@ -1461,6 +1461,17 @@ persons[].products[].productImage` (8 Oct 2026): the product photo as
 resolved at dispatch (`resolvePhotos`, variant image first), for the challan
 PDF. Blank on earlier challans.
 
+## A PI line's GST may be set by hand (9 Oct 2026, owner)
+
+`quotationRoutes.js` `lineGstPercentage(item, unitPrice)`: a line with
+`gstManual: true` and a finite `gstPercentage` (0–100) keeps that rate on
+both the create (`POST /requests/:id/quotation`) and update (`PUT …/:qid`)
+doors; every other line takes the slab for its price (`getGSTPercentage`:
+5% below Rs. 2,499, 18% at or above), exactly as before. The mark is
+required — an older client echoing a stale `gstPercentage` must not pin a
+rate across a slab change. `gstManual` is on the quotation item schema
+(`CustomerRequest.js`) and is written back as `item.gstManual === true`.
+
 ## One identity per raw-item variant (9 Oct 2026, owner)
 
 `PUT /api/cms/raw-items/:id` matched each incoming variant row to a stored

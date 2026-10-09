@@ -39,6 +39,16 @@ const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
 };
+/* GST SET BY HAND (9 Oct 2026, owner): a line marked `gstManual` keeps the
+   rate the sales person set (0–100, "No GST" is 0); every other line takes
+   the slab for its price, as before. The mark is required — an older client
+   echoing a stale `gstPercentage` must not pin a rate across a slab change. */
+const lineGstPercentage = (item, unitPrice) => {
+  if (item && item.gstManual === true && item.gstPercentage != null && Number.isFinite(Number(item.gstPercentage))) {
+    return Math.min(100, Math.max(0, Number(item.gstPercentage)));
+  }
+  return getGSTPercentage(unitPrice);
+};
 
 // ─── QUOTATION ↔ REQUEST STATUS MACHINE ───────────────────────────────────────
 // request.quotations[0] is the CURRENT quotation. Superseded rounds live in
@@ -1055,7 +1065,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const submittedPrice = parseFloat(item.unitPrice) || 0;
       const basePrice = item.basePrice != null ? parseFloat(item.basePrice) || 0 : submittedPrice;
       const unitPrice = Math.max(submittedPrice, basePrice);
-      const gstPercentage = getGSTPercentage(unitPrice);
+      const gstPercentage = lineGstPercentage(item, unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
       const discountPercentage = parseFloat(item.discountPercentage) || 0;
@@ -1067,7 +1077,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
         /* `item` is the SERVER-RESOLVED row: the client's provenance was
            stripped and, for a sourced line, replaced from the approved
            version. */
-        ...item, unitPrice, basePrice, gstPercentage,
+        ...item, unitPrice, basePrice, gstPercentage, gstManual: item.gstManual === true,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -1511,7 +1521,7 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
       const unitPrice = parseFloat(item.unitPrice) || 0;
-      const gstPercentage = getGSTPercentage(unitPrice);
+      const gstPercentage = lineGstPercentage(item, unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
       const discountPercentage = parseFloat(item.discountPercentage) || 0;
@@ -1520,7 +1530,7 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
       return {
-        ...item, gstPercentage,
+        ...item, gstPercentage, gstManual: item.gstManual === true,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
