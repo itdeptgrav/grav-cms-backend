@@ -60,6 +60,7 @@ const { CustomerMaterialExpectation } = require("../../../../models/CMS_Models/M
 const { resolveQcActor } = require("../../../../services/manufacturing/qcActor");
 const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarcodeIdentity");
 const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
+const qcGrns = require("../../../../services/manufacturing/qcRawItemGrns");
 
 const SLUG = "qc";
 const oid = (v) => new mongoose.Types.ObjectId(String(v));
@@ -380,7 +381,15 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
     const refs = [mo.requestId, moNumberOf(mo)].filter(Boolean);
     const [expectation, grns, lots, records, rl, woCount, reqMap] = await Promise.all([
       CustomerMaterialExpectation.findOne({ orderRef: { $in: refs }, state: "ISSUED" }).sort({ revisionNo: -1 }).select("documentRef revisionNo lines issuedAt").lean().catch(() => null),
-      GoodsReceipt.find({ sourceType: "CUSTOMER_MATERIAL", "customerMaterial.orderRef": { $in: refs }, status: { $ne: "VOID" } }).select("receiptNumber receiptDate lines").lean().catch(() => []),
+      /* What the Store received FOR this order: customer-supplied material, and
+         (8 Oct 2026) the GRNs against Merchandising's material requests for it. */
+      GoodsReceipt.find({
+        status: { $ne: "VOID" },
+        $or: [
+          { sourceType: "CUSTOMER_MATERIAL", "customerMaterial.orderRef": { $in: refs } },
+          { sourceType: "MATERIAL_REQUEST", "materialRequest.customerRequestId": mo._id },
+        ],
+      }).select("receiptNumber receiptDate lines").lean().catch(() => []),
       CustomerMaterialLot.find({ orderRef: { $in: refs } }).select("rawItemId variantId itemName sku baseUnit baseQuantity receiptQuantity receiptUnit receiptNumber").lean().catch(() => []),
       QCRawItemInspection.find({ manufacturingOrderId: mo._id }).sort({ inspectedAt: -1 }).lean(),
       rollups([String(mo._id)]),
@@ -475,7 +484,7 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
 });
 
 function recordView(r) {
-  return { _id: r._id, date: r.date, inspectedAt: r.inspectedAt, moNumber: r.moNumber, customerName: r.customerName, manufacturingOrderId: String(r.manufacturingOrderId), barcodeId: String(r.barcodeId), rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, quantity: r.quantity, unit: r.unit, purchaseOrderNumber: r.purchaseOrderNumber, vendorName: r.vendorName, status: r.status, passedQuantity: r.passedQuantity, defectiveQuantity: r.defectiveQuantity, defects: r.defects || [], note: r.note || "", inspectedByName: r.inspectedByName, inspectedByEmail: r.inspectedByEmail, superseded: Boolean(r.superseded), hourKey: r.hourKey };
+  return { _id: r._id, date: r.date, inspectedAt: r.inspectedAt, moNumber: r.moNumber, customerName: r.customerName, manufacturingOrderId: String(r.manufacturingOrderId), barcodeId: String(r.barcodeId), rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, quantity: r.quantity, unit: r.unit, purchaseOrderNumber: r.purchaseOrderNumber, vendorName: r.vendorName, goodsReceiptId: r.goodsReceiptId ? String(r.goodsReceiptId) : null, goodsReceiptNumber: r.goodsReceiptNumber || "", materialRequestNumber: r.materialRequestNumber || "", status: r.status, passedQuantity: r.passedQuantity, defectiveQuantity: r.defectiveQuantity, defects: r.defects || [], note: r.note || "", inspectedByName: r.inspectedByName, inspectedByEmail: r.inspectedByEmail, superseded: Boolean(r.superseded), hourKey: r.hourKey };
 }
 
 /* ── the scan ────────────────────────────────────────────────────────────── */
@@ -497,6 +506,8 @@ const stickerView = (b) => ({
   barcodeId: String(b._id), rawItemId: b.rawItem ? String(b.rawItem) : null, rawItemName: b.rawItemName || "—", rawItemSku: b.rawItemSku || "", variantId: b.variantId ? String(b.variantId) : null, variantLabel: (b.variantCombination || []).join(" · ") || "", variantSku: b.variantSku || "",
   quantity: r4(b.quantity), unit: b.unit || "", purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "", printedAt: b.createdAt,
   customerOrderRef: b.customerMaterial?.orderRef || "", customerLabel: b.customerMaterial?.customerLabel || "",
+  goodsReceiptId: b.goodsReceiptId ? String(b.goodsReceiptId) : (b.customerMaterial?.goodsReceiptId ? String(b.customerMaterial.goodsReceiptId) : null),
+  goodsReceiptNumber: b.goodsReceiptNumber || b.customerMaterial?.goodsReceiptNumber || "",
 });
 
 /**
@@ -525,6 +536,10 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
     const b = await Barcode.findById(id).lean();
     if (!b) return res.status(404).json({ success: false, code: "UNKNOWN_STICKER", message: "No raw material with that label is on record." });
 
+    /* The GRN the label was printed on, and the request and order it serves —
+       read once, shown on the screen, written on the record (8 Oct 2026). */
+    const receipt = await qcGrns.receiptOfLabel(b);
+
     /* An explicit order pins it; otherwise resolve. */
     let mo = null;
     let resolution = null;
@@ -532,13 +547,13 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
       mo = await CustomerRequest.findById(req.body.moId).select(MO_SELECT).lean();
       if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
     } else {
-      resolution = await qcOrders.resolveOrdersForLabel(b);
+      resolution = await qcOrders.resolveOrdersForLabel(b, receipt);
       if (resolution.resolution === "auto") {
         mo = await CustomerRequest.findById(resolution.candidates[0].manufacturingOrderId).select(MO_SELECT).lean();
       }
     }
 
-    const src = qcOrders.labelSource(b);
+    const src = qcOrders.labelSource(b, receipt);
 
     /* No order yet: report the label and the choice, and nothing about a verdict
        — there is no order to record one against. */
@@ -548,6 +563,8 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
       return res.json({
         success: true,
         sticker: { ...stickerView(b), ...src },
+        goodsReceipt: receipt,
+        grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
         order: null,
         orders: resolution?.candidates || [],
         orderResolution: resolution?.resolution || "none",
@@ -564,12 +581,15 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
     const warnings = [];
     const ref = b.customerMaterial?.orderRef || "";
     if (ref && ref !== mo.requestId && ref !== moNumberOf(mo)) warnings.push(`This material was received for ${ref}, not ${moNumberOf(mo)}.`);
+    if (receipt?.customerRequestId && String(receipt.customerRequestId) !== String(mo._id)) warnings.push(`This label was received on ${receipt.receiptNumber} for ${receipt.orderRef || "another order"}, not ${moNumberOf(mo)}.`);
     if (!(b.quantity > 0)) warnings.push("This label shows no quantity left (it was used up).");
     if (elsewhere.length) warnings.push(`Already checked on ${elsewhere.map((e) => e.moNumber).join(", ")}.`);
 
     res.json({
       success: true,
       sticker: { ...stickerView(b), ...src },
+      goodsReceipt: receipt,
+      grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
       order: {
         manufacturingOrderId: String(mo._id), moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "",
         /* Descriptive. See the header — this decides nothing. */
@@ -588,12 +608,27 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
 /** Record the verdict. `recheck: true` replaces an earlier verdict for the same sticker on the same order. */
 router.post("/save", requireChecker, async (req, res) => {
   try {
-    const { moId, barcodeId, status, defects, defectiveQuantity, note, recheck } = req.body || {};
+    const { moId, barcodeId, status, defects, defectiveQuantity, note, recheck, goodsReceiptId } = req.body || {};
     if (!isId(moId)) return res.status(400).json({ success: false, message: "Choose the order first." });
     if (!isId(barcodeId)) return res.status(400).json({ success: false, message: "Scan the raw item first." });
     if (!["passed", "defective"].includes(status)) return res.status(400).json({ success: false, message: "Pass the raw item, or mark a defect." });
     const [b, mo, who] = await Promise.all([Barcode.findById(barcodeId).lean(), CustomerRequest.findById(moId).select(MO_SELECT).lean(), whoAmI(req)]);
     if (!b) return res.status(404).json({ success: false, message: "No raw item with that label is on record." });
+    let receipt = await qcGrns.receiptOfLabel(b);
+    /* ── A GOODS RECEIPT THE CHECKER CHOSE (8 Oct 2026, owner) ────────────────
+       A label printed from stock names no receipt. The checker picks, from
+       the material-request GRNs carrying this material, the one the roll
+       belongs to; the verdict is recorded against it AND the label is linked
+       to it, so the next scan of the same label resolves on its own. A label
+       that already names a receipt keeps it — the choice never overrides. */
+    let linkLabel = false;
+    if (!receipt && isId(goodsReceiptId)) {
+      const choices = await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId });
+      const chosen = choices.find((c) => c.goodsReceiptId === String(goodsReceiptId));
+      if (!chosen) return res.status(400).json({ success: false, code: "GRN_NOT_FOR_MATERIAL", message: "That goods receipt carries no line for this raw item and variant, so the label cannot be linked to it." });
+      receipt = await qcGrns.receiptById(goodsReceiptId, b);
+      linkLabel = Boolean(receipt);
+    }
     if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
     const qty = r4(b.quantity);
     if (!(qty > 0)) return res.status(409).json({ success: false, message: "This raw item shows no quantity left — there is nothing to check." });
@@ -620,13 +655,44 @@ router.post("/save", requireChecker, async (req, res) => {
       date: shift.istDayKeyOf(now), hourKey: shift.shiftBuckets()[shift.bucketIndexOf(now)]?.key || "",
       manufacturingOrderId: mo._id, moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "", isJobWork: isJobWork(mo),
       barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantId: b.variantId || null, variantLabel: (b.variantCombination || []).join(" · "), quantity: qty, unit: b.unit || "", purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "",
+      /* the GRN the label was received under (8 Oct 2026), so the GRN book can
+         say how much of each receipt is checked */
+      goodsReceiptId: receipt ? receipt.goodsReceiptId : null, goodsReceiptNumber: receipt?.receiptNumber || "",
+      goodsReceiptLineId: b.goodsReceiptLineId || b.customerMaterial?.goodsReceiptLineId || receipt?.line?.goodsReceiptLineId || null,
+      materialRequestId: receipt?.requestId || null, materialRequestNumber: receipt?.requestNumber || "",
       status, passedQuantity: status === "passed" ? qty : r4(qty - defQty), defectiveQuantity: status === "passed" ? 0 : defQty, defects: picked, note: str(note).slice(0, 500),
       inspectedByEmail: who.email, inspectedByName: who.name, inspectedByBiometricId: who.biometricId, inspectedAt: now,
     });
     if (prior) { prior.superseded = true; prior.supersededById = doc._id; prior.supersededAt = now; await prior.save(); }
+    if (linkLabel && !b.goodsReceiptId) {
+      await Barcode.updateOne({ _id: b._id, goodsReceiptId: null }, { $set: { goodsReceiptId: receipt.goodsReceiptId, goodsReceiptNumber: receipt.receiptNumber, goodsReceiptLineId: receipt.line?.goodsReceiptLineId || null } });
+    }
     const rl = (await rollups([String(mo._id)])).get(String(mo._id)) || ZERO;
-    res.status(201).json({ success: true, record: recordView(doc), replaced: prior ? String(prior._id) : null, orderTotals: rl, message: status === "passed" ? `Passed: ${qty} ${b.unit || ""} of ${b.rawItemName}.` : `Defect marked on ${b.rawItemName}: ${defQty} ${b.unit || ""} defective, ${r4(qty - defQty)} passed.` });
+    res.status(201).json({ success: true, record: recordView(doc), replaced: prior ? String(prior._id) : null, orderTotals: rl, goodsReceipt: receipt, labelLinked: linkLabel, message: status === "passed" ? `Passed: ${qty} ${b.unit || ""} of ${b.rawItemName}.` : `Defect marked on ${b.rawItemName}: ${defQty} ${b.unit || ""} defective, ${r4(qty - defQty)} passed.` });
   } catch (err) { console.error("[qc raw-items save]", err); res.status(500).json({ success: false, message: err.message }); }
+});
+
+/* ── the GRN book (8 Oct 2026) ───────────────────────────────────────────── */
+
+/**
+ * Every material-request GRN with its raw-material QC standing — the list the
+ * QC Orders page shows beside the manufacturing orders. `q`, `status`
+ * (all | not-started | in-progress | complete | defects) and `customer` narrow it.
+ */
+router.get("/grns", requireOwnerOrChecker, async (req, res) => {
+  try {
+    const out = await qcGrns.listGrns({ q: str(req.query.q), status: str(req.query.status) || "all", customer: str(req.query.customer) });
+    res.json({ success: true, ...out });
+  } catch (err) { console.error("[qc raw-items grns]", err); res.status(500).json({ success: false, message: err.message }); }
+});
+
+/** One GRN: each line's received quantity against what QC has checked, every label and its verdict, every record. */
+router.get("/grns/:grnId", requireOwnerOrChecker, async (req, res) => {
+  try {
+    const d = await qcGrns.grnDetail(req.params.grnId);
+    if (!d) return res.status(404).json({ success: false, message: "No material-request goods receipt with that id is on record." });
+    res.json({ success: true, ...d });
+  } catch (err) { console.error("[qc raw-items grn]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
 /* ── the checker's day, and the owner's report ───────────────────────────── */

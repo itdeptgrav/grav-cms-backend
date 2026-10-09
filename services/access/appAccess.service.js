@@ -196,20 +196,66 @@ async function roleFor(appSlug, emails) {
   return best;
 }
 
-async function resolveWithIdentity(identity, appSlug, dept, { requireCatalogueEntry = true, allowLegacyAssignment = true } = {}) {
+/* ── ONE READ OF EVERY GRANT THE IDENTITY HOLDS (8 Oct 2026) ─────────────────
+   `listAccessibleApps` resolved each of the ~24 catalogue departments in turn,
+   and each resolution ran `roleFor` (one DepartmentRole query per address) and,
+   for an assigned department with no grant, a `DepartmentRole.exists` — around
+   fifty sequential Atlas round trips, ~1.5 s, on the most-called route
+   (`POST /api/auth/verify`), for every non-admin session. A platform admin
+   short-circuits before any of it, which is why the owner never felt it and
+   every ordinary QC / Store person did.
+
+   The index below is the same facts read ONCE: every active grant for the
+   identity's addresses (strongest role per app, exactly as `roleFor` ranks
+   them), the accountant role for the accounting app, and which apps have any
+   role configured at all (what the legacy-assignment rule asks). Per-app
+   resolution then costs no query. `roleFor` and the single-app path are
+   unchanged, so a one-off check reads nothing extra. */
+async function grantIndexFor(identity) {
+  const { DepartmentRole } = models();
+  const emails = (identity.emails || []).filter(Boolean);
+  const [rows, configuredSlugs] = await Promise.all([
+    emails.length
+      ? DepartmentRole.find({ email: { $in: emails }, isActive: true }).select("departmentSlug role").lean()
+      : [],
+    DepartmentRole.distinct("departmentSlug"),
+  ]);
+  const best = new Map();
+  for (const r of rows) {
+    const slug = lower(r.departmentSlug);
+    const role = r.role;
+    if (!slug || !RANK[role]) continue;
+    const cur = best.get(slug);
+    if (!cur || RANK[role] > RANK[cur]) best.set(slug, role);
+  }
+  /* the accounting app's role is the Acc_User's, as `getRole` reads it */
+  let accounting = null;
+  if (emails.length) {
+    const { findAccountantUser } = require("../accountantAccess");
+    for (const email of emails) {
+      const acc = await findAccountantUser(email).catch(() => null);
+      const role = acc && acc.isActive ? acc.role : null;
+      if (role && (!accounting || RANK[role] > RANK[accounting])) accounting = role;
+    }
+  }
+  if (accounting) best.set(ACCOUNTING, accounting);
+  return { roles: best, configured: new Set((configuredSlugs || []).map(lower)) };
+}
+
+async function resolveWithIdentity(identity, appSlug, dept, { requireCatalogueEntry = true, allowLegacyAssignment = true, index = null } = {}) {
   if (!dept && requireCatalogueEntry) return deny(appSlug, DENIAL.APP_NOT_FOUND);
   if (dept && !dept.isActive) return deny(appSlug, DENIAL.APP_INACTIVE);
 
   if (identity.isPlatformAdmin) return allow(appSlug, "owner", SOURCE.PLATFORM_ADMIN);
 
-  const role = await roleFor(appSlug, identity.emails);
+  const role = index ? (index.roles.get(lower(appSlug)) || null) : await roleFor(appSlug, identity.emails);
   if (role) return allow(appSlug, role, appSlug === ACCOUNTING ? SOURCE.ACCOUNTING_ROLE : SOURCE.APP_ROLE);
 
   // Compatibility bridge — see header. Only for an ASSIGNED department with no
   // role rows at all; never for Accounting, whose role store is Acc_User.
   if (allowLegacyAssignment && dept && appSlug !== ACCOUNTING && identity.assignedDeptIds.includes(String(dept._id))) {
     const { DepartmentRole } = models();
-    const configured = await DepartmentRole.exists({ departmentSlug: appSlug });
+    const configured = index ? index.configured.has(lower(appSlug)) : await DepartmentRole.exists({ departmentSlug: appSlug });
     if (!configured) return allow(appSlug, "editor", SOURCE.LEGACY_DEPARTMENT_ASSIGNMENT);
   }
   return deny(appSlug, DENIAL.NO_APP_GRANT);
@@ -257,11 +303,15 @@ async function listAccessibleApps(actorLike) {
     const identity = await verifiedIdentity(actor);
     if (!identity.ok) return { ok: false, denialCode: identity.code, apps: [] };
     const { AccessDepartment } = models();
-    const depts = await AccessDepartment.find({ isActive: true, slug: { $nin: [...NON_APPLICATION_SLUGS] } })
-      .sort({ sortOrder: 1, name: 1 });
+    /* the catalogue and the identity's grants, side by side; an admin needs no index */
+    const [depts, index] = await Promise.all([
+      AccessDepartment.find({ isActive: true, slug: { $nin: [...NON_APPLICATION_SLUGS] } })
+        .sort({ sortOrder: 1, name: 1 }),
+      identity.isPlatformAdmin ? null : grantIndexFor(identity),
+    ]);
     const apps = [];
     for (const dept of depts) {
-      const access = await resolveWithIdentity(identity, dept.slug, dept);
+      const access = await resolveWithIdentity(identity, dept.slug, dept, { index });
       if (access.allowed) apps.push({ department: dept, access });
     }
     return { ok: true, isPlatformAdmin: identity.isPlatformAdmin, apps };

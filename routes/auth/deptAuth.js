@@ -129,14 +129,26 @@ async function resolveEmployeeDepartments(employee) {
  * ASSIGNED to", which is a different question.
  */
 async function resolveEmployeeLauncher(employee) {
+  return (await resolveEmployeeLauncherWithAccess(employee)).departments;
+}
+
+/* ── ONE WALK OF THE CATALOGUE PER SESSION CHECK (8 Oct 2026) ──────────────
+   /verify used to resolve the launcher (every department, with its grant) and
+   then ask the resolver AGAIN for the one department the session is in — the
+   same identity, the same grant, one more set of round trips on the route the
+   browser calls most. The launcher now hands back the grant it already found
+   for each department, keyed by id, and verify reads the role from there. */
+async function resolveEmployeeLauncherWithAccess(employee) {
   const { listAccessibleApps } = require("../../services/access/appAccess.service");
   const out = await listAccessibleApps({ id: employee._id, email: employee.email, subject: "employee" });
-  if (!out.ok) return [];
+  if (!out.ok) return { departments: [], accessById: new Map() };
+  const accessById = new Map(out.apps.map((a) => [String(a.department._id), a.access]));
   const apps = out.apps.map((a) => a.department);
   const order = [employee.accessDepartmentId, ...(employee.additionalDepartmentIds || [])]
     .filter(Boolean).map(String);
   const rank = (d) => { const i = order.indexOf(String(d._id)); return i === -1 ? order.length : i; };
-  return apps.map((d, i) => ({ d, i })).sort((x, y) => rank(x.d) - rank(y.d) || x.i - y.i).map((x) => x.d);
+  const departments = apps.map((d, i) => ({ d, i })).sort((x, y) => rank(x.d) - rank(y.d) || x.i - y.i).map((x) => x.d);
+  return { departments, accessById };
 }
 
 /** The resolver's answer for a department session — one place, used below. */
@@ -705,7 +717,7 @@ router.post("/verify", async (req, res) => {
       // branch on, rather than a bare "Unauthorized" they cannot act on.
       if (refuseIfNotEmployed(res, employee)) return;
 
-      const allowed = await resolveEmployeeLauncher(employee);
+      const { departments: allowed, accessById } = await resolveEmployeeLauncherWithAccess(employee);
 
       if (!allowed.length) {
         return res.status(403).json({
@@ -736,14 +748,10 @@ router.post("/verify", async (req, res) => {
       // token — whose role is the DEPARTMENT role, "accountant". That is why an
       // Owner's sidebar read ACCOUNTANT. Minting it here means every page load
       // of the module carries the person's real accounting role.
-      /* Two independent lookups, one round trip's worth of waiting instead
-         of two. Each is a cross-region query on the most-called route. */
-      const [accSession, deptRole] = await Promise.all([
-        attachAccountantSession(res, dept, employee.email, decoded.iat),
-        require("../../services/access/appAccess.service")
-          .resolveAppAccess({ id: employee._id, email: employee.email, subject: "employee" }, dept.slug)
-          .then((a) => (a.allowed ? a.role : null)),
-      ]);
+      /* The launcher already resolved this department's grant (8 Oct 2026):
+         `dept` came out of it, so the role is read from it, not resolved again. */
+      const deptRole = accessById.get(String(dept._id))?.role ?? null;
+      const accSession = await attachAccountantSession(res, dept, employee.email, decoded.iat);
 
       return res.status(200).json({
         success: true,
@@ -804,15 +812,24 @@ router.post("/verify", async (req, res) => {
       // An admin's session may be pointed at a department other than the one
       // their account belongs to (see switch-department). Everyone else is read
       // from their own record, so a hand-edited token cannot move them.
-      const own = await AccessDepartment.findById(user.departmentId);
+      /* ── ONE RESOLUTION, NOT THREE (8 Oct 2026) ────────────────────────
+         This branch resolved access three times over — the requested
+         department, then the session's role, then the whole launcher for the
+         grid — each a fresh identity check and grant walk. The launcher is
+         resolved once, alongside the own-department read, and the other two
+         answers are looked up in it. GAC-AR1 is unchanged: the resolver
+         decides (database-verified administrator, or an application grant) —
+         never the token's isAdmin claim. */
+      const [own, launcher] = await Promise.all([
+        AccessDepartment.findById(user.departmentId),
+        require("../../services/access/appAccess.service")
+          .listAccessibleApps({ id: user._id, email: user.email, subject: "dept_user", tv: decoded.tv || 0 }),
+      ]);
+      const grantById = new Map((launcher.apps || []).map((a) => [String(a.department._id), a]));
       let dept = own;
       if (decoded.deptId && String(decoded.deptId) !== String(user.departmentId)) {
-        const requested = await AccessDepartment.findById(decoded.deptId);
-        // GAC-AR1: the resolver decides (database-verified administrator, or
-        // an application grant) — never the token's isAdmin claim.
-        if (requested && (await accessFor(user, requested.slug, decoded.tv || 0)).allowed) {
-          dept = requested;
-        }
+        const requested = grantById.get(String(decoded.deptId));
+        if (requested) dept = requested.department;
       }
 
       if (!dept || !dept.isActive) {
@@ -840,7 +857,7 @@ router.post("/verify", async (req, res) => {
               ? null
               : user.legacyRole) || dept.legacyRole || dept.slug,
           // GAC-AR1: the canonical resolver's role for this application.
-          deptRole: await accessFor(user, dept.slug, decoded.tv || 0).then((a) => (a.allowed ? a.role : null)),
+          deptRole: grantById.get(String(dept._id))?.access.role ?? null,
           employeeId: user.employeeId || "",
           department: dept.name,
           deptSlug: dept.slug,
@@ -865,9 +882,7 @@ router.post("/verify", async (req, res) => {
         // GAC-AR1: every application the canonical resolver opens for this
         // person. A database-verified platform administrator gets every
         // active internal application; everybody else gets their grants.
-        departments: await require("../../services/access/appAccess.service")
-          .listAccessibleApps({ id: user._id, email: user.email, subject: "dept_user", tv: decoded.tv || 0 })
-          .then((out) => out.apps.map((a) => a.department.toPublicTile())),
+        departments: (launcher.apps || []).map((a) => a.department.toPublicTile()),
         accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
         sessionToken: token,

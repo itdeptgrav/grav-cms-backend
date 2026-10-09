@@ -1286,3 +1286,243 @@ backdating is normal and there is no company backdating window to enforce.
 `test/hr-access/leave-before-joining.route.test.js` drives the real router.
 That record (GR0087, still `pending`) was left for the employee to withdraw and
 re-apply, by the owner's choice.
+
+## One goods receipt as a document; Receive lists material requests (7 Oct 2026)
+
+`services/storePurchase/goodsReceiptDocument.service.js` reads any GRN as a
+document: `document(tenant, grnId)` returns the receipt header, its source
+(purchase: PO and supplier; material-request: request, order, customer, PI;
+customer-material: document and customer), its lines (ordered, previously
+received, received, invoiced, difference, pending after, base quantity, labels
+activated) and totals. `listForSource(tenant, {purchaseOrderId |
+materialRequestId})` lists a source's GRNs. Read-only; figures are the GRN's
+own. Routes on `goodsReceipts.js`, declared before `/:grnId`:
+
+- `GET /api/cms/store/goods-receipts/for-source?purchaseOrderId=` (or
+  `materialRequestId=`)
+- `GET /api/cms/store/goods-receipts/:grnId/document`
+
+`receiveWorkspace.service` has a fourth source, `material-request`
+(`?source=material` is shorthand). Expected rows are submitted merchandising
+requests with a line pending, read through `materialRequestReceipt.registerRows`;
+their action is `RECEIVE_MATERIAL` to the request's receive page.
+
+**8 Oct 2026, owner:** `stage=all` lists RECORDED receipts only — the Receive
+list is the GRN register; expected arrivals are read only by Record receipt's
+picker (`stage=expected`). And a `MATERIAL_REQUEST` GRN goes through the same
+receipt control as a purchase GRN (`deriveControl`: awaiting inspection ->
+quarantine -> put-away), named by the order's customer. Only
+`POST /:grnId/supplier-returns` refuses it (`reason: "NO_SUPPLIER"`); `/control`
+returns `goodsReceipt.materialRequest`. QC's raw-item order page counts these
+GRNs as "received" for the order (`materialRequest.customerRequestId`), beside
+customer-supplied ones. Store inspection needs a receiving location
+(`NO_RECEIVING_LOCATION`), which no GRN has had since the destination panel left
+the receive pages on 1 Oct 2026 — true for purchase GRNs too.
+
+Only three GRNs existed on 7 Oct 2026, all against material requests
+(GRN/2026-27/0001–0003). The purchase-order wording of the document was checked
+with a synthetic receipt, not a recorded one.
+
+## Raw-material QC reads the GRN a label came from (8 Oct 2026)
+
+A label printed on a material-request GRN carries `Barcode.goodsReceiptId`,
+and the GRN names the request and the order it serves. QC never read it: a
+scan of such a label offered a chooser of unrelated orders ("requires this
+material") and called the source "Unavailable". Now:
+
+- `services/manufacturing/qcRawItemGrns.js` — `receiptOfLabel(b)` (the GRN,
+  request, order, customer and the label's line), `grnsForMaterial({rawItemId,
+  variantId})` (material-request GRNs whose lines carry that material; a line
+  with no variant matches any), `listGrns({q,status,customer})` and
+  `grnDetail(id)` (per line: received vs checked vs remaining, per unit; every
+  label with its verdict; every record). Routes on the raw-item router:
+  `GET /raw-items/grns`, `GET /raw-items/grns/:grnId`.
+- `qcRawItemOrders.resolveOrdersForLabel(b, receipt)`: signal 0 is the GRN's
+  order (`matchedBy: "label"`, auto). A label with NO receipt gets
+  `grnChoices` (the GRNs carrying its material) and their orders as
+  `"grn-for-material"` candidates, ahead of the requirement match. `labelSource`
+  answers `MATERIAL_REQUEST` for a receipt label. `eligibleOrders` counts a
+  material-request GRN as `received`.
+- `/identify-barcode` and `/lookup` return `goodsReceipt` (in `context` on
+  identify) and `grnChoices`. `/save` accepts `goodsReceiptId`: for a label
+  that names no receipt it must be one of `grnsForMaterial`'s, the record is
+  stamped with it AND the label is linked (`goodsReceiptId/Number/LineId` set
+  where null) so the next scan resolves alone. A label that names a receipt
+  keeps it. `QCRawItemInspection` gained `goodsReceiptId` (indexed),
+  `goodsReceiptNumber`, `goodsReceiptLineId`, `materialRequestId`,
+  `materialRequestNumber`; records saved before carry none and so are not
+  in the GRN book.
+
+Verified 8 Oct 2026 through the API: a GRN/2026-27/0002 label resolved
+straight to MO-REQ-2026-0041; a copied label with no receipt was offered
+GRN 0002 and 0001, a pass saved against 0001 linked it (`labelLinked:
+true`), the next identify resolved via the label, and the GRN book showed
+0001 complete; the test label and its verdict were then deleted.
+
+### QC's check is the Store's inspection of a material-request GRN; a label with no receipt is offered every GRN (8 Oct 2026, later)
+
+- `services/storePurchase/qcInspectionBridge.js` — `qcStandingFor(grns)` /
+  `qcStandingOf(grn)`: QC's standing `QCRawItemInspection` records per
+  MATERIAL_REQUEST GRN, per line (a record with no line sits on the line
+  carrying its material). When every line is checked in full it hands back an
+  inspection shaped like the Store's own (`source: "qc"`, accepted = passed
+  capped at received, rejected = the rest, nothing quarantined); otherwise
+  `progress` (`anyChecked`, `text` "20 of 20 Mtr", checkers). Used by
+  `receiveWorkspace.readRecordedReceipts` (controlStage "Awaiting QC check" /
+  "QC checking · …" / "Checked by QC · awaiting put-away") and by
+  `GET /goods-receipts/:grnId/control` (`inspection.source`, `qcProgress`).
+  `deriveControl` takes `ctx.noSupplier`: rejected stock never holds such a
+  receipt at "supplier return required". `POST /:grnId/inspection` refuses a
+  material-request GRN (`INSPECTED_BY_QC`). It reads only; put-away still
+  needs a receiving location on the GRN (`NO_RECEIVING_LOCATION`).
+- `qcRawItemGrns.grnsForMaterial` falls back to EVERY recent material-request
+  GRN (`carriesMaterial: false`, `line: null`, `materials[]`) when none
+  carries the label's raw item + variant, so the checker can still say which
+  delivery it came with; `/save` links the label to it with no line id.
+
+## Raw material measured by weight (8 Oct 2026, owner)
+
+Small parts (buttons, hooks) are weighed, not counted. `RawItem`'s
+`unitConversionSchema` gained `measureByWeight` (Boolean) and `tareQuantity`
+(Number, null = not stated): a conversion flagged for weighing — 1 Pcs =
+0.2234 Gram — is what the scale reads through, and the tare is the weight of
+the extra, unused material weighed with the goods (the packet cover, the box)
+in the conversion's `toUnit`. `rawItemPayload.normaliseUnitConversion` (both
+the create service and `PUT /raw-items/:id`) carries both; a negative or
+blank tare is null. The arithmetic itself is the CMS's
+(`components/store/barcode-labels/labels.js`): base quantity = (weighed −
+tare) ÷ quantity. The older per-variant `weightGrams` field stays on the
+schema and the write paths but the form no longer shows it.
+
+## `/api/auth/verify` resolves access once, not three times (8 Oct 2026)
+
+The route the browser calls most walked the grant catalogue several times per
+request: an employee session resolved the launcher (every department with its
+grant) and then asked `resolveAppAccess` AGAIN for the one department it was
+in; a department account resolved the requested department, then its role,
+then the whole launcher for the grid — each a fresh identity check and grant
+walk. Now `services/access/appAccess.service.js` builds one **grant index**
+per identity (`grantIndexFor`: one `DepartmentRole.find` over the person's
+emails plus one `distinct` of configured slugs) and `listAccessibleApps` passes
+it to every `resolveWithIdentity`; `routes/auth/deptAuth.js` resolves the
+launcher once (`resolveEmployeeLauncherWithAccess` returns `{ departments,
+accessById }`) and reads the session's `deptRole`, the requested department
+and `departments` from it. Behaviour is unchanged except that a department
+account requesting an *inactive* department now falls back to its own instead
+of answering 401. Measured on Atlas: employee verify 1.46 s → 0.25 s, CEO
+0.30 s → 0.13 s.
+
+`services/manufacturing/qcActor.js` runs its three reads (role, roster row,
+employee) with `Promise.all` for the same reason.
+
+A scratch token for an employee must carry `email` — every `/api/cms` router
+reads `req.user.email` from the JWT, and a token minted without it is a
+QC "session expired" / no-role user, which looks exactly like an access bug.
+
+## Packing without a carton; carton counts on the orders list (8 Oct 2026, owner)
+
+`POST /api/cms/manufacturing/packaging/done` accepts `noCarton: true`: the
+scanned units are written on their work orders through the same
+`recordOnWorkOrder` (same records, same unit numbers, same person and time)
+with no `cartonId`/`cartonNumber`, no `PackingCarton` is made, and the
+one-order-per-carton rule is not applied (there is no box to mix). The answer
+is `{ success, noCarton: true, added, carton: null, lines[] }`. Such units
+count in `packagedQuantity` and show as `packedNotInCarton` on the carton
+dispatch overview — they cannot be dispatched by carton. `cartonNumber` and
+`noCarton` together: the carton is ignored.
+
+`GET …/packaging-dispatch-view/manufacturing-orders` rows gained
+`cartonsReady`, `cartonsDispatched`, `piecesReady`,
+`piecesInDispatchedCartons`, `cartonsUnweighed` and `packedNotInCarton` (one
+grouped count over the page's orders). Additive.
+
+## A carton may hold several orders (8 Oct 2026, owner)
+
+"One carton, one order" is gone: `POST /packaging/done` no longer refuses
+MIXED_ORDERS or CARTON_OTHER_ORDER. `PackingCarton` keeps its head fields
+(`manufacturingOrderId`, `moNumber`, `poNumber`, `customerName` = the FIRST
+order, so older readers work) and gained `orders[]` (every order inside, with
+PO and customer), `lines[].manufacturingOrderId` / `lines[].moNumber`, and
+`dispatchChallans[]`. A line written before carries no order — read the
+carton's head for it (`lineOrderOf` in cartonDispatchRoutes). Everything
+that found "this order's cartons" by `manufacturingOrderId` now matches
+`orders.manufacturingOrderId` too (`cartonsHolding`), and counts THIS
+order's pieces as its lines, never the whole box (`piecesOfThisOrder` on
+the overview's cartons; the orders list aggregates by line order). Dispatch
+of a mixed carton: the box leaves whole, and **one challan per order
+inside it** is made — the screen's order gets the head challan
+(`carton.dispatchChallanNumber`), the others are in `carton.dispatchChallans`
+and the response's `challans[]`; each work order's `dispatchRecords` names
+its own order's challan. `/resolve` accepts a carton holding any piece of
+the order; OTHER_ORDER names every order the box does hold.
+
+`DispatchChallan.cartons[].lines[].productImage` and `bulkProducts[] /
+persons[].products[].productImage` (8 Oct 2026): the product photo as
+resolved at dispatch (`resolvePhotos`, variant image first), for the challan
+PDF. Blank on earlier challans.
+
+## One identity per raw-item variant (9 Oct 2026, owner)
+
+`PUT /api/cms/raw-items/:id` matched each incoming variant row to a stored
+one by id, else by exact combination, and wrote `_id: existing._id`. Two
+rows could resolve to ONE stored variant — the CMS form carried a rename
+into the row (keeping its id) while the person was still typing past an
+existing value, so "Green" → "Green " → … → "Green Khaki" took Green's id
+along and a fresh "Green" row then matched the stored Green by combination
+— and the item was saved with one id on two variants, and the balance on
+both. Every later edit was refused: "variants[78] repeats a variant already
+listed" (RAW-BUT-BUT-977 on production, 8–9 Oct 2026).
+
+`services/inventory/variantIdentity.js` (tested, `variantIdentity.test.mjs`)
+is now the pairing: `assignIds(rows, stored)` claims by COMBINATION first
+(trimmed), then by id for a still-unclaimed stored row (a true rename), else
+the row is a new variant (fresh id, no balance). Every stored row is claimed
+once, every saved row has its own id, and an item already holding
+duplicates is repaired by its next save (a `console.warn` names it;
+`duplicateIds`). The route no longer refuses a repeated id; it still
+refuses two rows with the same options (`DUPLICATE_VARIANT_COMBINATION`,
+naming both). The CMS side: `isTrueRename` / `uniqueVariantIds` /
+`attributeValues` in `components/store/item-master/form.mjs`. **Deploy
+both** — the hosted backend alone shows the clearer refusal, the form fix
+stops it recurring, and the owner's item is repaired by saving it once.
+
+## Every customer onto the pipeline; the PI product scope is a setting (8 Oct 2026, owner)
+
+**The pipeline is the Sales Journeys page** (`/sales/dashboard/journeys`,
+Account → Enquiry → … → Retention), not the Leads board. A first version the
+same morning made LEADS; the owner's "see this script is not working" was
+that. It was redone the same day.
+
+`services/sales/customerPipelineImport.js` — `importCustomersIntoPipeline({
+scope, ownership, actor, fallbackOwner, dryRun })`: for every active,
+non-test `Customer`, (1) its CRM Account — `customerAccountLink.resolve`
+(LINKED / REPAIRABLE), else the one active Account whose active `Contact`
+carries the customer's e-mail (then `linkedCustomer` is set on it; two
+accounts with that e-mail = a named failure), else `ensure` creates one (a
+name is never matched); (2) one `SalesJourney` on that account unless it
+already has a live one (any outcome) — `name` = the account's company,
+`businessType: "repeat"`, stage enquiry, `ownerId` = the customer's
+`salesAssignedBy` else `fallbackOwner`/actor, `leadId/leadRef` from the Lead
+the first version made (if any), `importedFromCustomerId/Code` (new on the
+Journey schema, traceability only — idempotency is one Journey per Account).
+Result: `created[]`, `alreadyThere[]` (with `journeyId`, `stage`, `outcome`),
+`skippedTest[]` (`@internal.gravtest.com`), `failed[]`, `strayLeads` (Leads
+still carrying `importedFromCustomerId`). `retireImportedLeads()` archives
+those (`isActive:false`, `captureStatus:"archived"`).
+
+Doors: `POST /api/cms/crm/leads/import-customers` (Sales manager / admin;
+`?dryRun=1` lists only), `POST …/import-customers/retire-leads`, and
+`scripts/importCustomersToPipeline.js [--dry-run]` (sole / primary company or
+`COMPANY_ID=`; `OWNER_EMAIL=` names the fallback owner — any CMS login:
+an Employee, Sales or CEO user — else the CEO user; journey owners are CMS
+login ids and Sales people are `employees` rows, `salesdepartments` is
+empty here). Local dry run 8 Oct 2026: 27 customers, 25 "already
+there" — 28 journeys (SJ-2026-0011…0038) had been created in bulk by the
+CEO on 7 Oct 2026 13:07, so locally nothing is added; production had 1
+journey and 24 stray Leads at the time. Several customers share a
+`customerId` (CUST-0021 ×4, six with none) — a data quirk, untouched.
+
+`SalesSettings.piProductScope` ("all" | "approved", default "all") now decides
+`flag.piAllProducts`: `piProductGate.piAllProducts()` is async, reads the
+setting (5 s cache, `forgetPiProductScope()` on a settings save) and falls back
+to `SALES_PI_ALL_PRODUCTS` only while the setting is absent.

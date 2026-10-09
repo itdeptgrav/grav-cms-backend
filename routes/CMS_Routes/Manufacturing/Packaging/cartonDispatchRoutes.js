@@ -108,7 +108,21 @@ function weightState(c) {
   return { weightKg: c.weightKg ?? null, weighedAt: c.weighedAt || null, needsReweigh: Boolean(needsReweigh) };
 }
 
-async function publicCarton(c) {
+/** Every order with pieces in the box — the list when it has one, else the head. */
+function ordersOf(c) {
+  if (Array.isArray(c.orders) && c.orders.length) return c.orders.map((o) => ({ manufacturingOrderId: o.manufacturingOrderId ? String(o.manufacturingOrderId) : null, moNumber: o.moNumber || "", poNumber: o.poNumber || "", customerName: o.customerName || "" }));
+  return c.manufacturingOrderId ? [{ manufacturingOrderId: String(c.manufacturingOrderId), moNumber: c.moNumber || "", poNumber: c.poNumber || "", customerName: c.customerName || "" }] : [];
+}
+/** Does this box hold any piece of the order? */
+const holdsOrder = (c, moId) => ordersOf(c).some((o) => o.manufacturingOrderId === String(moId));
+/** The order a line belongs to: its own, else the carton's head. */
+const lineOrderOf = (c, l) => String(l.manufacturingOrderId || c.manufacturingOrderId || "");
+/** The pieces of ONE order in the box. */
+const piecesOfOrder = (c, moId) => (c.lines || []).reduce((n, l) => n + (lineOrderOf(c, l) === String(moId) ? (Number(l.quantity) || 0) : 0), 0);
+const cartonsHolding = (companyId, moId, extra = {}) => ({ companyId, ...extra, $or: [{ manufacturingOrderId: access.oid(moId) }, { "orders.manufacturingOrderId": access.oid(moId) }] });
+
+async function publicCarton(c, forOrder = null) {
+  const orders = ordersOf(c);
   return {
     _id: String(c._id),
     cartonNumber: c.cartonNumber,
@@ -116,6 +130,10 @@ async function publicCarton(c) {
     poNumber: c.poNumber || "",
     customerName: c.customerName || "",
     manufacturingOrderId: c.manufacturingOrderId ? String(c.manufacturingOrderId) : null,
+    orders,
+    mixed: orders.length > 1,
+    piecesOfThisOrder: forOrder ? piecesOfOrder(c, forOrder) : null,
+    dispatchChallans: (c.dispatchChallans || []).map((d) => ({ challanNumber: d.challanNumber, moNumber: d.moNumber })),
     totalQuantity: c.totalQuantity,
     workOrderCount: c.workOrderCount,
     status: c.status,
@@ -128,7 +146,7 @@ async function publicCarton(c) {
     dispatchChallanId: c.dispatchChallanId ? String(c.dispatchChallanId) : null,
     notes: c.notes || "",
     ...weightState(c),
-    lines: await describeLines(c.lines || []),
+    lines: (await describeLines(c.lines || [])).map((l) => ({ ...l, manufacturingOrderId: l.manufacturingOrderId ? String(l.manufacturingOrderId) : (c.manufacturingOrderId ? String(c.manufacturingOrderId) : null), moNumber: l.moNumber || c.moNumber || "" })),
   };
 }
 
@@ -147,8 +165,11 @@ async function resolveForOrder(companyId, moId, rawCode) {
   const cartonNumber = normaliseCartonNumber(code);
   const carton = await PackingCarton.findOne({ companyId, cartonNumber }).lean();
   if (!carton) return { refusal: [404, "NOT_FOUND", `Carton ${cartonNumber} was not found. Check the label — it may belong to another company or never have been sealed.`] };
-  if (String(carton.manufacturingOrderId || "") !== String(moId)) {
-    return { refusal: [409, "OTHER_ORDER", `Carton ${cartonNumber} belongs to ${carton.moNumber || "another order"}${carton.customerName ? ` (${carton.customerName})` : ""}, not this one. Open that order to dispatch it.`, { carton: { cartonNumber, moNumber: carton.moNumber, customerName: carton.customerName, manufacturingOrderId: carton.manufacturingOrderId } }] };
+  /* A box holding ANY piece of this order may leave from here; a mixed box
+     leaves whole, and every order inside it gets its own challan. */
+  if (!holdsOrder(carton, moId)) {
+    const theirs = ordersOf(carton).map((o) => [o.moNumber, o.customerName].filter(Boolean).join(" · ")).join(", ") || "another order";
+    return { refusal: [409, "OTHER_ORDER", `Carton ${cartonNumber} holds ${theirs}, not this order. Open that order to dispatch it.`, { carton: { cartonNumber, moNumber: carton.moNumber, customerName: carton.customerName, manufacturingOrderId: carton.manufacturingOrderId } }] };
   }
   if (carton.status === "dispatched") {
     return { refusal: [409, "ALREADY_DISPATCHED", `Carton ${cartonNumber} already left${carton.dispatchChallanNumber ? ` on challan ${carton.dispatchChallanNumber}` : ""}${carton.dispatchedAt ? ` (${new Date(carton.dispatchedAt).toLocaleString("en-IN", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" })})` : ""}.`, { carton: { cartonNumber, dispatchChallanNumber: carton.dispatchChallanNumber, dispatchedAt: carton.dispatchedAt } }] };
@@ -175,14 +196,15 @@ router.get("/manufacturing-orders/:moId/overview", ...canRead, async (req, res) 
       CustomerRequest.findById(moId).select(`requestId customerInfo requestType measurementName deliveryDeadline ${PO_SELECT}`).lean(),
       WorkOrder.find(access.scoped(companyId, { customerRequestId: access.oid(moId) }))
         .select("workOrderNumber stockItemName quantity packagedQuantity dispatchedQuantity").lean(),
-      PackingCarton.find({ companyId, manufacturingOrderId: access.oid(moId) }).sort({ packedAt: -1 }).lean(),
+      PackingCarton.find(cartonsHolding(companyId, moId)).sort({ packedAt: -1 }).lean(),
     ]);
 
     const ready = [];
     const gone = [];
-    for (const c of cartons) (c.status === "dispatched" ? gone : ready).push(await publicCarton(c));
+    for (const c of cartons) (c.status === "dispatched" ? gone : ready).push(await publicCarton(c, moId));
 
-    const pieces = (list) => list.reduce((n, c) => n + (c.totalQuantity || 0), 0);
+    /* This order's pieces in those boxes — a mixed box counts only its own. */
+    const pieces = (list) => list.reduce((n, c) => n + (c.piecesOfThisOrder ?? c.totalQuantity ?? 0), 0);
     const orderQuantity = wos.reduce((n, w) => n + (w.quantity || 0), 0);
     const packedQuantity = wos.reduce((n, w) => n + (w.packagedQuantity || 0), 0);
     const dispatchedQuantity = wos.reduce((n, w) => n + (w.dispatchedQuantity || 0), 0);
@@ -237,7 +259,7 @@ router.post("/manufacturing-orders/:moId/resolve", ...canRead, async (req, res) 
     if (!visible) return access.notFound(res, "manufacturing order");
     const r = await resolveForOrder(companyId, moId, req.body?.code);
     if (r.refusal) { const [status, code, message, extra] = r.refusal; return refuse(res, status, code, message, extra); }
-    return res.json({ success: true, carton: await publicCarton(r.carton) });
+    return res.json({ success: true, carton: await publicCarton(r.carton, moId) });
   } catch (err) {
     console.error("Carton dispatch resolve error:", err);
     return res.status(500).json({ success: false, message: "Server error", error: err.message });
@@ -295,12 +317,11 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
       if (r.refusal) { const [status, code, message, extra] = r.refusal; return refuse(res, status, code, message, { ...extra, cartonNumber: n }); }
     }
 
-    const challanNumber = await nextChallanNumber(now);
     const session = await mongoose.startSession();
     let result = null;
     try {
       await session.withTransaction(async () => {
-        const cartons = await PackingCarton.find({ companyId, cartonNumber: { $in: asked }, manufacturingOrderId: access.oid(moId), status: "packed" }).session(session);
+        const cartons = await PackingCarton.find(cartonsHolding(companyId, moId, { cartonNumber: { $in: asked }, status: "packed" })).session(session);
         if (cartons.length !== asked.length) {
           const have = new Set(cartons.map((c) => c.cartonNumber));
           const missing = asked.filter((n) => !have.has(n));
@@ -320,16 +341,31 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
         const variants = await resolveVariantAttributes(allLines);
         let vi = 0;
 
-        const persons = new Map();
-        const bulk = new Map();
+        /* ── ONE CHALLAN PER ORDER IN THE LOAD (8 Oct 2026) ────────────────
+           A mixed carton leaves whole, but each order's dispatch history is
+           its own: the lines are grouped by order, and every order present
+           gets a challan listing the cartons and ITS lines in them. The
+           order this screen belongs to gets the first number and is the
+           carton's head challan. */
+        const orderIds = [String(moId), ...new Set(cartons.flatMap((c) => (c.lines || []).map((l) => lineOrderOf(c, l))).filter((k) => k && k !== String(moId)))];
+        const mosById = new Map([[String(moId), mo]]);
+        const others = orderIds.slice(1).filter(access.isId);
+        if (others.length) {
+          for (const m of await CustomerRequest.find({ _id: { $in: others.map(access.oid) } }).select(`requestId customerInfo requestType measurementName ${PO_SELECT}`).session(session).lean()) mosById.set(String(m._id), m);
+        }
+        const perOrder = new Map(orderIds.map((k) => [k, { persons: new Map(), bulk: new Map(), challanCartons: [], totalUnits: 0, cartonNumbers: new Set() }]));
         const perWo = new Map();
         const progressIds = [];
-        const challanCartons = [];
         let totalUnits = 0;
 
         for (const c of cartons) {
-          const lines = [];
+          const linesByOrder = new Map();
           for (const l of c.lines || []) {
+            const ok = lineOrderOf(c, l) || String(moId);
+            const bucket = perOrder.get(ok) || perOrder.get(String(moId));
+            const { persons, bulk } = bucket;
+            if (!linesByOrder.has(ok)) linesByOrder.set(ok, []);
+            const lines = linesByOrder.get(ok);
             const wo = woById.get(String(l.workOrderId));
             const attrs = variants[vi++]?.attributes || l.variantAttributes || [];
             const vText = (() => { const t = variantText({ attributes: attrs }); return t === "Not specified" ? "" : t; })();
@@ -338,8 +374,10 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
             totalUnits += qty;
             lines.push({ workOrderId: l.workOrderId, workOrderNumber, productName: l.productName || wo?.stockItemName || "—", productRef: l.productReference || wo?.stockItemReference || "", variantText: vText, quantity: qty, employeeName: l.employee?.employeeName || "", employeeUIN: l.employee?.employeeUIN || "" });
 
+            bucket.totalUnits += qty;
+            bucket.cartonNumbers.add(c.cartonNumber);
             const wk = String(l.workOrderId);
-            if (!perWo.has(wk)) perWo.set(wk, { qty: 0, cartons: new Set(), employeeIds: [], employeeNames: [] });
+            if (!perWo.has(wk)) perWo.set(wk, { qty: 0, cartons: new Set(), employeeIds: [], employeeNames: [], orderKey: ok });
             const agg = perWo.get(wk);
             agg.qty += qty; agg.cartons.add(c.cartonNumber);
 
@@ -357,36 +395,56 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
               bulk.get(bk).quantity += qty;
             }
           }
-          challanCartons.push({ cartonId: c._id, cartonNumber: c.cartonNumber, totalQuantity: c.totalQuantity, weightKg: c.weightKg ?? null, lines });
+          for (const [ok, lines] of linesByOrder) {
+            const bucket = perOrder.get(ok) || perOrder.get(String(moId));
+            /* The carton on this order's challan: the whole box's number and
+               weight, with THIS order's lines and their count. */
+            bucket.challanCartons.push({ cartonId: c._id, cartonNumber: c.cartonNumber, totalQuantity: lines.reduce((n, l) => n + l.quantity, 0), weightKg: c.weightKg ?? null, lines });
+          }
         }
 
-        const dispatchType = persons.size && !bulk.size ? "person_wise" : "bulk";
-        const [challan] = await DispatchChallan.create([{
-          challanNumber,
-          manufacturingOrderId: access.oid(moId),
-          requestId: mo.requestId || "",
-          customerName: mo.customerInfo?.name || "—",
-          customerInfo: mo.customerInfo || null,
-          dispatchType,
-          persons: [...persons.values()],
-          bulkProducts: [...bulk.values()],
-          totalUnits,
-          totalPersons: persons.size,
-          totalProducts: dispatchType === "person_wise" ? [...persons.values()].reduce((n, p) => n + p.products.length, 0) : bulk.size,
-          notes,
-          dispatchedBy,
-          createdBy: mongoose.Types.ObjectId.isValid(actor.userId) ? access.oid(actor.userId) : null,
-          source: "carton",
-          cartons: challanCartons,
-          cartonCount: cartons.length,
-          transport,
-        }], { session });
+        const challans = [];
+        const challanByOrder = new Map();
+        for (const ok of orderIds) {
+          const b = perOrder.get(ok);
+          if (!b || !b.challanCartons.length) continue;
+          const m = mosById.get(ok) || null;
+          const number = await nextChallanNumber(now);
+          const dispatchType = b.persons.size && !b.bulk.size ? "person_wise" : "bulk";
+          const [challan] = await DispatchChallan.create([{
+            challanNumber: number,
+            manufacturingOrderId: access.oid(ok),
+            requestId: m?.requestId || "",
+            customerName: m?.customerInfo?.name || "—",
+            customerInfo: m?.customerInfo || null,
+            dispatchType,
+            persons: [...b.persons.values()],
+            bulkProducts: [...b.bulk.values()],
+            totalUnits: b.totalUnits,
+            totalPersons: b.persons.size,
+            totalProducts: dispatchType === "person_wise" ? [...b.persons.values()].reduce((n, p) => n + p.products.length, 0) : b.bulk.size,
+            notes,
+            dispatchedBy,
+            createdBy: mongoose.Types.ObjectId.isValid(actor.userId) ? access.oid(actor.userId) : null,
+            source: "carton",
+            cartons: b.challanCartons,
+            cartonCount: b.challanCartons.length,
+            transport,
+          }], { session });
+          challans.push(challan);
+          challanByOrder.set(ok, challan);
+        }
+        const challan = challanByOrder.get(String(moId)) || challans[0];
+        const challanNumber = challan.challanNumber;
 
         for (const c of cartons) {
           c.status = "dispatched";
           c.dispatchedAt = now;
           c.dispatchChallanId = challan._id;
           c.dispatchChallanNumber = challanNumber;
+          c.dispatchChallans = challans
+            .filter((ch) => ch.cartons.some((k) => k.cartonNumber === c.cartonNumber))
+            .map((ch) => ({ challanId: ch._id, challanNumber: ch.challanNumber, manufacturingOrderId: ch.manufacturingOrderId, moNumber: mosById.get(String(ch.manufacturingOrderId))?.requestId ? `MO-${mosById.get(String(ch.manufacturingOrderId)).requestId}` : "" }));
           c.dispatchedBy = actor;
           await c.save({ session });
         }
@@ -402,7 +460,7 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
             dispatchedQuantity: agg.qty, dispatchedAt: now, dispatchedBy, notes,
             dispatchType: agg.employeeIds.length ? "person_wise" : "bulk",
             employeeIds: agg.employeeIds, employeeNames: agg.employeeNames,
-            cartonNumbers: [...agg.cartons], challanNumber,
+            cartonNumbers: [...agg.cartons], challanNumber: challanByOrder.get(agg.orderKey)?.challanNumber || challanNumber,
           });
           await wo.save({ session });
         }
@@ -415,7 +473,7 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
           );
         }
 
-        result = { challan: challan.toObject(), cartonNumbers: cartons.map((c) => c.cartonNumber), totalUnits, workOrders: perWo.size, persons: persons.size };
+        result = { challan: challan.toObject(), challans: challans.map((ch) => ({ challanNumber: ch.challanNumber, manufacturingOrderId: String(ch.manufacturingOrderId), moNumber: mosById.get(String(ch.manufacturingOrderId))?.requestId ? `MO-${mosById.get(String(ch.manufacturingOrderId)).requestId}` : "", totalUnits: ch.totalUnits, cartonCount: ch.cartonCount })), challanNumber, cartonNumbers: cartons.map((c) => c.cartonNumber), totalUnits, workOrders: perWo.size, persons: [...perOrder.values()].reduce((n, b) => n + b.persons.size, 0) };
       });
     } catch (e) {
       if (e?.status) return refuse(res, e.status, e.code || "REFUSED", e.message);
@@ -424,10 +482,12 @@ router.post("/manufacturing-orders/:moId/dispatch", ...canRecord, async (req, re
       await session.endSession();
     }
 
+    const extra = result.challans.filter((ch) => ch.challanNumber !== result.challanNumber);
     return res.json({
       success: true,
-      message: `Challan ${challanNumber}: ${result.cartonNumbers.length} carton${result.cartonNumbers.length !== 1 ? "s" : ""} · ${result.totalUnits} piece${result.totalUnits !== 1 ? "s" : ""} dispatched.`,
+      message: `Challan ${result.challanNumber}: ${result.cartonNumbers.length} carton${result.cartonNumbers.length !== 1 ? "s" : ""} · ${result.totalUnits} piece${result.totalUnits !== 1 ? "s" : ""} dispatched.${extra.length ? ` Also ${extra.map((ch) => `${ch.challanNumber} for ${ch.moNumber || "another order"}`).join(", ")} — the mixed carton${result.cartonNumbers.length !== 1 ? "s" : ""} left whole.` : ""}`,
       challan: result.challan,
+      challans: result.challans,
       summary: { cartons: result.cartonNumbers.length, cartonNumbers: result.cartonNumbers, pieces: result.totalUnits, workOrders: result.workOrders, persons: result.persons },
     });
   } catch (err) {

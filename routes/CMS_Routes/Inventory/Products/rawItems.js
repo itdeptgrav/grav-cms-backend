@@ -15,6 +15,8 @@ const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
 const RawItem = require("../../../../models/CMS_Models/Inventory/Products/RawItem");
+/* One stored identity per saved variant (9 Oct 2026) — see the service. */
+const variantIdentity = require("../../../../services/inventory/variantIdentity");
 const { isUsedAs, DEFAULT_USED_AS, USED_AS_VALUES } = require("../../../../models/CMS_Models/Inventory/Products/usedAs");
 const Unit = require("../../../../models/CMS_Models/Inventory/Configurations/Unit");
 const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
@@ -289,20 +291,9 @@ const applyComputedStatus = (item) => {
 // Match incoming variant payload to existing variant doc:
 // → first by _id (most reliable),
 // → fallback by exact combination.
-const matchExistingVariant = (incoming, existingList) => {
-  if (incoming._id) {
-    const byId = existingList.find(e => e._id?.toString() === incoming._id.toString());
-    if (byId) return byId;
-  }
-  if (Array.isArray(incoming.combination) && incoming.combination.length) {
-    return existingList.find(e =>
-      Array.isArray(e.combination) &&
-      e.combination.length === incoming.combination.length &&
-      e.combination.every((v, i) => v === incoming.combination[i])
-    );
-  }
-  return null;
-};
+/* matchExistingVariant (id first, then exact combination) was replaced by
+   services/inventory/variantIdentity.assignIds on 9 Oct 2026 — it let two
+   rows resolve to one stored variant and wrote one id twice. */
 
 /* normaliseVariantNicknames is imported from rawItemPayload.service.js
    (its object-shaped vendor fix now lives there — 27 Sep 2026). */
@@ -1173,28 +1164,33 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
 
         /* Duplicates introduced by the request would collapse two variants
            into one and silently discard a balance. */
-        const seenIds = new Set();
-        const seenCombos = new Set();
+        /* Two rows with the SAME options are one variant twice — refused,
+           naming both (a value listed twice under one attribute). Two rows
+           with the same id but DIFFERENT options are not refused any more
+           (9 Oct 2026): that is an item this route itself saved with one
+           identity on two variants (a renamed row kept the id while a new
+           row took the old combination, and `_id: existing._id` wrote it
+           twice), and refusing it made the item uneditable for ever —
+           "variants[78] repeats a variant already listed" on RAW-BUT-BUT-977.
+           `variantIdentity.assignIds` gives every saved row one identity,
+           matching each to its own stored row by combination, so the save
+           repairs the item. */
+        const seenCombos = new Map();
+        const label = (x) => (Array.isArray(x.combination) && x.combination.length ? x.combination.join(" / ") : "no options");
         for (let i = 0; i < variants.length; i += 1) {
           const v = variants[i] || {};
-          const id = v._id ? String(v._id) : null;
-          if (id && seenIds.has(id)) {
-            return sendError(res, fail("VALIDATION",
-              `variants[${i}] repeats a variant already listed.`,
-              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_ID" }));
-          }
-          if (id) seenIds.add(id);
-          const combo = JSON.stringify(v.combination || []);
+          const combo = JSON.stringify((v.combination || []).map((c) => String(c ?? "").trim()));
           if (seenCombos.has(combo)) {
             return sendError(res, fail("VALIDATION",
-              `variants[${i}] repeats an option combination already listed.`,
-              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_COMBINATION" }));
+              `Variant ${i + 1} (${label(v)}) has the same options as variant ${seenCombos.get(combo) + 1}. Two variants cannot share one combination — list each value once.`,
+              { field: `variants[${i}]`, reason: "DUPLICATE_VARIANT_COMBINATION", duplicateOf: seenCombos.get(combo) }));
           }
-          seenCombos.add(combo);
+          seenCombos.set(combo, i);
         }
+        const repairedIds = variantIdentity.duplicateIds(oldVariants);
+        if (repairedIds.length) console.warn(`[raw-items] ${rawItem.sku || rawItem._id}: ${repairedIds.length} variant id(s) stored on more than one variant — repaired by this save.`);
 
-        const newVariants = variants.map(incoming => {
-          const existing = matchExistingVariant(incoming, oldVariants);
+        const newVariants = variantIdentity.assignIds(variants, oldVariants).map(({ incoming, existing, _id }) => {
 
           // image: if explicitly in payload (even ""), respect it; else preserve
           const image = incoming.image !== undefined
@@ -1215,7 +1211,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
             : (existing?.unitConversions || [])
 
           return {
-            _id: existing?._id,
+            _id,
             combination: incoming.combination || existing?.combination || [],
             /* From the payload again (30 Sep 2026, on request). This was pinned
                to the stored balance so that editing item details could never
