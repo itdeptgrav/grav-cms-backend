@@ -21,6 +21,8 @@ const qcOperators                = require("../../../../services/qcOperators");
 const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+const { boundedRecordedAt } = require("../../../../services/manufacturing/recordedAt");
+
 const istDateString = (d = new Date()) => {
   const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
   return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, "0")}-${String(ist.getUTCDate()).padStart(2, "0")}`;
@@ -826,6 +828,8 @@ router.post("/save-inspection", async (req, res) => {
 router.post("/save-inspection-offline", async (req, res) => {
   try {
     const { barcodeId, status, note, qcSession, stageId, defects, defectTypes } = req.body;
+    // When the verdict was actually made on the device — services/manufacturing/recordedAt.js.
+    const recordedAt = boundedRecordedAt(req.body.recordedAt);
 
     if (!barcodeId || !["passed", "defective", "rejected"].includes(status))
       return res.status(400).json({ success: false, message: "barcodeId and a valid verdict are required" });
@@ -907,7 +911,7 @@ router.post("/save-inspection-offline", async (req, res) => {
     const reworkRound = verdict.reworkRound || 0;
 
     const record = await QCInspection.create({
-      date: istDateString(), barcodeId, workOrderShortId: parsed.workOrderShortId,
+      date: istDateString(recordedAt), inspectedAt: recordedAt, barcodeId, workOrderShortId: parsed.workOrderShortId,
       workOrderId: workOrder._id, moRequestId, manufacturingOrderId: workOrder.customerRequestId || null,
       status,
       defects: isFault && hasStructuredDefect ? cleanDefects : [],
