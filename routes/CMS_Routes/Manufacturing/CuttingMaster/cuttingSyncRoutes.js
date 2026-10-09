@@ -9,7 +9,7 @@
  * automatically; nothing here has to be kept in step by hand.
  *
  *   POST /work-orders/:woId/send-to-cutting   the web marks a WO for the desktop
- *   GET  /cutting-sync/outbox?since=<iso>      bundles for every WO sent since then
+ *   GET  /cutting-sync/outbox?since=<iso>&have=<id,id>   bundles for every WO sent since then; which of `have` are deleted
  *   POST /cutting-sync/inbox                   { items: [{ woId, employeeId, cutDoneAt }] }
  *
  * The only thing that flows back is "this employee's cutting is done" (decided
@@ -234,7 +234,18 @@ router.get("/cutting-sync/outbox", async (req, res) => {
     const since = req.query.since ? new Date(req.query.since) : null;
     const filter = { sentToCutting: true };
     if (since && !Number.isNaN(since.getTime())) {
+      /*
+       * A PATTERN EDITED ON THE WEB IS NEWS FOR EVERY ORDER OF THAT PRODUCT.
+       *
+       * The pull asked only for orders that had themselves changed. A designer who widened an allowance to 2" on the
+       * website changed the product's pattern config and no work order at all, so the desk was never sent anything:
+       * the cutting screen went on drawing the old allowances, groups and chart for good. The bundle itself already
+       * knew (its key includes the config's time); it was this filter that never asked for it.
+       */
+      const cfgs = await PatternGradingConfig.find({ updatedAt: { $gt: since } }).select("stockItemId").lean();
+      const changed = cfgs.map((c) => c.stockItemId).filter(Boolean);
       filter.$or = [{ sentToCuttingAt: { $gt: since } }, { updatedAt: { $gt: since } }];
+      if (changed.length) filter.$or.push({ stockItemId: { $in: changed } });
     }
     const wos = await WorkOrder.find(filter)
       .select("workOrderNumber stockItemName stockItemReference stockItemId quantity customerRequestId variantAttributes cuttingStatus cuttingProgress sentToCuttingAt updatedAt")
@@ -248,8 +259,21 @@ router.get("/cutting-sync/outbox", async (req, res) => {
     const t0 = Date.now();
     const bundles = await inPool(wos, 2, (wo) => bundleFor(wo, origin, headers));
     outboxLog(`outbox since=${req.query.since || "-"}: ${bundles.length} bundle(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+    /*
+     * WHICH OF THE DESK'S WORK ORDERS NO LONGER EXIST. The desk sends the ids it holds (`have`: on its table and put
+     * aside) and is told which of them are gone from the database — a test order deleted, a product removed. Only
+     * those leave a desk. "Not on the cutting list" is NOT "gone": the production shirt order on the cutting desk was
+     * captured there on 19 Sep and this database does not flag it as sent, and the first version of this answer (every
+     * id still sent to cutting) made the desk put the shirt aside (2026-10-08). With no `have`, nothing is said.
+     */
+    const have = [...new Set(String(req.query.have || "").split(",").map((s) => s.trim()).filter((s) => /^[a-f0-9]{24}$/i.test(s)))].slice(0, 300);
+    let goneWorkOrderIds;
+    if (have.length) {
+      const found = new Set((await WorkOrder.find({ _id: { $in: have } }).select("_id").lean()).map((w) => String(w._id)));
+      goneWorkOrderIds = have.filter((id) => !found.has(id));
+    }
 
-    res.json({ success: true, serverTime, bundles });
+    res.json({ success: true, serverTime, bundles, ...(goneWorkOrderIds ? { goneWorkOrderIds } : {}) });
   } catch (error) {
     console.error("cutting-sync outbox:", error);
     res.status(500).json({ success: false, message: error.message });

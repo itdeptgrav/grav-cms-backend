@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:54.502Z",
+ "productRef": "PROD-BOT-E&MTRO-808",
+ "stockItem": {
+  "_id": "6975a92fcd0afcc274c207cb",
+  "reference": "PROD-BOT-E&MTRO-808",
+  "name": "E&M Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

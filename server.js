@@ -1148,6 +1148,9 @@ const CATEGORY_MEASUREMENTS = {
  * endpoint matrix and the field tests cover it.
  */
 const hrContract = require("./Middlewear/hrContract");
+/* Before EVERY /api/ceo router: the CEO's accounting session is turned back
+   into the CEO's own session — see Middlewear/ceoSessionBridge.js. */
+app.use("/api/ceo", require("./Middlewear/ceoSessionBridge"));
 app.use("/api/ceo/hr", hrContract());
 app.use("/api/employee", hrContract());
 

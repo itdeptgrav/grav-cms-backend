@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:26.648Z",
+ "productRef": "PROD-SHI-DRISHI-694",
+ "stockItem": {
+  "_id": "69732676cb185373c591d571",
+  "reference": "PROD-SHI-DRISHI-694",
+  "name": "Driver Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:11.836Z",
+ "productRef": "PROD-OUT-EXESHI-056",
+ "stockItem": {
+  "_id": "69724f23c156e7d5ce977e55",
+  "reference": "PROD-OUT-EXESHI-056",
+  "name": "Executive to Managers Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

@@ -198,7 +198,7 @@ describe("4/5 — editor, approver, owner", () => {
     for (const [method, path] of [
       ["PATCH", "/api/hr/payroll/mark-paid"],
       ["PATCH", "/api/hr/documents/60c0000000000000000000aa/release"],
-      ["POST", "/hr/attendance/sync-period"],
+      ["DELETE", "/hr/attendance/remove-from-month"],
       ["PUT", "/api/hr/leaves/config"],
       ["GET", "/api/hr/password-management/users"],
     ]) {
@@ -314,7 +314,6 @@ describe("12-16 — the capability separations, end to end", () => {
       "/api/hr/payslip/GR0001/pdf",
       "/api/hr/payroll/items",
       "/api/hr/payroll/preview",
-      "/api/employees/config/salary",
       "/api/employees/import-export/export",
     ]) {
       const denied = await call("GET", path, { token: editor });
@@ -331,8 +330,15 @@ describe("12-16 — the capability separations, end to end", () => {
     const approver = await hrUser("approver");
 
     expect((await call("PUT", "/hr/attendance/day-override", { token: editor, body: {} })).status).toBe(200);
-    expect((await call("POST", "/hr/attendance/sync-period", { token: editor, body: {} })).status).toBe(403);
-    expect((await call("POST", "/hr/attendance/sync-period", { token: approver, body: {} })).status).toBe(200);
+    expect((await call("DELETE", "/hr/attendance/remove-from-month", { token: editor, body: {} })).status).toBe(403);
+    expect((await call("DELETE", "/hr/attendance/remove-from-month", { token: approver, body: {} })).status).toBe(200);
+  });
+
+  test("ANY HR user may resync attendance (owner's decision, 7 Oct 2026)", async () => {
+    for (const role of ["viewer", "editor", "approver", "owner"]) {
+      const token = await hrUser(role);
+      expect({ role, status: (await call("POST", "/hr/attendance/sync-period", { token, body: {} })).status }).toEqual({ role, status: 200 });
+    }
   });
 
   test("document issue and document release need different people", async () => {

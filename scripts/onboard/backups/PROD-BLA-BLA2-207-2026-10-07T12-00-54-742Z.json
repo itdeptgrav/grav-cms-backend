@@ -1,0 +1,21 @@
+{
+ "takenAt": "2026-10-07T12:00:54.745Z",
+ "productRef": "PROD-BLA-BLA2-207",
+ "stockItem": {
+  "_id": "6ac6346f88d5ff24a5a77119",
+  "reference": "PROD-BLA-BLA2-207",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff"
+  ]
+ },
+ "config": null,
+ "createdConfigIds": [
+  "6ac6348317a6f4bde763b2cc"
+ ]
+}

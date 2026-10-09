@@ -46,8 +46,59 @@ const ALLOWED_ROLES = ["sales", "admin", "ceo", "project_manager", "merchandiser
 // It is granted per-route via `SalesAuthMiddlewear.withRoles(...)`.
 const RND_ROLES = ["rnd", "research_development", "research-development"];
 
+/* ── WHEN THE TOKEN IS IN ANOTHER DEPARTMENT ─────────────────────────────────
+   The CMS keeps ONE session per browser, and opening a department's pages
+   switches it INTO that department (role becomes that department's literal —
+   "store_manager" in Store). So a CEO, or anybody holding Sales AND Store, who
+   had Store open in another tab — or had just come from Store — was refused
+   here with "Your role: store_manager" on every Sales read (found by
+   scripts/pageSweep.js, 7 Oct 2026; the recurring "sometimes no permission").
+
+   Before refusing, the DATABASE is asked the real question: is this person a
+   platform administrator, or do they hold an active grant to an application
+   this guard admits? Never the token's claim — the same facts a department
+   switch would re-read. Admitted, they are treated as that application's role,
+   exactly what the switch would have minted. Answers are cached for a minute
+   per (person, token version) so it is not a lookup per request. */
+const ADMIT_TTL_MS = 60 * 1000;
+const admitCache = new Map();
+async function admittedRole(decoded, allowed) {
+  const key = `${decoded.id}|${decoded.email || ""}|${decoded.tv || 0}|${allowed.join(",")}`;
+  const hit = admitCache.get(key);
+  if (hit && hit.at > Date.now() - ADMIT_TTL_MS) return hit.role;
+  let role = null;
+  try {
+    const db = require("mongoose").connection.db;
+    const apps = await db.collection("access_departments")
+      .find({ isActive: { $ne: false }, $or: [{ legacyRole: { $in: allowed } }, { slug: { $in: allowed } }] })
+      .project({ slug: 1, legacyRole: 1 }).toArray();
+    const login = decoded.id && require("mongoose").isValidObjectId(decoded.id)
+      ? await db.collection("dept_users").findOne({ _id: new (require("mongoose").Types.ObjectId)(String(decoded.id)), isActive: { $ne: false } }, { projection: { isAdmin: 1, tokenVersion: 1 } })
+      : null;
+    if (login?.isAdmin === true && (login.tokenVersion || 0) === (decoded.tv || 0)) {
+      const sales = apps.find((a) => a.slug === "sales");
+      role = sales?.legacyRole || "sales";
+    } else if (decoded.email) {
+      const email = String(decoded.email).toLowerCase().trim();
+      const grant = await db.collection("department_roles").findOne({
+        email, isActive: true, departmentSlug: { $in: apps.map((a) => a.slug) },
+      });
+      if (grant) {
+        const app = apps.find((a) => a.slug === grant.departmentSlug);
+        role = app?.legacyRole || app?.slug || null;
+      }
+    }
+  } catch (err) {
+    console.warn("[SalesAuthMiddlewear] admit check:", err?.message || err);
+    return null; // an outage refuses, exactly as before
+  }
+  if (admitCache.size > 5000) admitCache.clear();
+  admitCache.set(key, { role, at: Date.now() });
+  return role;
+}
+
 // Factory, so a route group can widen the role list without widening the CRM's.
-const makeSalesAuth = (allowed) => (req, res, next) => {
+const makeSalesAuth = (allowed) => async (req, res, next) => {
   try {
     // ── 1. Cookie (standard — cookie-parser present) ───────────────────────
     let token = req.cookies?.auth_token;
@@ -74,6 +125,10 @@ const makeSalesAuth = (allowed) => (req, res, next) => {
     const decoded = jwt.verify(token, SECRET);
 
     // ── Role check ──────────────────────────────────────────────────────────
+    if (!allowed.includes(decoded.role)) {
+      const role = await admittedRole(decoded, allowed);
+      if (role && allowed.includes(role)) decoded.role = role;
+    }
     if (!allowed.includes(decoded.role)) {
       return res.status(403).json({
         success: false,

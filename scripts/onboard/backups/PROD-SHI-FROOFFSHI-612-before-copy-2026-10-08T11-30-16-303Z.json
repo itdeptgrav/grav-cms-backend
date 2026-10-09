@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:16.304Z",
+ "productRef": "PROD-SHI-FROOFFSHI-612",
+ "stockItem": {
+  "_id": "6974c8fe28f083586d38dc98",
+  "reference": "PROD-SHI-FROOFFSHI-612",
+  "name": "Front Office Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

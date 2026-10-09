@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:24.610Z",
+ "productRef": "PROD-SHI-SECSUPSHI-077",
+ "stockItem": {
+  "_id": "6975cd4f8786accba01a5298",
+  "reference": "PROD-SHI-SECSUPSHI-077",
+  "name": "Security Supervisor Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

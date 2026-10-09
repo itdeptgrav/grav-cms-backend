@@ -1,0 +1,11 @@
+{
+ "takenAt": "2026-10-08T11:30:06.849Z",
+ "productRef": "PROD-BOT-FORPAN-013",
+ "stockItem": {
+  "_id": "6a9a639e402e076a36caf070",
+  "reference": "PROD-BOT-FORPAN-013",
+  "name": "Formal Pant",
+  "measurements": []
+ },
+ "config": null
+}

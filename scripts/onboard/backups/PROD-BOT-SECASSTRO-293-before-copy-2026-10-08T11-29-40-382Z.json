@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:40.383Z",
+ "productRef": "PROD-BOT-SECASSTRO-293",
+ "stockItem": {
+  "_id": "69732582cb185373c591d540",
+  "reference": "PROD-BOT-SECASSTRO-293",
+  "name": "Security Associate Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

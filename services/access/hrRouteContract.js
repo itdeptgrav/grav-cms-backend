@@ -106,9 +106,9 @@ const DECLARATIONS = [
   D("GET", "/api/employees/team-structure", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], { persona: "any HR user" }),
   D("GET", "/api/employees/department/employees", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], { persona: "any HR user" }),
   D("GET", "/api/employees/config/form-visibility", [C.HR_ACCESS, C.PEOPLE_READ_DIRECTORY], { persona: "HR operations" }),
-  D("GET", "/api/employees/config/salary", [C.HR_ACCESS, C.COMPENSATION_READ], {
-    persona: "payroll preparer / approver",
-    note: "The salary RULES, not one person's pay — but the rules disclose the company's pay structure, so they ride the compensation capability.",
+  D("GET", "/api/employees/config/salary", [C.HR_ACCESS, C.PEOPLE_WRITE], {
+    persona: "anybody who adds people (the new-employee form computes pay from these)",
+    note: "The salary RULES (percentages, ceilings, caps), not one person's pay. Was compensation.read; editors and approvers now add employees with pay that goes to the owner, and the form refused this read silently and fell back to built-in defaults that differ from the company's (PF cap 1,800 vs 3,000, EDLI ceiling 15,000 vs 25,000) — so the pay sent for the owner's approval was computed wrong (7 Oct 2026). Changing the rules stays owner-only (PUT); the payroll PREVIEW stays compensation.read.",
     ...P,
   }),
   D("PUT", "/api/employees/config/salary", [C.HR_ACCESS, C.COMPENSATION_WRITE], { persona: "HR owner", ...P }),
@@ -255,8 +255,8 @@ const DECLARATIONS = [
     persona: "attendance approver",
     note: "Removes a person from a whole month of attendance. Period-shaped, so it takes the CLOSE capability rather than the correction one — the separation tests pin this.",
   }),
-  D("POST", "/hr/attendance/sync-period", [C.HR_ACCESS, C.ATTENDANCE_CLOSE], {
-    persona: "attendance approver",
+  D("POST", "/hr/attendance/sync-period", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "any HR user (owner's decision, 7 Oct 2026: everyone in HR may resync)",
     note: "Re-derives a whole period from the biometric source. Exempt from the approval queue as a machine operation (server.js), which is exactly why it needs the higher capability here.",
   }),
   D("GET", "/hr/attendance/sync-period/:jobId", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
