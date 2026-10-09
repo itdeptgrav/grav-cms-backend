@@ -603,6 +603,29 @@ async function verifiedLegacyDepartment(decoded) {
   };
 }
 
+/**
+ * KEEP A SIGNED-IN DEVICE SIGNED IN (sliding session).
+ *
+ * A CMS token lives TOKEN_TTL (7 days) from sign-in and /verify used to return
+ * it unchanged, so a station or tablet in daily use was still signed out a week
+ * after its sign-in. /verify runs on every page, re-reads the account from the
+ * database, and is the natural place to extend a session that is plainly in
+ * use: once the token is a day old, a fresh one with the same claims is issued
+ * — as the cookie and as `sessionToken`, which the CMS writes over its stored
+ * copy (lib/session.js syncVerifiedSession). Called only on a successful
+ * verify, so a revoked or deactivated account is never extended; a device left
+ * unused for TOKEN_TTL still signs out.
+ */
+const RENEW_AFTER_SECONDS = 24 * 60 * 60;
+function renewedSession(res, decoded, token) {
+  const age = Math.floor(Date.now() / 1000) - (Number(decoded?.iat) || 0);
+  if (!decoded || age < RENEW_AFTER_SECONDS) return token;
+  const { iat, exp, nbf, ...claims } = decoded; // eslint-disable-line no-unused-vars
+  const fresh = signToken(claims);
+  res.cookie(COOKIE_NAME, fresh, cookieOptions());
+  return fresh;
+}
+
 router.post("/verify", async (req, res) => {
   try {
     const token =
@@ -687,7 +710,7 @@ router.post("/verify", async (req, res) => {
         departments: apps.map((d) => d.toPublicTile()),
         accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
-        sessionToken: token,
+        sessionToken: renewedSession(res, decoded, token),
       });
     }
 
@@ -772,7 +795,7 @@ router.post("/verify", async (req, res) => {
         // GAC-AR2 bridge: the token this answer verified (the cookie when one
         // was sent), so the browser's localStorage copy is re-synced to it and
         // a stale Bearer can never outlive a newer cookie.
-        sessionToken: token,
+        sessionToken: renewedSession(res, decoded, token),
       });
     }
 
@@ -870,7 +893,7 @@ router.post("/verify", async (req, res) => {
           .then((out) => out.apps.map((a) => a.department.toPublicTile())),
         accountantRole: accSession?.role || null,
         accountantToken: accSession?.token || null,
-        sessionToken: token,
+        sessionToken: renewedSession(res, decoded, token),
       });
     }
 
