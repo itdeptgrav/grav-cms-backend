@@ -45,6 +45,12 @@ const mongoose = require("mongoose");
 const SampleStyle = require("../../../models/CMS_Models/Sales/SampleStyle");
 const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const Enquiry = require("../../../models/CMS_Models/Sales/Enquiry");
+/* THE MERCHANDISER'S OWN REGISTER (3 Oct 2026): sending a style to the
+   Merchandiser also ISSUES a Sales development request for its product line,
+   so the Development File opens on their dashboard with the brief, the
+   photos and the quantity — before this, the hand-off was an email only. */
+const developmentRequests = require("../../../services/sales/developmentRequest.service");
+const developmentDelivery = require("../../../services/integration/developmentRequestDelivery.service");
 const CustomerChangeRequest = require("../../../models/CMS_Models/Sales/CustomerChangeRequest");
 const customerChangeRouting = require("../../../services/sales/customerChangeRouting.service");
 const {
@@ -65,7 +71,7 @@ const { processVariantRawItems, updateStockItemAggregates, recomputeVariantCosts
 const { nextRequestId } = require("../../../services/requestId");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
-const { styleEmailContext, imageGalleryHtml, bomTableHtml, stockItemBom } = require("../../../services/sampleStyleEmail.service");
+const { styleEmailContext, imageGalleryHtml, bomTableHtml, stockItemBom, devBomTableHtml, technicalTableHtml } = require("../../../services/sampleStyleEmail.service");
 const { resolveRequirements } = require("../../../services/sales/sampleRequirements.service");
 /* Merchandising's approved selection joined to R&D's consumption — one
    BOM → Packaging workflow over two owned records. */
@@ -503,8 +509,15 @@ router.post("/house", salesAuth, async (req, res) => {
     });
 
     const who = actor(req);
+    /* THE CREATOR'S COMPANY, ON THE STYLE ITSELF (6 Oct 2026): a house sample
+       has no journey or enquiry to prove its company through, so every write
+       on one answered "Style not found" until the proof could read the style's
+       own stamp. Resolved once, the way every other Sales write resolves it. */
+    const houseScope = await salesScopeFor(req);
     const style = await createWithRef(SampleStyle, {
       sampleType: "house",
+      companyId: houseScope.companyId,
+      companyOwnership: { source: houseScope.membershipSource, resolvedAt: new Date(), proven: houseScope.membershipSource === "MEMBERSHIP_RECORD" },
       // No journeyId, no enquiryId, no accountId — that is the whole point.
       // The partial unique index (see the model) is what makes this safe.
       productName,
@@ -1303,6 +1316,11 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     // the full spec, the reference photos and a View button straight onto the
     // finished good.
     if (stage === "materials" && from === "brief") {
+      /* best effort, never awaited by the routing: a failure here is logged
+         and the e-mail below still goes */
+      issueDevelopmentRequestForStyle(style, req).catch((e) => console.error("[sampleStyles] development request:", e?.message || e));
+    }
+    if (stage === "materials" && from === "brief") {
       (async () => {
         const c = await styleEmailContext(style, await sampleEmailScope(req));
         const salesPerson = actor(req).name || "Sales";
@@ -1896,19 +1914,26 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
          Refused rather than warned, and refused BY FIELD AND OWNER — "R&D
          still needs consumption for Shell fabric" is actionable in a way
          that "incomplete" is not. */
+      /* ── THE FILE IS THE SUBMISSION (4 Oct 2026, owner) ─────────────
+         "Don't ask R&D to give the qty during this tech sheet upload —
+         just ask for the file upload." The merchandiser's assumed
+         consumption already sits on the approved materials; R&D's
+         technical facts are optional detail. What is refused: no file, or
+         a selection Sales has not yet released (stale). */
       const submitShortlist = await approvedShortlistFor(style);
-      const gate = technicalRecord.completeness(style.techSheet.technical || {}, {
-        file: style.techSheet.file,
-        approvedMaterialCount: submitShortlist.rows.length,
-        shortlistBlocker: submitShortlist.blocker,
-      });
-      if (!gate.complete) {
+      const file = style.techSheet.file;
+      if (!String(file?.url || "").trim() && !String(file?.name || "").trim()) {
         return res.status(400).json({
-          success: false,
-          code: "TECHNICAL_RECORD_INCOMPLETE",
-          message: "The technical record is not complete yet.",
-          gaps: gate.gaps,
-          byOwner: gate.byOwner,
+          success: false, code: "TECHNICAL_RECORD_INCOMPLETE",
+          message: "Attach the tech sheet file before submitting.",
+          gaps: [{ field: "file", owner: "RND", message: "A tech sheet file has to be attached." }],
+          byOwner: { RND: [{ field: "file", message: "A tech sheet file has to be attached." }] },
+        });
+      }
+      if (submitShortlist.blocker?.code === "DEVELOPMENT_MATERIALS_STALE") {
+        return res.status(400).json({
+          success: false, code: "TECHNICAL_RECORD_INCOMPLETE",
+          message: submitShortlist.blocker.message, gaps: [submitShortlist.blocker], byOwner: { SALES: [submitShortlist.blocker] },
         });
       }
 
@@ -2066,16 +2091,20 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
     if (action === "submit") {
       (async () => {
         const [customerName, image] = await Promise.all([customerNameFor(style, req), referenceImageFor(style, req)]);
+        /* the product's details, photos, the materials with consumption and the
+           technical record ride on the mail (4 Oct 2026, owner) */
+        const c = await styleEmailContext(style, await sampleEmailScope(req)).catch(() => null);
+        const f = style.techSheet.file;
+        const fileHtml = f?.url ? `<p style="margin:14px 0 0;font-size:13px"><a href="${escapeHtml(f.url)}" style="color:#0f172a;font-weight:600">Open the tech sheet file: ${escapeHtml(f.name || "tech sheet")}</a></p>` : "";
         await notifyEvent("tech_sheet_submitted", {
           heading: `Tech sheet submitted: ${style.productName || style.styleCode || ""}`,
           bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "R&D")}</strong> submitted the tech sheet for your review.</p>`,
           details: [
-            ["Customer", customerName],
-            ["Style", style.styleCode || style.sampleStyleId],
-            ["Product", style.productName],
+            ...(c?.details || [["Customer", customerName], ["Style", style.styleCode || style.sampleStyleId], ["Product", style.productName]]),
             ["File", style.techSheet.file?.name],
           ],
-          image,
+          image: c?.images?.[0] || image,
+          extraHtml: imageGalleryHtml(c?.images || []) + devBomTableHtml(style.materials?.rawItems || [], { heading: "APPROVED BILL OF MATERIALS" }) + technicalTableHtml(style.techSheet.technical || {}) + fileHtml,
           bodyText: `${actor(req).name || "R&D"} submitted the tech sheet for "${style.productName || "a style"}" (${customerName}) for review.`,
           ctaLabel: "Review tech sheet",
           ctaUrl: styleSampleUrl(style),
@@ -2085,15 +2114,19 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       (async () => {
         const [customerName, image] = await Promise.all([customerNameFor(style, req), referenceImageFor(style, req)]);
         const note = req.body.note || "";
+        const c = await styleEmailContext(style, await sampleEmailScope(req)).catch(() => null);
+        const f = style.techSheet.file;
+        const fileHtml = f?.url ? `<p style="margin:14px 0 0;font-size:13px"><a href="${escapeHtml(f.url)}" style="color:#0f172a;font-weight:600">Open the tech sheet file: ${escapeHtml(f.name || "tech sheet")}</a></p>` : "";
         await notifyEvent("tech_sheet_decision", {
           heading: `Tech sheet ${action === "approve" ? "approved" : "changes requested"}: ${style.productName || style.styleCode || ""}`,
-          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> ${action === "approve" ? "approved the tech sheet" : "requested changes to the tech sheet"}.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}`,
+          bodyHtml: `<p><strong>${escapeHtml(actor(req).name || "Sales")}</strong> ${action === "approve" ? "approved the tech sheet" : "requested changes to the tech sheet"}.</p>${note ? `<p style="margin:10px 0 0;color:#475569">${escapeHtml(note)}</p>` : ""}${action === "approve" ? `<p style="margin:10px 0 0;color:#475569">Sales sets the sample quantities per product variant next; you will be told when they are set.</p>` : ""}`,
           details: [
-            ["Customer", customerName],
-            ["Style", style.styleCode || style.sampleStyleId],
-            ["Product", style.productName],
+            ...(c?.details || [["Customer", customerName], ["Style", style.styleCode || style.sampleStyleId], ["Product", style.productName]]),
+            ["Decision", action === "approve" ? "Approved" : "Changes requested"],
+            ["Tech sheet file", f?.name],
           ],
-          image,
+          image: c?.images?.[0] || image,
+          extraHtml: imageGalleryHtml(c?.images || []) + devBomTableHtml(style.materials?.rawItems || [], { heading: "APPROVED BILL OF MATERIALS" }) + technicalTableHtml(style.techSheet.technical || {}) + fileHtml,
           bodyText: `${actor(req).name || "Sales"} ${action === "approve" ? "approved" : "requested changes to"} the tech sheet for "${style.productName || "a style"}" (${customerName}).${note ? ` Note: ${note}` : ""}`,
           ctaLabel: "Open in R&D",
           ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
@@ -2104,7 +2137,8 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
     return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/tech-sheet", err);
-    return res.status(500).json({ success: false, message: err.message });
+    /* a refusal the route sync raised with its own status is not a 500 (4 Oct 2026) */
+    return res.status(Number(err?.status) >= 400 && Number(err?.status) < 600 ? Number(err.status) : 500).json({ success: false, message: err.message });
   }
 });
 
@@ -2217,10 +2251,30 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
             totalSeconds: o.totalSeconds != null ? Number(o.totalSeconds) || 0 : minutes * 60 + seconds,
           };
         });
+      /* ── IE'S RECORD IS THE OPERATIONS (5 Oct 2026, owner: "don't ask R&D
+         for the operations: IE already saved the actual times"). When R&D
+         sends none, the development order's operations with the ACTUAL SAM IE
+         recorded at completion stand in, in the shape the costing expects.
+         A style with no completed IE run and no operations sent is still
+         refused: there is no record of what was done. */
+      if (!cleanedOperations.length) {
+        const dev = style.production?.developmentOrder || {};
+        const ieOps = dev.status === "completed" ? (dev.operations || []) : [];
+        for (const o of ieOps) {
+          const sam = Number(o.actualSamMinutes ?? o.assumedSamMinutes) || 0;
+          const totalSeconds = Math.max(0, Math.round(sam * 60));
+          cleanedOperations.push({
+            type: String(o.name || "").trim(), operationCode: String(o.operationCode || "").trim(),
+            machine: String(o.machineType || "").trim(), machineType: String(o.machineType || "").trim(),
+            salaryDept: "", salaryDesig: "",
+            minutes: Math.floor(totalSeconds / 60), seconds: totalSeconds % 60, totalSeconds,
+          });
+        }
+      }
       if (!cleanedOperations.length) {
         return res.status(400).json({
           success: false,
-          message: "Record at least one operation you ran making this sample before submitting.",
+          message: "No operations are recorded for this sample. IE records them with the actual SAM when it completes the development order.",
         });
       }
       // Costed here, at submit, rather than at approval — so the Sales
@@ -3083,6 +3137,25 @@ const hydrateOperationIds = async (operations) => {
    and therefore keeps its normal work-order, scan and QC protocol; this only
    removes the duplicate R&D data entry that used to sit between approval and
    release. */
+/** The development order as every reader gets it (4 Oct 2026). */
+const developmentOrderView = (d) => {
+  const o = d && d.toObject ? d.toObject() : (d || {});
+  return {
+    status: o.status || "none",
+    priority: o.priority || "medium",
+    deliveryDeadline: o.deliveryDeadline || null,
+    sentToIeAt: o.sentToIeAt || null, sentToIeBy: o.sentToIeBy || null,
+    operations: (o.operations || []).map((r) => ({
+      operationId: r.operationId ? String(r.operationId) : "", operationCode: r.operationCode || "", name: r.name || "",
+      machineType: r.machineType || "", assumedSamMinutes: r.assumedSamMinutes ?? null, actualSamMinutes: r.actualSamMinutes ?? null,
+    })),
+    operationsAssignedAt: o.operationsAssignedAt || null, operationsAssignedBy: o.operationsAssignedBy || null,
+    startedAt: o.startedAt || null, startedBy: o.startedBy || null,
+    completedAt: o.completedAt || null, completedBy: o.completedBy || null,
+    completionNote: o.completionNote || "",
+  };
+};
+
 const syncApprovedTechnicalRoute = async (style, userId) => {
   const stockItemId = style.production?.stockItemId || style.sourceStockItemId;
   const technicalRows = style.techSheet?.technical?.operations || [];
@@ -3202,10 +3275,12 @@ router.get("/:id/production", salesAuth, async (req, res) => {
          while they are redefining the route — a status chip alone sends them
          to another screen to find out. */
       const rows = await WorkOrder.find({ _id: { $in: style.production.workOrderIds } })
-        .select("workOrderNumber status quantity completedQuantity variantAttributes operations cancellation").lean();
+        .select("workOrderNumber status quantity productionCompletion.overallCompletedQuantity variantAttributes operations cancellation").lean();
       workOrders = rows.map((w) => ({
         id: w._id, workOrderNumber: w.workOrderNumber, status: w.status,
-        quantity: w.quantity, completedQuantity: w.completedQuantity || 0,
+        /* WorkOrder has no root `completedQuantity` — the figure lived under
+           productionCompletion all along and this read answered 0 (4 Oct 2026) */
+        quantity: w.quantity, completedQuantity: Number(w.productionCompletion?.overallCompletedQuantity) || 0,
         attributes: w.variantAttributes,
         operationCount: (w.operations || []).length,
         cancellation: w.cancellation
@@ -3264,6 +3339,9 @@ router.get("/:id/production", salesAuth, async (req, res) => {
         liveWorkOrderCount: liveWorkOrders.length,
         cancelledWorkOrders: workOrders.filter((w) => w.status === "cancelled"),
         routeEditingOpen: style.production.status !== "submitted",
+        /* IE's handling of the order (4 Oct 2026) — status, the operations
+           with assumed and actual SAM, who did what and when. */
+        developmentOrder: developmentOrderView(style.production.developmentOrder),
         log: style.production.log || [],
       },
     });
@@ -3392,10 +3470,15 @@ router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
     const scope = await salesScopeFor(req);
     const re = new RegExp(escapeRegex(q), "i");
     const rows = await RawItem.find({
-      companyId: scope.companyId,
-      $or: [{ name: re }, { sku: re }],
+      /* this company's, or registered before a company was stamped: the
+         Store read-through's rule (5 Oct 2026); strict matching found 16 of 317.
+         `$and` keeps the company clause beside the search's own `$or`. */
+      $and: [
+        { $or: [{ companyId: scope.companyId }, { companyId: null }, { companyId: { $exists: false } }] },
+        { $or: [{ name: re }, { sku: re }] },
+      ],
     })
-      .select("name sku unit customUnit category quantity variants").limit(10).lean();
+      .select("name sku unit customUnit category quantity variants unitConversions").limit(10).lean();
     const rawItems = rows.map((r) => {
       const unit = r.customUnit || r.unit || "Unit";
       const variants = (r.variants || []).map((v) => {
@@ -3403,7 +3486,7 @@ router.get("/:id/production/raw-items/search", salesAuth, async (req, res) => {
         const price = prices.length ? prices.reduce((s, p) => s + p, 0) / prices.length : null;
         return { id: v._id, sku: v.sku, combination: v.combination || [], quantity: v.quantity || 0, price, unitConversions: v.unitConversions || [] };
       });
-      return { id: r._id, name: r.name, sku: r.sku, category: r.category, unit, quantity: r.quantity || 0, variants };
+      return { id: r._id, name: r.name, sku: r.sku, category: r.category, unit, quantity: r.quantity || 0, unitConversions: r.unitConversions || [], variants };
     });
     return res.json({ success: true, rawItems });
   } catch (err) {
@@ -3767,6 +3850,19 @@ router.post("/:id/production/stock-item", salesAuth, async (req, res) => {
   try {
     const style = await resolveStyle(req.params.id);
     if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    /* An in-house sample has no customer to link (the R&D page skips that
+       step for it), so it borrows the standing house account here too —
+       send-to-ie and the release already did, but a house sample could not
+       get THIS far: the register was refused with "Link a customer" (6 Oct 2026). */
+    if (style.sampleType === "house" && !style.production?.customerId) {
+      const { resolveHouseSamplingCustomer } = require("../../../services/houseSamplingCustomer.service");
+      const house = await resolveHouseSamplingCustomer();
+      style.production = style.production || {};
+      style.production.customerId = house._id;
+      if (!style.production.status || style.production.status === "not_started") style.production.status = "customer_linked";
+      style.production.log = style.production.log || [];
+      style.production.log.push({ kind: "customer_linked", at: new Date(), by: actor(req), note: `In-house sample — billed to the house account "${house.name}".` });
+    }
     if (!style.production?.customerId) return res.status(400).json({ success: false, message: "Link a customer before registering the product." });
 
     let stockItem;
@@ -3940,6 +4036,30 @@ router.post("/:id/production/order-quantities", salesAuth, async (req, res) => {
     style.updatedBy = who;
     await style.save();
 
+    /* ── R&D IS TOLD, WITH THE FIGURES (4 Oct 2026, owner) ─────────────────
+       "The sales person set the qty and send to the R&D team for the further
+       process." Best effort — a mail that fails never fails the save. */
+    (async () => {
+      const c = await styleEmailContext(style, await sampleEmailScope(req)).catch(() => null);
+      const td = "padding:6px 10px 6px 0;border-bottom:1px solid #eef1f5;vertical-align:top";
+      const qtyHtml = `<p style="margin:16px 0 6px;font-size:12px;color:#64748b;font-weight:600">SAMPLE QUANTITIES</p>
+<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+  <thead><tr style="text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#94a3b8"><th style="padding:0 10px 6px 0">Variant</th><th style="padding:0 10px 6px 0">SKU</th><th style="padding:0 10px 6px 0;text-align:right">Quantity</th></tr></thead>
+  <tbody>${orderVariants.map((v) => `<tr><td style="${td}"><strong>${escapeHtml(v.variantLabel || "Default")}</strong></td><td style="${td};color:#64748b">${escapeHtml(v.sku || "—")}</td><td style="${td};text-align:right">${v.quantity} pcs</td></tr>`).join("")}
+  <tr><td style="${td}" colspan="2"><strong>Total</strong></td><td style="${td};text-align:right"><strong>${total} pcs</strong></td></tr></tbody>
+</table>`;
+      await notifyEvent("sample_quantities_set", {
+        vars: { product: style.productName || "", customer: c?.customerName || "", styleCode: style.styleCode || style.sampleStyleId || "", person: who.name || "Sales" },
+        heading: `Sample quantities set: ${style.productName || style.styleCode || ""}`,
+        bodyHtml: `<p><strong>${escapeHtml(who.name || "Sales")}</strong> set the sample quantities for this style — ${total} pcs across ${orderVariants.length} variant(s). Make the sample against these; they cannot be changed in R&D.</p>`,
+        details: [...(c?.details || [["Style", style.styleCode || style.sampleStyleId], ["Product", style.productName]]), ["Sample quantity", `${total} pcs`]],
+        image: c?.images?.[0],
+        extraHtml: imageGalleryHtml(c?.images || []) + qtyHtml + devBomTableHtml(style.materials?.rawItems || [], { heading: "APPROVED BILL OF MATERIALS" }),
+        bodyText: `${who.name || "Sales"} set the sample quantities for "${style.productName || "a style"}": ${orderVariants.map((v) => `${v.variantLabel || "Default"} ${v.quantity}`).join(", ")} — ${total} pcs in all.`,
+        ctaLabel: "Open in R&D", ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/styles/${style._id}`,
+      });
+    })().catch((e) => console.error("[sampleStyles] sample_quantities_set mail:", e?.message || e));
+
     return res.json({ success: true, sampleStyle: await withJourney(style, req) });
   } catch (err) {
     console.error("[sampleStyles] POST /:id/production/order-quantities", err);
@@ -3956,10 +4076,23 @@ router.post("/:id/production/order-quantities", salesAuth, async (req, res) => {
 // expect `{ quantities: {...} }`, a shape nothing ever sent, so a real
 // quantity that WAS entered still came back as "set a quantity for at
 // least one variant").
-router.post("/:id/production/submit", salesAuth, async (req, res) => {
-  try {
-    const style = await resolveStyle(req.params.id);
-    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+/**
+ * THE RELEASE ITSELF, AS A FUNCTION (4 Oct 2026).
+ *
+ * Shared by the legacy `POST /:id/production/submit` below and by Industrial
+ * Engineering's "Start processing" on the development order
+ * (services/industrialEngineering/ieDevelopmentOrder.service.js). Everything
+ * the release does — the house customer, the gates, the internal request, the
+ * work orders, the rollback, the style's own log — happens here once.
+ *
+ * Throws an Error carrying `status`, `code` and (for a route refusal) `products`;
+ * resolves to `{ request, createdWorkOrders, newEntries }` after saving the
+ * style. `keepProductRoute: true` skips the technical-route sync — IE has just
+ * written the product's operations itself and they must stand.
+ */
+async function releaseSampleToProduction(style, { priority: priorityIn, deliveryDeadline: deadlineIn, userId, who, keepProductRoute = false } = {}) {
+  const refuse = (status, message, extra = {}) => { const e = new Error(message); e.status = status; Object.assign(e, extra); return e; };
+  {
 
     // ── AN IN-HOUSE SAMPLE HAS NO CUSTOMER TO LINK ────────────────────────
     // Every other style reaches here with `production.customerId` already set
@@ -3982,12 +4115,12 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
       style.production.log.push({
         kind: "customer_linked",
         at: new Date(),
-        byName: actor(req).name,
+        by: who,
         note: `In-house sample — billed to the house account "${house.name}".`,
       });
     }
 
-    if (!style.production?.customerId) return res.status(400).json({ success: false, message: "Link a customer first." });
+    if (!style.production?.customerId) throw refuse(400, "Link a customer first.");
     // `sourceStockItemId` is the FALLBACK, not an alternative — see GET
     // /:id/production's own comment. `production.stockItemId` is only set by
     // walking this wizard's own Product step; a style whose product was
@@ -3998,18 +4131,18 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     // quantities against its variants (1 Sept 2026 bug fix — this was the
     // one place left still checking only `production.stockItemId`).
     const targetStockItemId = style.production?.stockItemId || style.sourceStockItemId;
-    if (!targetStockItemId) return res.status(400).json({ success: false, message: "Register the product first." });
-    if (style.production.status === "submitted") return res.status(400).json({ success: false, message: "Already sent to production." });
+    if (!targetStockItemId) throw refuse(400, "Register the product first.");
+    if (style.production.status === "submitted") throw refuse(400, "Already sent to production.");
 
     // Freeze the Sales-approved technical route onto the product immediately
     // before the sample MO/WO is created. Production therefore receives its
     // ordinary route, scanning and QC protocol without a second R&D entry.
-    await syncApprovedTechnicalRoute(style, req.user?.id);
+    if (!keepProductRoute) await syncApprovedTechnicalRoute(style, userId);
 
     const stockItem = await StockItem.findById(targetStockItemId).select("name reference variants").lean();
-    if (!stockItem) return res.status(404).json({ success: false, message: "The registered product could not be found." });
+    if (!stockItem) throw refuse(404, "The registered product could not be found.");
     const customer = await Customer.findById(style.production.customerId).select("name email phone profile").lean();
-    if (!customer) return res.status(404).json({ success: false, message: "The linked customer could not be found." });
+    if (!customer) throw refuse(404, "The linked customer could not be found.");
 
     // QUANTITIES COME FROM WHAT SALES SET, NOT FROM THE REQUEST BODY (26 Aug
     // 2026). This route is reachable by R&D — `salesAuth` here is deliberately
@@ -4020,9 +4153,7 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
     // `production.orderVariants` is the only source.
     const variantsById = new Map((stockItem.variants || []).map((v) => [String(v._id), v]));
     const ordered = style.production?.orderVariants || [];
-    if (!ordered.length) {
-      return res.status(400).json({ success: false, message: "Sales hasn't set the sample quantities for this style yet." });
-    }
+    if (!ordered.length) throw refuse(400, "Sales hasn't set the sample quantities for this style yet.");
     const variants = [];
     for (const row of ordered) {
       const qty = Number(row?.quantity) || 0;
@@ -4033,14 +4164,14 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
       if (qty <= 0 || !v) continue;
       variants.push({ variantId: String(v._id), attributes: v.attributes || [], quantity: qty, specialInstructions: [], estimatedPrice: (v.salesPrice || 0) * qty });
     }
-    if (!variants.length) return res.status(400).json({ success: false, message: "None of the ordered variants still exist on the product — ask Sales to set the quantities again." });
+    if (!variants.length) throw refuse(400, "None of the ordered variants still exist on the product — ask Sales to set the quantities again.");
     const totalQuantity = variants.reduce((s, v) => s + v.quantity, 0);
 
-    const priority = ["low", "medium", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "medium";
-    const deliveryDeadline = req.body?.deliveryDeadline ? new Date(req.body.deliveryDeadline) : null;
+    const priority = ["low", "medium", "high", "urgent"].includes(priorityIn) ? priorityIn : "medium";
+    const deliveryDeadline = deadlineIn ? new Date(deadlineIn) : null;
     /* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
     if (!deliveryDeadline || Number.isNaN(deliveryDeadline.getTime())) {
-      return res.status(400).json({ success: false, code: "DELIVERY_DEADLINE_REQUIRED", message: "Set the delivery deadline for this production run — every department plans against it." });
+      throw refuse(400, "Set the delivery deadline for this production run — every department plans against it.", { code: "DELIVERY_DEADLINE_REQUIRED" });
     }
 
     const requestId = await nextRequestId(CustomerRequest);
@@ -4061,7 +4192,7 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
       status: "pending",
       priority,
       createdBySales: true,
-      createdBySalesId: req.user?.id,
+      createdBySalesId: userId,
       // WHAT KIND OF ORDER THIS IS, stated once and read everywhere — the MO
       // badge, the Project Manager's email and the order PDF all take it from
       // here rather than each re-deriving it from `isInternalOrder` (which is
@@ -4082,15 +4213,15 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
         status: "sales_approved",
         notes: "Internal / Company Order — sampling production run, no PI or payment required.",
         customerApproval: { approved: true, approvedAt: new Date() },
-        salesApproval: { approved: true, approvedAt: new Date(), approvedBy: req.user?.id },
+        salesApproval: { approved: true, approvedAt: new Date(), approvedBy: userId },
       }],
       finalOrderPrice: 0,
-      salesPersonAssigned: req.user?.id,
+      salesPersonAssigned: userId,
     });
     request.status = "quotation_sales_approved";
     await request.save();
 
-    const { createdWorkOrders, unroutedProducts } = await createWorkOrdersAndProgress(request, req.user?.id);
+    const { createdWorkOrders, unroutedProducts } = await createWorkOrdersAndProgress(request, userId);
 
     /* A production release without a work order is not a release.  The
        previous path saved the internal request and advanced the style even
@@ -4102,14 +4233,10 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
         await WorkOrder.deleteMany({ _id: { $in: createdWorkOrders.map((wo) => wo._id) } });
       }
       await CustomerRequest.deleteOne({ _id: request._id });
-      return res.status(409).json({
-        success: false,
-        code: "SAMPLE_WORK_ORDERS_NOT_CREATED",
-        message: unroutedProducts.length
-          ? "The approved production route could not be turned into work orders. Return the technical record to R&D to correct the route."
-          : "No sample work orders were created. The sample has not been released to Production.",
-        products: unroutedProducts,
-      });
+      throw refuse(409, unroutedProducts.length
+        ? "The production route could not be turned into work orders — the product has no operations. Assign the operations first."
+        : "No sample work orders were created. The sample has not been released to Production.",
+      { code: "SAMPLE_WORK_ORDERS_NOT_CREATED", products: unroutedProducts });
     }
 
     /* ── EVERY ATTEMPT'S WORK ORDERS ARE KEPT, NOT REPLACED ───────────────
@@ -4144,17 +4271,27 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
         ? [{
           kind: "attempt_replaced",
           note: `Replacement attempt. The previous attempt's ${previousWorkOrderIds.length} work order(s)${previousRequestId ? " and its request" : ""} stay on record.`,
-          by: actor(req), at: new Date(),
+          by: who, at: new Date(),
         }]
         : []),
-      { kind: "request_created", note: request.requestId, by: actor(req), at: new Date() },
-      { kind: "sales_approved", note: "Internal order — auto-approved.", by: actor(req), at: new Date() },
-      { kind: "work_orders_created", note: `${createdWorkOrders.length} work order(s).`, by: actor(req), at: new Date() },
+      { kind: "request_created", note: request.requestId, by: who, at: new Date() },
+      { kind: "sales_approved", note: "Internal order — auto-approved.", by: who, at: new Date() },
+      { kind: "work_orders_created", note: `${createdWorkOrders.length} work order(s).`, by: who, at: new Date() },
     ];
     style.production.log.push(...newEntries);
-    style.updatedBy = actor(req);
+    style.updatedBy = who;
     await style.save();
+    return { request, createdWorkOrders, newEntries };
+  }
+}
 
+router.post("/:id/production/submit", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const { request, createdWorkOrders, newEntries } = await releaseSampleToProduction(style, {
+      priority: req.body?.priority, deliveryDeadline: req.body?.deliveryDeadline, userId: req.user?.id, who: actor(req),
+    });
     return res.json({
       success: true,
       /* THIS call's work orders, not the style's cumulative list. The list is
@@ -4167,10 +4304,85 @@ router.post("/:id/production/submit", salesAuth, async (req, res) => {
       log: newEntries,
     });
   } catch (err) {
-    console.error("[sampleStyles] POST /:id/production/submit", err);
+    const status = Number(err?.status) >= 400 && Number(err?.status) < 600 ? Number(err.status) : 500;
+    if (status === 500) console.error("[sampleStyles] POST /:id/production/submit", err);
+    return res.status(status).json({ success: false, message: err.message, ...(err.code ? { code: err.code } : {}), ...(err.products ? { products: err.products } : {}) });
+  }
+});
+
+/* ── R&D SENDS THE ORDER TO INDUSTRIAL ENGINEERING (4 Oct 2026, owner) ─────
+   "Once the techpack gets approved by the sales team, the job of R&D is to
+   send the corresponding requested product-variant and the defined qty."
+   Nothing is created here: IE assigns the operations and presses Start, which
+   is when the request and the work orders come into being. The gates are the
+   release's own, checked now so R&D learns of a problem at this click and not
+   at IE's. */
+router.post("/:id/production/send-to-ie", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+    const who = actor(req);
+    style.production = style.production || {};
+    if (style.production.status === "submitted") return res.status(400).json({ success: false, message: "Already sent to production." });
+    const dev = style.production.developmentOrder || {};
+    if (["processing", "completed"].includes(dev.status)) return res.status(400).json({ success: false, message: "This order is already being processed by IE." });
+    if (style.sampleType === "house" && !style.production.customerId) {
+      const { resolveHouseSamplingCustomer } = require("../../../services/houseSamplingCustomer.service");
+      const house = await resolveHouseSamplingCustomer();
+      style.production.customerId = house._id;
+      if (style.production.status === "not_started") style.production.status = "customer_linked";
+      style.production.log = style.production.log || [];
+      style.production.log.push({ kind: "customer_linked", at: new Date(), by: who, note: `In-house sample — billed to the house account "${house.name}".` });
+    }
+    if (!style.production.customerId) return res.status(400).json({ success: false, message: "Link a customer first." });
+    if (!(style.production.stockItemId || style.sourceStockItemId)) return res.status(400).json({ success: false, message: "Register the product first." });
+    if (!(style.production.orderVariants || []).length) return res.status(400).json({ success: false, message: "Sales hasn't set the sample quantities for this style yet." });
+    if (style.techSheet?.status !== "approved" && style.techSheet?.status !== "notApplicable") {
+      return res.status(400).json({ success: false, message: "The tech sheet has to be approved by Sales before the order goes to IE." });
+    }
+    const priority = ["low", "medium", "high", "urgent"].includes(req.body?.priority) ? req.body.priority : "medium";
+    const deliveryDeadline = req.body?.deliveryDeadline ? new Date(req.body.deliveryDeadline) : null;
+    if (!deliveryDeadline || Number.isNaN(deliveryDeadline.getTime())) {
+      return res.status(400).json({ success: false, code: "DELIVERY_DEADLINE_REQUIRED", message: "Set the delivery deadline for this production run — every department plans against it." });
+    }
+    const prior = dev.operations || [];
+    style.production.developmentOrder = {
+      ...(dev.toObject ? dev.toObject() : dev),
+      status: prior.length ? "operations_assigned" : "sent_to_ie",
+      priority, deliveryDeadline, sentToIeAt: new Date(), sentToIeBy: who,
+    };
+    style.production.log = style.production.log || [];
+    const total = (style.production.orderVariants || []).reduce((n, v) => n + (Number(v.quantity) || 0), 0);
+    const entry = { kind: "sent_to_ie", note: `${total} pcs across ${(style.production.orderVariants || []).length} variant(s) — IE assigns the operations and starts the run.`, by: who, at: new Date() };
+    style.production.log.push(entry);
+    logHistory(style, { kind: "sent_to_ie", note: entry.note }, req);
+    style.updatedBy = who;
+    await style.save();
+
+    (async () => {
+      const c = await styleEmailContext(style, await sampleEmailScope(req)).catch(() => null);
+      const rows = style.production.orderVariants || [];
+      const td = "padding:6px 10px 6px 0;border-bottom:1px solid #eef1f5;vertical-align:top";
+      const qtyHtml = `<p style="margin:16px 0 6px;font-size:12px;color:#64748b;font-weight:600">SAMPLE QUANTITIES</p><table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px"><tbody>${rows.map((v) => `<tr><td style="${td}"><strong>${escapeHtml(v.variantLabel || "Default")}</strong></td><td style="${td};color:#64748b">${escapeHtml(v.sku || "—")}</td><td style="${td};text-align:right">${v.quantity} pcs</td></tr>`).join("")}<tr><td style="${td}" colspan="2"><strong>Total</strong></td><td style="${td};text-align:right"><strong>${total} pcs</strong></td></tr></tbody></table>`;
+      await notifyEvent("development_order_sent_to_ie", {
+        vars: { product: style.productName || "", customer: c?.customerName || "", styleCode: style.styleCode || style.sampleStyleId || "", person: who.name || "R&D" },
+        heading: `Development order for IE: ${style.productName || style.styleCode || ""}`,
+        bodyHtml: `<p><strong>${escapeHtml(who.name || "R&D")}</strong> sent this development order to Industrial Engineering. Assign the operations with an assumed SAM each, then start processing — that is when the work orders reach the floor.</p>`,
+        details: [...(c?.details || [["Style", style.styleCode || style.sampleStyleId], ["Product", style.productName]]), ["Sample quantity", `${total} pcs`], ["Priority", priority], ["Delivery deadline", deliveryDeadline.toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" })]],
+        image: c?.images?.[0],
+        extraHtml: imageGalleryHtml(c?.images || []) + qtyHtml + devBomTableHtml(style.materials?.rawItems || [], { heading: "APPROVED BILL OF MATERIALS" }) + technicalTableHtml(style.techSheet?.technical || {}),
+        bodyText: `${who.name || "R&D"} sent the development order for "${style.productName || "a style"}" (${total} pcs) to IE.`,
+        ctaLabel: "Open in IE", ctaUrl: `${DEPT_NOTIFY_APP_URL}/industrial-engineering/development/${style._id}?tab=order`,
+      });
+    })().catch((e) => console.error("[sampleStyles] development_order_sent_to_ie mail:", e?.message || e));
+
+    return res.json({ success: true, log: [entry], developmentOrder: style.production.developmentOrder });
+  } catch (err) {
+    console.error("[sampleStyles] POST /:id/production/send-to-ie", err);
     return res.status(500).json({ success: false, message: err.message });
   }
 });
+
 
 // POST /:id/production/reset — clears the wizard so R&D can run it again.
 // Never touches anything already sent to production (customerRequestId /
@@ -4338,4 +4550,160 @@ router.post("/:id/choose", salesAuth, async (req, res) => {
   }
 });
 
+
+/* ── OPEN THE MERCHANDISER'S DEVELOPMENT FILE FOR A STYLE (3 Oct 2026) ────
+   Builds the brief the merchandiser selects materials from — what Sales
+   wrote on the enquiry line — and issues it through the Sales development
+   request door, which is the ONLY thing that opens a Development File. A
+   line that already carries an open request gets a new version, exactly as a
+   second ask from the Sales panel would. Nothing here touches the style. */
+async function issueDevelopmentRequestForStyle(style, req) {
+  /* ── AN IN-HOUSE SAMPLE GOES TO THE MERCHANDISER TOO (6 Oct 2026, owner).
+     It has no journey and no enquiry line, so the request is issued on the
+     sample's own grain (see developmentRequest.service `house`). The brief
+     is the sample's own. */
+  if (style?.sampleType === "house") {
+    const companyId = style.companyId || (await salesScopeFor(req)).companyId;
+    if (!companyId) return;
+    const b = style.brief || {};
+    const say = (label, v) => (v != null && String(v).trim() !== "" ? `${label}: ${String(v).trim()}` : null);
+    const summary = [
+      `${style.productName || "In-house sample"}${style.styleCode ? ` (${style.styleCode})` : ""} — in-house sample, no customer`,
+      say("Quantity", b.quantity != null ? `${b.quantity} pcs` : null),
+      say("Gender", b.gender), say("Colour", b.colour), say("Fabric", b.fabricPreference), say("Composition", b.fabricComposition),
+      say("GSM", b.gsm), say("Fit", b.fit), say("Size range", b.sizeRange),
+      say("Branding", [b.branding, b.brandingPlacement].filter(Boolean).join(" at ")),
+      say("Trims", b.trims), say("Special construction", b.specialConstruction), say("Note", b.note),
+    ].filter(Boolean).join(" · ");
+    const categories = ["FABRIC", "TRIMS"];
+    if (b.logo || b.printing || b.embroidery || String(b.branding || "").trim()) categories.push("LABELS");
+    const images = (Array.isArray(b.images) ? b.images : [])
+      .map((im) => ({ url: String(im?.url || im?.secure_url || "").trim(), caption: String(im?.caption || im?.name || "Reference").slice(0, 120) }))
+      .filter((im) => /^https?:\/\//i.test(im.url)).slice(0, 10);
+    const deadline = style.materials?.deadline ? new Date(style.materials.deadline) : null;
+    const out = await developmentRequests.issue({ companyId }, {
+      house: { style: style.toObject ? style.toObject() : style },
+      body: {
+        requirementSummary: summary.length >= 15 ? summary : `${summary} — select the fabric and trims for this in-house sample.`,
+        requestedCategories: categories,
+        requiredByDate: deadline && !Number.isNaN(deadline.getTime()) ? deadline.toISOString().slice(0, 10) : undefined,
+        referenceImages: images,
+        styleRef: style.styleCode || style.sampleStyleId || undefined,
+        sampleStyleId: String(style._id),
+        stockItemId: style.sourceStockItemId ? String(style.sourceStockItemId) : undefined,
+        idempotencyKey: `style-send:${style._id}:${(style.history || []).length}`,
+      },
+      actor: req.user?.id ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" } : null,
+    });
+    await developmentDelivery.deliverPending({ companyId, correlationId: out.correlationId });
+    return;
+  }
+  if (!style?.journeyId || !style?.enquiryId) return;
+  const journey = await SalesJourney.findById(style.journeyId).select("companyId").lean();
+  const enquiry = await Enquiry.findById(style.enquiryId).select("products").lean();
+  if (!journey?.companyId || !enquiry) return;
+  const line = (enquiry.products || []).find((p) => String(p._id) === String(style.enquiryProductId))
+    || (enquiry.products || []).find((p) => String(p.stockItemId || "") === String(style.sourceStockItemId || ""))
+    || (enquiry.products || []).find((p) => String(p.product || "").trim().toLowerCase() === String(style.productName || "").trim().toLowerCase());
+  if (!line?.productLineRef) { console.warn("[sampleStyles] development request: no product line ref for", style.styleCode); return; }
+  const b = style.brief || {};
+  const say = (label, v) => (v != null && String(v).trim() !== "" ? `${label}: ${String(v).trim()}` : null);
+  const summary = [
+    `${style.productName || line.product || "Style"}${style.styleCode ? ` (${style.styleCode})` : ""}`,
+    say("Quantity", b.quantity != null ? `${b.quantity} pcs` : line.quantity != null ? `${line.quantity} pcs` : null),
+    say("Gender", b.gender), say("Colour", b.colour), say("Fabric", b.fabricPreference), say("Composition", b.fabricComposition),
+    say("GSM", b.gsm), say("Fit", b.fit), say("Size range", b.sizeRange),
+    say("Branding", [b.branding, b.brandingPlacement].filter(Boolean).join(" at ")),
+    say("Trims", b.trims), say("Special construction", b.specialConstruction), say("Note", b.note || line.note),
+  ].filter(Boolean).join(" · ");
+  const categories = ["FABRIC", "TRIMS"];
+  if (b.logo || b.printing || b.embroidery || String(b.branding || "").trim()) categories.push("LABELS");
+  const images = (Array.isArray(b.images) && b.images.length ? b.images : (line.images || []))
+    .map((im) => ({ url: String(im?.url || im?.secure_url || "").trim(), caption: String(im?.caption || im?.name || "Reference").slice(0, 120) }))
+    .filter((im) => /^https?:\/\//i.test(im.url)).slice(0, 10);
+  const deadline = style.materials?.deadline ? new Date(style.materials.deadline) : null;
+  const scope = { companyId: journey.companyId };
+  const out = await developmentRequests.issue(scope, {
+    journeyId: String(style.journeyId), productLineRef: String(line.productLineRef),
+    body: {
+      requirementSummary: summary.length >= 15 ? summary : `${summary} — select the fabric and trims for this style.`,
+      requestedCategories: categories,
+      requiredByDate: deadline && !Number.isNaN(deadline.getTime()) ? deadline.toISOString().slice(0, 10) : undefined,
+      referenceImages: images,
+      styleRef: style.styleCode || style.sampleStyleId || undefined,
+      sampleStyleId: String(style._id),
+      stockItemId: style.sourceStockItemId ? String(style.sourceStockItemId) : undefined,
+      idempotencyKey: `style-send:${style._id}:${(style.history || []).length}`,
+    },
+    actor: req.user?.id ? { id: req.user.id, name: req.user.name || "", email: req.user.email || "" } : null,
+  });
+  await developmentDelivery.deliverPending({ companyId: journey.companyId, correlationId: out.correlationId });
+}
+
 module.exports = router;
+/* shared with Industrial Engineering's development order (4 Oct 2026) */
+module.exports.releaseSampleToProduction = releaseSampleToProduction;
+module.exports.developmentOrderView = developmentOrderView;
+module.exports.resolveStyle = resolveStyle;
+module.exports.logHistory = logHistory;
+
+/* ── SALES APPROVED THE MERCHANDISER'S MATERIALS: THE STYLE MOVES ON (3 Oct
+   2026, owner: "the sales person will do the approval and then move to R&D").
+   Called by the Sales development route after Merchandising's revision is
+   approved. Records the chosen rows on the style, marks the BOM approved by
+   Sales, routes the style to R&D with a history row, and tells R&D exactly
+   as "Send to R&D" does. Best effort beside the approval, never a reason for
+   it to fail. */
+async function approveMaterialsAndSendToRnd(style, rows, req) {
+  if (!style) return;
+  const picks = (Array.isArray(rows) ? rows : [])
+    .filter((r) => r && r.rawItemId)
+    .map((r) => ({
+      rawItemId: r.rawItemId, rawItemName: r.rawItemName || "", rawItemSku: r.rawItemSku || "",
+      variantId: r.variantId || undefined, variantCombination: Array.isArray(r.variantCombination) ? r.variantCombination : [],
+      /* the merchandiser's assumed consumption, so R&D starts from a figure (4 Oct 2026) */
+      ...(Number.isFinite(Number(r.consumptionPerPiece)) && r.consumptionPerPiece !== null ? { quantity: Number(r.consumptionPerPiece) } : {}),
+      ...(r.consumptionUnit ? { unit: String(r.consumptionUnit) } : {}),
+    }));
+  style.materials = style.materials || {};
+  if (picks.length) style.materials.rawItems = picks;
+  style.materials.items = (Array.isArray(rows) ? rows : []).map((r) => r?.rawItemName).filter(Boolean);
+  /* "selected" — the schema allows only "pending" | "selected"; "done" failed
+     validation, the save threw, and the style never moved to R&D (4 Oct 2026) */
+  style.materials.status = "selected";
+  const who = actor(req);
+  style.bomApproval = {
+    ...(style.bomApproval?.toObject ? style.bomApproval.toObject() : (style.bomApproval || {})),
+    status: "approved", decidedAt: new Date(), decidedByName: who.name || "Sales",
+    decidedByEmail: req.user?.email || "", note: "Materials approved by Sales from the development panel",
+    round: (style.bomApproval?.round || 0) + 1, token: undefined,
+  };
+  const from = style.stage;
+  if (from === "materials") {
+    style.stage = "rnd";
+    logHistory(style, { kind: "route", from, to: "rnd", note: "Materials approved by Sales — sent to R&D" }, req);
+  }
+  style.updatedBy = who;
+  await style.save();
+  if (from === "materials") {
+    (async () => {
+      const c = await styleEmailContext(style, await sampleEmailScope(req));
+      const salesPerson = who.name || "Sales";
+      await notifyEvent("sample_sent_to_rnd", {
+        vars: { product: style.productName || "", customer: c.customerName, salesPerson, styleCode: style.styleCode || style.sampleStyleId || "", approvedBy: ` (${salesPerson})` },
+        heading: `Style sent to R&D: ${style.productName || style.styleCode || ""}`,
+        bodyHtml: `<p><strong>${escapeHtml(salesPerson)}</strong> approved the materials and sent this style to R&D for tech-pack / development.</p>`,
+        details: [...c.details, ["Materials", style.materials.items.join(", ") || undefined], ["Materials approved by", salesPerson]],
+        /* the full selection with the assumed consumption rides on the mail (4 Oct 2026) */
+        image: c.images[0], extraHtml: imageGalleryHtml(c.images) + devBomTableHtml(rows, { heading: "APPROVED BILL OF MATERIALS" }),
+        bodyText: `${salesPerson} approved the materials for "${style.productName || "a style"}" (${c.customerName}) and sent it to R&D.`,
+        ctaLabel: "Open in R&D", ctaUrl: `${DEPT_NOTIFY_APP_URL}/research-development/dashboard`,
+      });
+    })().catch(() => {});
+  }
+}
+
+module.exports.issueDevelopmentRequestForStyle = issueDevelopmentRequestForStyle;
+
+
+module.exports.approveMaterialsAndSendToRnd = approveMaterialsAndSendToRnd;

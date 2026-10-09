@@ -312,7 +312,7 @@ async function styleOwnersFor(styleIds) {
   if (!wanted.length) return new Map();
   const styles = await SampleStyle()
     .find({ _id: { $in: wanted.map((id) => new mongoose.Types.ObjectId(id)) } })
-    .select("_id journeyId enquiryId isActive status").lean();
+    .select("_id companyId journeyId enquiryId isActive status").lean();
   const journeyIds = [...new Set(styles.map((x) => str(x.journeyId)).filter(isId))];
   const enquiryIds = [...new Set(styles.map((x) => str(x.enquiryId)).filter(isId))];
   const [journeys, enquiries] = await Promise.all([
@@ -393,7 +393,7 @@ async function assertStylesUsable(styleIds, { expectedCompanyId = null } = {}) {
   }
 
   const styles = await SampleStyle().find({ _id: { $in: wanted.map((id) => new mongoose.Types.ObjectId(id)) } })
-    .select("_id journeyId enquiryId isActive status")
+    .select("_id companyId journeyId enquiryId isActive status")
     .lean();
   const byId = new Map(styles.map((s) => [str(s._id), s]));
 

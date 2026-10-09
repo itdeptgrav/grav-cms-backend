@@ -215,9 +215,10 @@ async function styleOwnershipClause(companyId, { activeOnly = true } = {}) {
   const journeyIds = journeys.map((j) => j._id);
   const enquiryIds = enquiries.map((e) => e._id);
 
-  if (!journeyIds.length && !enquiryIds.length) return null;
-
   const branches = [];
+  /* A style stamped with this company and no parent at all — an in-house
+     sample (6 Oct 2026). The row-wise rule's clause 2b. */
+  branches.push({ companyId, journeyId: { $in: [null] }, enquiryId: { $in: [null] } });
   /* Proved by the spine. A journey that resolves and names this company is the
      authoritative answer, exactly as `ownershipProofFor` treats it. */
   if (journeyIds.length) branches.push({ journeyId: { $in: journeyIds } });
@@ -278,8 +279,8 @@ const merchandisingCompanyMiddleware = ({ domainLabel = "Merchandising" } = {}) 
  * order, and `test/industrial-engineering/ie-style-ownership.test.js` proves
  * the two agree over a fixture set by running both and comparing the id sets.
  *
- * @param {object} style  a lean SampleStyle with `journeyId`, `enquiryId`,
- *   `isActive` and `status`
+ * @param {object} style  a lean SampleStyle with `companyId`, `journeyId`,
+ *   `enquiryId`, `isActive` and `status`
  * @param {object} parents
  * @param {(journeyId: string) => (string|null)} parents.journeyCompanyOf  the
  *   company on that journey, or null when the journey is missing or carries
@@ -307,6 +308,15 @@ function styleOwnerFrom(style, { journeyCompanyOf, enquiryCompanyOf }, { activeO
      named-but-unprovable journey cannot fall through to it. A missing journey,
      one carrying no company, and one belonging to somebody else are therefore
      the same answer — unprovable — and that is deliberate. */
+  /* 2b — a style STAMPED with its own company (6 Oct 2026). An in-house
+     sample has no journey and no enquiry by construction — the Sampling
+     section works without a customer — so `POST /sample-styles/house` writes
+     the raising scope's company onto the style itself, and that stamp is the
+     answer. It is consulted before the parents only because such a style has
+     none; a style that names a journey is still proved by the journey below. */
+  const stamped = id(style?.companyId);
+  if (stamped && !id(style?.journeyId) && !id(style?.enquiryId)) return out("STYLE", stamped);
+
   const journeyId = id(style?.journeyId);
   if (journeyId) {
     const company = id(journeyCompanyOf(journeyId));

@@ -965,4 +965,23 @@ router.get("/order-requests/:id/issuance-summary", async (req, res) => {
   }
 });
 
+/* ── PPC'S MATERIAL REQUESTS AGAINST THIS ORDER, AS THE STORE READS THEM ──
+   (4 Oct 2026, owner.) The same service PPC reads, through the Store's own
+   session door: each request with its lines, what was issued against each,
+   and the order's free issues. The report shape feeds the Excel export. */
+const materialRequestsSvc = () => require("../../../services/ppc/materialRequests.service");
+const sendSvcError = (res, err) => {
+  const status = Number(err?.status) >= 400 && Number(err?.status) < 600 ? Number(err.status) : 500;
+  if (status === 500) console.error("[storeRoutes] material-requests:", err);
+  return res.status(status).json({ success: false, message: status === 500 ? "Server error" : err.message });
+};
+router.get("/order-requests/:id/material-requests", async (req, res) => {
+  try { return res.json({ success: true, ...(await materialRequestsSvc().listForOrder(req.params.id)) }); }
+  catch (err) { return sendSvcError(res, err); }
+});
+router.get("/order-requests/:id/material-requests/report", async (req, res) => {
+  try { return res.json({ success: true, ...(await materialRequestsSvc().reportForOrder(req.params.id)) }); }
+  catch (err) { return sendSvcError(res, err); }
+});
+
 module.exports = router;

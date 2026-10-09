@@ -416,7 +416,7 @@ router.get("/", canRead, async (req, res) => {
        the figures — 1–4 s a request on 307 items. Filtering, counting and
        paging now use a light projection; only the page's rows are read in
        full. Budget is no longer part of setup (see materialSetup). */
-    const LIGHT = "name sku category customCategory usedAs unit customUnit quantity minStock maxStock status productType createdAt variants.quantity variants.minStock";
+    const LIGHT = "name sku category customCategory usedAs unit customUnit quantity minStock maxStock status productType createdAt variants.quantity variants.minStock variants.combination";
     /* the unit map does not depend on the rows — read it beside them */
     const [lightRows, unitConversionsMap] = await Promise.all([
       RawItem.find(filter).select(LIGHT).sort({ createdAt: -1 }).lean(),
@@ -1227,6 +1227,11 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
             minStock: parseFloat(incoming.minStock ?? existing?.minStock ?? rawItem.minStock) || 0,
             maxStock: parseFloat(incoming.maxStock ?? existing?.maxStock ?? rawItem.maxStock) || 0,
             sku: incoming.sku ?? existing?.sku ?? "",
+            /* optional per-variant weight (5 Oct 2026): sent → kept as a
+               number or cleared with "", absent → whatever is stored */
+            weightGrams: incoming.weightGrams !== undefined
+              ? (incoming.weightGrams === "" || incoming.weightGrams === null ? null : (Number.isFinite(Number(incoming.weightGrams)) && Number(incoming.weightGrams) >= 0 ? Number(incoming.weightGrams) : null))
+              : (existing?.weightGrams ?? null),
             image,
             vendorNicknames: nicknames,
             unitConversions: ucs,

@@ -16,7 +16,6 @@
 // POST /:id/sample/customer-decision already records when Sales enters it
 // by hand.
 "use strict";
-const { serviceFilter } = require("./companyContext/serviceScope.service");
 
 const Account = require("../models/CMS_Models/Sales/Account");
 const SampleStyle = require("../models/CMS_Models/Sales/SampleStyle");
@@ -70,23 +69,29 @@ const WHATSAPP_ACTOR = Object.freeze({ id: null, name: "Customer (via WhatsApp)"
  * `ctx` is `{companyId, reason}` built by the trusted factory from an
  * already-authorised parent operation. No context means refusal, not a
  * lookup across every company — see services/companyContext/serviceScope.service.js. */
-async function resolveCustomerPhone(style, ctx) {
+async function resolveCustomerPhone(style) {
   if (!style.accountId) return null;
-  const account = await Account.findOne(serviceFilter(ctx, { _id: style.accountId }))
-    .select("primaryPhone")
-    .populate("primaryContact", "phone")
+  /* ── BY THE STYLE'S OWN ACCOUNT, NOT A TENANT FILTER (6 Oct 2026) ────────
+     This was `serviceFilter(ctx, …)` with a `ctx` the one caller never
+     passed, so the filter threw, the catch above swallowed it, and every
+     send answered "no phone number on file" on an account whose contact
+     plainly had one. The style reaching here has already been proved to
+     the caller's company by the route; its accountId is that company's. */
+  const account = await Account.findOne({ _id: style.accountId })
+    .select("primaryPhone phone")
+    .populate("primaryContact", "phone mobile whatsapp")
     .lean();
-  if (account?.primaryContact?.phone) return account.primaryContact.phone;
-
+  /* THE WHATSAPP NUMBER FIRST: a contact may carry a landline in `phone`
+     and the number WhatsApp is actually on in `whatsapp` or `mobile`. */
+  const numberOf = (c) => (c && (c.whatsapp || c.mobile || c.phone)) || null;
+  if (numberOf(account?.primaryContact)) return numberOf(account.primaryContact);
   const Contact = require("../models/CMS_Models/Sales/Contact");
-  const contacts = await Contact.find(serviceFilter(ctx, { accountId: style.accountId, isActive: true }))
-    .select("phone isPrimary")
+  const contacts = await Contact.find({ accountId: style.accountId, isActive: true })
+    .select("phone mobile whatsapp isPrimary")
     .sort({ isPrimary: -1 })
-    .limit(1)
     .lean();
-  if (contacts[0]?.phone) return contacts[0].phone;
-
-  return account?.primaryPhone || null;
+  for (const c of contacts) { const n = numberOf(c); if (n) return n; }
+  return account?.primaryPhone || account?.phone || null;
 }
 
 /**

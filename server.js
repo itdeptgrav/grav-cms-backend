@@ -1893,6 +1893,8 @@ app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/capacityRoute"));
 /* PPC's piece-completion targets per order and department (24 Sep 2026), and
    the door each department's overview reads them through. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/orderTargetsRoute"));
+/* PPC → Store material requests against an order (4 Oct 2026) */
+app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/materialRequestsRoute"));
 /* The PPC control center (25 Sep 2026): every production-management READ —
    orders, work orders, person-wise, departments, hourly/daily, targets vs
    achievement, efficiency, delays, reports, search and the assistant — all
@@ -2132,6 +2134,8 @@ app.use("/api/cms/stock-items", stockItemsRoutes);
 
 const StoreRoutes = require("./routes/CMS_Routes/Store/storeRoutes.js");
 app.use("/api/cms/store", StoreRoutes);
+/* the Store's day book (4 Oct 2026) — tenant + READ, like the overview */
+app.use("/api/cms/store/reports", require("./routes/CMS_Routes/Store/storeReportsRoutes.js"));
 
 const workerWorkOrderRoutes = require("./routes/CMS_Routes/Store/workerWorkOrderRoutes");
 app.use("/api/cms/store/work-orders-worker", workerWorkOrderRoutes);

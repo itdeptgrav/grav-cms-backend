@@ -328,6 +328,8 @@ const rowView = (r) => ({
   placement: str(r.placement),
   appliesTo: str(r.appliesTo),
   selectionNote: str(r.selectionNote),
+  consumptionPerPiece: Number.isFinite(Number(r.consumptionPerPiece)) && r.consumptionPerPiece !== null ? Number(r.consumptionPerPiece) : null,
+  consumptionUnit: str(r.consumptionUnit),
   source: r.source ? {
     kind: str(r.source.kind),
     stockItemId: r.source.stockItemId ? str(r.source.stockItemId) : null,
@@ -441,8 +443,8 @@ async function listFiles(ctx, { view = "active", q = "", assignedTo = "", includ
     .sort({ updatedAt: -1, _id: -1 }).limit(size + 1).lean();
   const page = files.slice(0, size);
 
-  /* One lookup each for the page's BOMs and receipts, not one per row. */
-  const [boms, receipts] = await Promise.all([
+  /* One lookup each for the page's BOMs, receipts and request photos, not one per row. */
+  const [boms, receipts, requests] = await Promise.all([
     DevelopmentBomRevision.find({
       companyId: ctx.companyId, developmentFileId: { $in: page.map((f) => f._id) },
       state: { $in: [BOM_STATE.DRAFT, BOM_STATE.SUBMITTED, BOM_STATE.APPROVED] },
@@ -451,7 +453,13 @@ async function listFiles(ctx, { view = "active", q = "", assignedTo = "", includ
       companyId: ctx.companyId, developmentFileId: { $in: page.map((f) => f._id) },
       state: RECEIPT_STATE.CLARIFICATION_REQUESTED,
     }).select("developmentFileId").lean(),
+    /* the buyer's first reference photo rides on the row (3 Oct 2026, owner:
+       "the product photo should come, so the request is easy to understand") */
+    SalesDevelopmentRequest.find({
+      _id: { $in: page.map((f) => f.currentRequestId).filter(Boolean) },
+    }).select("referenceImages").lean(),
   ]);
+  const photoByRequest = new Map(requests.map((r) => [str(r._id), str((r.referenceImages || []).find((i) => str(i?.url))?.url)]));
   const bomByFile = new Map();
   for (const b of boms) {
     const key = str(b.developmentFileId);
@@ -464,6 +472,7 @@ async function listFiles(ctx, { view = "active", q = "", assignedTo = "", includ
   return {
     rows: page.map((f) => ({
       ...fileView(f),
+      image: photoByRequest.get(str(f.currentRequestId)) || "",
       bom: bomByFile.get(str(f._id)) || {},
       awaitingClarification: clarifying.has(str(f._id)),
     })),
@@ -856,6 +865,8 @@ async function moveLifecycle(ctx, { fileId, command, body = {}, actor = null } =
 const ROW_FIELDS = Object.freeze([
   "category", "rawItemId", "rawItemName", "rawItemSku", "variantId", "variantCombination",
   "colourOrShade", "finish", "placement", "appliesTo", "selectionNote",
+  /* the assumed consumption per piece and its unit (4 Oct 2026, owner) */
+  "consumptionPerPiece", "consumptionUnit",
 ]);
 
 /** Named so a refusal can say which department owns the fact. */
@@ -919,6 +930,16 @@ function shapeRow(body, existingRef = "") {
     placement: str(body?.placement).slice(0, 200),
     appliesTo: str(body?.appliesTo).slice(0, 200),
     selectionNote: str(body?.selectionNote).slice(0, 1000),
+    consumptionPerPiece: (() => {
+      const raw = body?.consumptionPerPiece;
+      if (raw === undefined || raw === null || str(raw) === "") return null;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < 0) {
+        throw fail("VALIDATION", "The assumed consumption per piece must be a number, zero or more.", { field: "consumptionPerPiece" });
+      }
+      return n;
+    })(),
+    consumptionUnit: str(body?.consumptionUnit).slice(0, 40),
   };
 }
 
@@ -1342,7 +1363,11 @@ async function approveBom(ctx, { fileId, body = {}, actor = null, idempotencyKey
       (str(actor?.email) && str(who?.email).toLowerCase() === str(actor?.email).toLowerCase())
       || (str(actor?.id) && str(who?.id) === str(actor?.id)),
     );
-    if (same(submitted.submittedBy) || same(submitted.createdBy)) {
+    /* Sales' approval is another department's decision (3 Oct 2026): the
+       maker/checker rule guards against one merchandiser approving their own
+       work, not against the salesperson who asked for it — who, in a small
+       team, may be the same signed-in person. */
+    if (!body?.salesChecker && (same(submitted.submittedBy) || same(submitted.createdBy))) {
       throw fail("DEVELOPMENT_SELF_APPROVAL",
         "This selection is approved by somebody other than the person who made it. "
         + "R&D and Costing both work from it, so it is not one person's decision alone.",

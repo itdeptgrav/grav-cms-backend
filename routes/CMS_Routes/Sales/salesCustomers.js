@@ -10,6 +10,7 @@
 //   - GET /:id/measurements — MPC measurement sessions for a customer
 //   - profile.avatar field handled on create + update
 
+const requestLineStyles = require("../../../services/sales/requestLineStyles");
 const express = require("express");
 const mongoose = require("mongoose");
 const {
@@ -1036,6 +1037,14 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
         if (style && String(style.production?.stockItemId || "") === String(stockItem._id)) {
           sampleStyleId = style._id;
         }
+      }
+      /* ── THE LINE NAMES ITS APPROVED STYLE EVEN WHEN THE FORM DID NOT ──
+         The order form raises lines from the approved PRODUCT and sends no
+         style id, and a line with none is refused at release
+         ("names no approved style"). Resolved here from the product's own
+         settled style (7 Oct 2026) — see services/sales/requestLineStyles.js. */
+      if (!sampleStyleId) {
+        sampleStyleId = await requestLineStyles.resolveStyleForStockItem(stockItem._id, { customerId: customer._id });
       }
       validatedItems.push({
         stockItemId: stockItem._id,

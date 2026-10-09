@@ -1,5 +1,6 @@
 // routes/CMS_Routes/Sales/quotationRoutes.js
 
+const requestLineStyles = require("../../../services/sales/requestLineStyles");
 const express = require("express");
 /* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
 const { requireDeliveryDeadline } = require("../../../services/sales/deliveryDeadlineGate");
@@ -1130,6 +1131,10 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       shippingCharges: parseFloat(shippingCharges.toFixed(2)),
       grandTotal: parseFloat(grandTotal.toFixed(2)),
       quotationNumber, preparedBy: req.user.id,
+      /* who prepared it, in words, and when — a re-save keeps the first
+         preparer and moment (6 Oct 2026) */
+      preparedByName: existingQuotation?.preparedByName || req.user.name || req.user.email || "",
+      preparedAt: existingQuotation?.preparedAt || new Date(),
       status: resolvedStatus, updatedAt: new Date()
     };
 
@@ -2912,8 +2917,24 @@ router.post("/requests/:requestId/quotation/send", async (req, res) => {
     syncRequestStatusFromQuotation(request, quotation); request.updatedAt = new Date();
     request.quotationNotifications.push({ type: 'customer_approval', message: 'Quotation sent to customer for approval', actionRequired: false, createdAt: new Date() });
     await request.save();
-    try { await CustomerEmailService.sendQuotationEmail(request, quotation, req.user); } catch (emailError) { console.error("Failed to send quotation email:", emailError); }
-    res.json({ success: true, message: "Quotation sent to customer successfully", request });
+    /* ── THE DOCUMENT RIDES ON THE MAIL (6 Oct 2026, owner) ─────────────
+       The browser builds the PDF from the figures it just saved and sends it
+       here as base64; the mail attaches it. Bounded so a bad client cannot
+       post an arbitrary blob through a mail route, and never fatal: a mail
+       that could not carry the PDF still goes, and the response says so. */
+    let attachment = null;
+    const att = req.body?.attachment;
+    if (att && typeof att.content === "string" && att.content.length > 0 && att.content.length <= 11 * 1024 * 1024) {
+      const name = String(att.name || "").replace(/[^\w.\- ]+/g, "").slice(0, 120) || `${quotation.quotationNumber || "document"}.pdf`;
+      attachment = { name: name.toLowerCase().endsWith(".pdf") ? name : `${name}.pdf`, content: att.content };
+    }
+    let mail = null;
+    try {
+      mail = await CustomerEmailService.sendQuotationEmail(request, quotation, req.user, {
+        docLabel: String(req.body?.docLabel || ""), attachment,
+      });
+    } catch (emailError) { console.error("Failed to send quotation email:", emailError); }
+    res.json({ success: true, message: "Quotation sent to customer successfully", request, mail: mail ? { sent: mail.success === true, attached: Boolean(mail.attached), messageId: mail.messageId || null, reason: mail.reason || mail.error || null } : { sent: false } });
   } catch (error) {
     console.error("Error sending quotation:", error);
     res.status(500).json({ success: false, message: "Server error while sending quotation" });
@@ -2963,6 +2984,15 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
      refused with the correction Sales must make. Nobody is moved silently and
      the commercial order is never changed here. Nothing is written when this
      throws. */
+  /* ── A LINE RAISED FROM THE PRODUCT LEARNS ITS STYLE NOW (7 Oct 2026) ──
+     Orders raised by the Sales order form before create-request filled the
+     link carry none; without this they are refused below as "names no
+     approved style". Filled from the product's settled style, never guessed
+     (services/sales/requestLineStyles.js); a line with no settled style is
+     still refused by the proof that follows. */
+  const linkedNow = await requestLineStyles.linkMissingLineStyles(request);
+  if (linkedNow.length) console.log(`[release] linked ${linkedNow.length} line(s) to their approved style on ${request.requestId}:`, linkedNow.map((l) => l.productName).join(", "));
+
   const effectiveItems = request.items;
   const lineMembers = isMeasurementOrder && measurement
     ? await salesLineLink.planMeasurementRelease(request)
@@ -4344,7 +4374,9 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
   try {
     const { requestId } = req.params;
     const request = await CustomerRequest.findById(requestId)
-      .populate("items.stockItemId", "name genderCategory hsnCode reference")
+      /* + the pictures, so the quotation / PI PDF can print a thumbnail per
+         line (6 Oct 2026, owner). Additive: every field read before is kept. */
+      .populate("items.stockItemId", "name genderCategory hsnCode reference images variants._id variants.attributes variants.images variants.image")
       .lean();
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (!request.quotations || request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });

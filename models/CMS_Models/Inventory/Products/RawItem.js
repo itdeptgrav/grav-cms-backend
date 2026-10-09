@@ -49,6 +49,11 @@ const variantSchema = new mongoose.Schema({
   minStock:    { type: Number, default: 0 },
   maxStock:    { type: Number, default: 0 },
   sku:         { type: String, default: "" },
+  /* The weight of ONE base unit of this variant, in grams (5 Oct 2026,
+     owner: "as per the variant, ask for the weight of the raw item variant —
+     optional"). `null` is "not stated"; it is never defaulted to 0, because a
+     zero would read as a weighed figure. */
+  weightGrams: { type: Number, default: null, min: 0 },
 
   // ── NEW: per-variant fields ──
   image:           { type: String, default: "" },          // Cloudinary URL

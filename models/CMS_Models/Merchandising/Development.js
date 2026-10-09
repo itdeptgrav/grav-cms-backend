@@ -278,6 +278,15 @@ const bomRowSchema = new mongoose.Schema(
 
     selectionNote: { type: String, trim: true, default: "", maxlength: 1000 },
 
+    /* ── THE MERCHANDISER'S ASSUMED CONSUMPTION (4 Oct 2026, owner) ─────
+       "He can fill the raw item-variant and the corresponding qty and the
+       unit." An ASSUMPTION per finished piece, in the unit chosen from the
+       variant's own conversions, carried to Sales for approval and on to R&D
+       as the starting figure. R&D's engineered consumption on the technical
+       record remains the figure Costing prices. */
+    consumptionPerPiece: { type: Number, min: 0, default: null },
+    consumptionUnit: { type: String, trim: true, default: "", maxlength: 40 },
+
     /* ── WHERE THIS IDENTITY CAME FROM ───────────────────────────────────
        A safe catalogue reference, so a reader can see whether a row was
        chosen fresh, adopted from a registered product's BOM, or carried

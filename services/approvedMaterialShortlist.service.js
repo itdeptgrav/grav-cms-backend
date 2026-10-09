@@ -57,6 +57,13 @@ function identityRow(r, { source }) {
        row is size-specific; it is not a consumption. */
     appliesToVariantLabels: Array.isArray(r.variantLabels)
       ? r.variantLabels.map(str).filter(Boolean) : [],
+    /* ── THE MERCHANDISER'S ASSUMED CONSUMPTION (4 Oct 2026) ────────────
+       Carried as the STARTING figure for R&D's record — a development row's
+       consumptionPerPiece / consumptionUnit, or a style pick's quantity /
+       unit. R&D's own entry, when they make one, overrides it. */
+    assumedConsumption: Number.isFinite(Number(r.consumptionPerPiece ?? r.quantity)) && (r.consumptionPerPiece ?? r.quantity) !== null && (r.consumptionPerPiece ?? r.quantity) !== undefined
+      ? Number(r.consumptionPerPiece ?? r.quantity) : null,
+    assumedUnit: str(r.consumptionUnit || r.unit),
     /* Where this identity came from, so a reader is never left guessing why
        a row is or is not there. */
     source,
@@ -91,7 +98,10 @@ async function approvedShortlistFor(style) {
   const development = await approvedDevelopmentSelectionFor(style);
   if (development?.rows.length) {
     return {
-      rows: development.rows.map((r) => identityRow(r, { source: "DEVELOPMENT_BOM" })),
+      /* a row with no catalogue item (a material described by hand) cannot
+         seed a technical row — the record requires an item id — so it is
+         skipped rather than failing the whole start (4 Oct 2026) */
+      rows: development.rows.filter((r) => r.rawItemId).map((r) => identityRow(r, { source: "DEVELOPMENT_BOM" })),
       source: "DEVELOPMENT_BOM",
       stockItemId: stockItemId ? String(stockItemId) : null,
       developmentNumber: development.developmentNumber,
