@@ -44,7 +44,12 @@ const { dispatchRollup } = require("../services/accounting/proformaDispatch");
 
 // ── The DEMO keys. Everything is found, updated and removed by these. ───────
 const REQUEST_ID = "MO-REQ-DEMO-DISPATCH";
-const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002"];
+/* A SECOND order, for a DIFFERENT customer. Without it the two proformas
+   sat on one order and therefore showed the same dispatches — which is what
+   "every PI is showing all the dispatch" was. With it, each proforma shows
+   only its own challans, and ticking across the two is the refusal to see. */
+const REQUEST_ID_B = "MO-REQ-DEMO-DISPATCH-B";
+const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002", "DC-DEMO-0003"];
 const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002"];
 /* Customer has `customerId` (a String), NOT `customerCode` — keying on a
    field the schema does not declare meant strict mode dropped it, so every
@@ -54,6 +59,8 @@ const CUSTOMER_ID = "DEMO-RIVERSIDE";
    carry, so --undo matches on either. Note the TLD: Customer's validator is
    /(\.\w{2,3})+$/, which refuses a 4-letter TLD like ".test". */
 const CUSTOMER_EMAIL = "accounts@riversidedemo.com";
+const CUSTOMER_ID_B = "DEMO-HILLVIEW";
+const CUSTOMER_EMAIL_B = "accounts@hillviewdemo.com";
 
 const arg = (name, fallback = null) => {
   const i = process.argv.indexOf(name);
@@ -122,13 +129,16 @@ const BUYER = {
 };
 
 async function undo() {
-  const order = await CustomerRequest.findOne({ requestId: REQUEST_ID }).lean();
+  const order = await CustomerRequest.findOne({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B] } }).lean();
   const r = {
     challans: (await DispatchChallan.deleteMany({ challanNumber: { $in: CHALLANS } })).deletedCount,
     proformas: (await Acc_ProformaInvoice.deleteMany({ voucherNumber: { $in: PI_NUMBERS } })).deletedCount,
-    orders: (await CustomerRequest.deleteMany({ requestId: REQUEST_ID })).deletedCount,
+    orders: (await CustomerRequest.deleteMany({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B] } })).deletedCount,
     customers: (await Customer.deleteMany({
-      $or: [{ customerId: CUSTOMER_ID }, { email: CUSTOMER_EMAIL }],
+      $or: [
+        { customerId: { $in: [CUSTOMER_ID, CUSTOMER_ID_B] } },
+        { email: { $in: [CUSTOMER_EMAIL, CUSTOMER_EMAIL_B] } },
+      ],
     })).deletedCount,
   };
   console.log("\nRemoved:", r, order ? "" : "(no demo order was present)");
@@ -243,7 +253,50 @@ async function seed() {
     );
   }
 
-  // ── Two proformas, both linked to the order ─────────────────────────────
+  /* ── A SECOND customer, order and challan ───────────────────────────────
+     So each proforma shows only ITS order's dispatches, and so that ticking
+     a challan from each is a refusal somebody can actually try. */
+  const BUYER_B = {
+    name: "Hillview Resorts (DEMO)",
+    addressLines: ["NH-16, Chandaka"], city: "Bhubaneswar", state: "Odisha",
+    stateCode: "21", pincode: "751024", country: "India", gstin: "21AADCH9876P1Z4",
+  };
+  let customerB =
+    (await Customer.findOne({ customerId: CUSTOMER_ID_B })) ||
+    (await Customer.findOne({ email: CUSTOMER_EMAIL_B }));
+  if (!customerB) {
+    customerB = await Customer.create({
+      customerId: CUSTOMER_ID_B, name: BUYER_B.name, companyName: BUYER_B.name,
+      email: CUSTOMER_EMAIL_B, phone: "9000000002", gstin: BUYER_B.gstin,
+    });
+  }
+  let orderB = await CustomerRequest.findOne({ requestId: REQUEST_ID_B });
+  if (!orderB) orderB = new CustomerRequest({ requestId: REQUEST_ID_B });
+  orderB.customerId = customerB._id;
+  orderB.customerName = BUYER_B.name;
+  orderB.status = "production";
+  orderB.customerInfo = { name: BUYER_B.name, gstin: BUYER_B.gstin, deliveryDeadline: new Date(Date.now() + 25 * 864e5) };
+  orderB.quotations = [{
+    items: [{ productName: "Spa Robe", variant: "Size: Free", quantity: 20, rate: 900, unit: "Nos", hsnCode: "6208", gstRate: 12 }],
+    grandTotal: 20160, status: "sales_approved",
+  }];
+  await orderB.save();
+
+  await DispatchChallan.findOneAndUpdate(
+    { challanNumber: CHALLANS[2] },
+    { $set: {
+        challanNumber: CHALLANS[2], manufacturingOrderId: orderB._id, requestId: REQUEST_ID_B,
+        customerName: BUYER_B.name, dispatchType: "bulk", source: "carton",
+        dispatchDate: new Date(Date.now() - 3 * 864e5),
+        bulkProducts: [{ productName: "Spa Robe", quantity: 20, variantAttributes: [{ name: "Size", value: "Free" }] }],
+        cartons: [{ cartonNumber: "CTN-DEMO-0006", totalQuantity: 20, lines: [] }],
+        cartonCount: 1, totalUnits: 20, totalPersons: 0, totalProducts: 1,
+        transport: { transporter: "Delhivery" }, dispatchedBy: "Seed script",
+      } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+
+  // ── Two proformas, EACH on its own order ────────────────────────────────
   const voucherDate = new Date();
   const items = [
     piLine({ name: "Reception Blazer — Size: M", hsn: "6203", qty: 50, rate: 1200, taxRate: 12 }),
@@ -251,19 +304,24 @@ async function seed() {
   ];
   const totals = piTotals(items);
 
+  const itemsB = [piLine({ name: "Spa Robe — Size: Free", hsn: "6208", qty: 20, rate: 900, taxRate: 12 })];
+  const totalsB = piTotals(itemsB);
+
   const made = [];
   for (const [i, voucherNumber] of PI_NUMBERS.entries()) {
+    const second = i === 1;
+    const buyer = second ? BUYER_B : BUYER;
     const doc = {
       companyId: company._id,
       voucherNumber,
       financialYear: financialYear(voucherDate),
       voucherDate,
       validTill: new Date(Date.now() + 30 * 864e5),
-      buyer: BUYER,
-      consignee: { ...BUYER, name: `${BUYER.name} — Site Store` },
-      /* The link this whole feature turns on. */
-      customerRequestId: order._id,
-      requestRef: REQUEST_ID,
+      buyer,
+      consignee: { ...buyer, name: `${buyer.name} — Site Store` },
+      /* The link this whole feature turns on — a DIFFERENT order each. */
+      customerRequestId: second ? orderB._id : order._id,
+      requestRef: second ? REQUEST_ID_B : REQUEST_ID,
       buyersReference: "RFQ/RH/2026/118",
       dispatchedThrough: "VRL Logistics",
       destination: "Bhubaneswar",
@@ -271,8 +329,8 @@ async function seed() {
       paymentTerms: "50% advance, balance on delivery",
       otherReferences: "Seeded demonstration document",
       isInterState: false,
-      items,
-      ...totals,
+      items: second ? itemsB : items,
+      ...(second ? totalsB : totals),
       narration: "Uniform supply for the Nayapalli property.",
       internalNotes: "[seed:proforma-dispatch] safe to delete",
       /* The second one is ACCEPTED on purpose: PUT /:id refuses it, so it is
@@ -287,11 +345,11 @@ async function seed() {
     made.push(pi);
   }
 
-  return { company, order, proformas: made };
+  return { company, order, orderB, proformas: made };
 }
 
 /* ── Prove it, with the real service the screen reads ────────────────────── */
-async function verify({ company, order, proformas }) {
+async function verify({ company, order, orderB, proformas }) {
   const challans = await DispatchChallan.find({ manufacturingOrderId: order._id }).sort({ createdAt: 1 }).lean();
   const pi = proformas[0];
   const r = dispatchRollup(challans, pi.items);
@@ -321,6 +379,28 @@ async function verify({ company, order, proformas }) {
   if (r.totals.units !== 90) problems.push(`90 units dispatched expected, got ${r.totals.units}`);
   if (r.totals.value !== 93750) problems.push(`priced value should be ₹93,750 (50×1200 + 25×1350), got ${r.totals.value}`);
 
+  /* ── Each proforma sees ONLY its own order's dispatches ────────────────
+     The whole point of this pass. Order B has one challan of its own; if it
+     ever appears under order A, the panel is reading the wrong thing. */
+  const challansB = await DispatchChallan.find({ manufacturingOrderId: orderB._id }).lean();
+  const aNumbers = challans.map((c) => c.challanNumber).sort();
+  const bNumbers = challansB.map((c) => c.challanNumber).sort();
+  if (aNumbers.length !== 2) problems.push(`order A should have 2 challans, got ${aNumbers.join(",")}`);
+  if (bNumbers.length !== 1) problems.push(`order B should have 1 challan, got ${bNumbers.join(",")}`);
+  if (aNumbers.some((n) => bNumbers.includes(n))) problems.push("the two orders share a challan");
+
+  /* ── Two customers never share an invoice ──────────────────────────────── */
+  const { selectionGuard } = require("../services/accounting/proformaDispatch");
+  const mixed = selectionGuard([challans[0], challansB[0]]);
+  if (mixed.ok) problems.push("a selection spanning two customers was allowed");
+  const sameCustomer = selectionGuard(challans);
+  if (!sameCustomer.ok) problems.push(`one customer's challans were refused: ${sameCustomer.reason}`);
+
+  console.log("");
+  console.log(`  Order A (${REQUEST_ID}): ${aNumbers.join(", ")}`);
+  console.log(`  Order B (${REQUEST_ID_B}): ${bNumbers.join(", ")}`);
+  console.log(`  Mixing A + B: ${mixed.ok ? "ALLOWED (wrong)" : "refused — " + mixed.reason}`);
+
   console.log("");
   if (problems.length) {
     console.log("FAILED:");
@@ -329,6 +409,8 @@ async function verify({ company, order, proformas }) {
     console.log("  ✓ both challans fold into one line per product and variant");
     console.log("  ✓ rates come from the proforma; the unpriced product reads No rate");
     console.log("  ✓ the value total excludes what the proforma does not price");
+    console.log("  ✓ each proforma sees only its own order's challans");
+    console.log("  ✓ two customers' challans cannot share one invoice");
   }
 
   console.log("\n─────────── open these ───────────");

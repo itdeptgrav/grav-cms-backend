@@ -447,8 +447,67 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
         .lean(),
     ]);
 
+    /* WHICH OF THESE HAS ALREADY BEEN BILLED.
+       The invoice carries the reference (Acc_Voucher.sourceChallans), so this
+       is one query and there is no flag on the challan to fall out of step
+       with it. A challan with an invoice is shown as spent and cannot be
+       ticked again — billing a dispatch twice is the fault the link exists
+       to stop. */
+    const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
+    const challanIds = challans.map((c) => c._id);
+    const billed = challanIds.length
+      ? await Acc_Voucher.find({
+          companyId: pi.companyId,
+          "sourceChallans.challanId": { $in: challanIds },
+        })
+          .select("voucherNumber voucherDate voucherType sourceChallans")
+          .lean()
+      : [];
+    const invoiceByChallan = new Map();
+    for (const v of billed) {
+      for (const sc of v.sourceChallans || []) {
+        invoiceByChallan.set(String(sc.challanId), {
+          _id: String(v._id),
+          voucherNumber: v.voucherNumber,
+          voucherDate: v.voucherDate,
+        });
+      }
+    }
+    const withInvoice = challans.map((c) => ({
+      ...c,
+      invoice: invoiceByChallan.get(String(c._id)) || null,
+    }));
+
     const { dispatchRollup } = require("../../services/accounting/proformaDispatch");
-    const rolled = dispatchRollup(challans, pi.items);
+    /* The figures default to what is still BILLABLE, because that is the
+       question the panel is open to answer. The challan list still shows
+       every challan, billed or not, so nothing is hidden. */
+    const billable = withInvoice.filter((c) => !c.invoice).map((c) => String(c._id));
+
+    /* A SELECTION, when the caller names one (?challans=a,b,c).
+       The invoice form asks with the challans the user ticked, so the lines
+       and the totals it prefills are exactly what those challans dispatched —
+       and the same guard runs here as on the screen, because a URL can be
+       typed and the screen's check is a courtesy, not the rule. */
+    const asked = String(req.query.challans || "")
+      .split(",").map((x) => x.trim()).filter(Boolean);
+    let guard = null;
+    let only = billable;
+    if (asked.length) {
+      const known = new Set(withInvoice.map((c) => String(c._id)));
+      const unknown = asked.filter((id) => !known.has(id));
+      const chosen = withInvoice.filter((c) => asked.includes(String(c._id)));
+      const { selectionGuard } = require("../../services/accounting/proformaDispatch");
+      guard = unknown.length
+        ? { ok: false, reason: `Not a challan of this order: ${unknown.join(", ")}.`, customers: [], alreadyInvoiced: [] }
+        : selectionGuard(chosen);
+      only = chosen.map((c) => String(c._id));
+    }
+
+    const rolled = dispatchRollup(withInvoice, pi.items, { only });
+    /* …and the full list, so the panel can show the spent ones too. */
+    const { challanSummary } = require("../../services/accounting/proformaDispatch");
+    rolled.challans = withInvoice.map(challanSummary);
 
     res.json({
       success: true,
@@ -461,6 +520,12 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
             status: order.status || "",
           }
         : { _id: String(pi.customerRequestId), requestId: pi.requestRef || "", missing: true },
+      /* Present only when a selection was asked for. `ok: false` means the
+         caller must not raise an invoice from it — the reason is the
+         sentence to show. */
+      guard,
+      selection: asked.length ? asked : null,
+      billableChallanIds: billable,
       ...rolled,
     });
   } catch (e) {
