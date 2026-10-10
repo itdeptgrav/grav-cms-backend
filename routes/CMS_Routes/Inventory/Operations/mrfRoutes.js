@@ -19,6 +19,29 @@ const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Opera
 const mrfNotify = require("../../../../services/mrfNotify.service");
 const mrfChat = require("../../../../services/mrfChat.service");
 const { buildContext } = require("../../../../services/mrfContext.service");
+const itemApproval = require("../../../../services/mrfItemApproval.service");
+
+/**
+ * What the Store is shown of a request: only the lines that reached it — the
+ * lines the manager approved, or that never needed a manager. A line still
+ * waiting for the manager, or one the manager rejected, is not the Store's to
+ * see or act on; it is counted (`heldByManager`) so the page can say "two more
+ * items are still with the manager", never listed.
+ *
+ * Call AFTER anything that needs the whole request (buildContext). Mutates and
+ * returns the plain request; `keep` filters a parallel per-line array.
+ */
+function storeView(mrf) {
+  itemApproval.annotate(mrf);
+  const all = mrf.items || [];
+  mrf.heldByManager = {
+    awaiting: all.filter((l) => l.awaitingApproval).length,
+    rejected: all.filter((l) => l.approval && l.approval.decision === "REJECTED").length,
+  };
+  mrf.items = all.filter((l) => l.withStore);
+  return mrf;
+}
+const storeLineIds = (mrf) => new Set((mrf.items || []).map((l) => String(l._id)));
 const mrfUnits = require("../../../../services/mrfUnits.service");
 const fulfilment = require("../../../../services/storeFulfilment.service");
 /* Shipping, discount and charges, and the one rule for the total they make. */
@@ -37,7 +60,7 @@ const tenantContext = require("../../../../services/storePurchase/tenantContext.
 const mrfAuthority = require("../../../../services/storePurchase/mrfAuthority.service");
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
-const documentSequence = require("../../../../services/storePurchase/documentSequence.service");
+const mrfNumber = require("../../../../services/storePurchase/mrfNumber.service");
 const { fail, sendError } = require("../../../../services/storePurchase/errors");
 /* ── REQUIRED AT THE TOP, AND THAT IS NOT A STYLE PREFERENCE ─────────────────
    This was a lazy `require` inside `adjustStock`, which runs INSIDE the issue
@@ -585,6 +608,10 @@ router.get("/", async (req, res) => {
       .populate("rejectedBy", "firstName lastName name")
       .lean();
 
+    /* A Store reader sees the Store's lines only (see storeView). Somebody
+       reading their OWN requests through this door — no Store read — keeps
+       every line, since they are theirs. */
+    const asStore = req.tenant.capabilitySet.has(CAPABILITIES.READ);
     mrfs.forEach(mrf => {
       if (mrf.requestedFor && typeof mrf.requestedFor === "object") {
         mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
@@ -592,6 +619,8 @@ router.get("/", async (req, res) => {
       // Same contextual copy the requester and TL see, phrased for the store.
       mrf.context = buildContext(mrf, "store");
       mrf.storeActionable = isStoreActionable(mrf);
+      if (asStore) storeView(mrf);
+      else itemApproval.annotate(mrf);
     });
     markOverdue(mrfs);
 
@@ -1177,10 +1206,15 @@ router.get("/:id", async (req, res) => {
     if (mrf.requestedFor && typeof mrf.requestedFor === "object")
       mrf.requestedFor._fullName = buildFullName(mrf.requestedFor);
     markOverdue([mrf]);
+    const detailContext = buildContext(mrf, "store");
+    /* A Store reader sees the lines that reached the Store; the requester and
+       the approver reading through this door see all of theirs. */
+    if (req.tenant.capabilitySet.has(CAPABILITIES.READ)) storeView(mrf);
+    else itemApproval.annotate(mrf);
     res.json({
       success: true,
       mrf,
-      context: buildContext(mrf, "store"),
+      context: detailContext,
       storeActionable: isStoreActionable(mrf),
     });
   } catch (e) {
@@ -1248,9 +1282,8 @@ router.post(
 
     /* Server-owned and atomic: one $inc, so two requests submitted in
        the same moment cannot receive the same number. */
-    const allocated = await documentSequence.allocate({
+    const allocated = await mrfNumber.allocate({
       companyId: req.tenant.companyId,
-      documentType: "MATERIAL_REQUEST",
       siteId: req.tenant.siteId || null,
     })
     const mrf = new MRF({
@@ -1382,9 +1415,8 @@ router.post(
 
     /* Server-owned and atomic: one $inc, so two requests submitted in
        the same moment cannot receive the same number. */
-    const allocated = await documentSequence.allocate({
+    const allocated = await mrfNumber.allocate({
       companyId: req.tenant.companyId,
-      documentType: "MATERIAL_REQUEST",
       siteId: req.tenant.siteId || null,
     })
     const mrf = new MRF({
@@ -1528,6 +1560,8 @@ router.patch(
       const item = mrf.items.id(line.itemId);
       if (!item) continue;
       if (["REJECTED", "UNFULFILLED"].includes(item.itemStatus)) continue;
+      /* Still waiting on the manager — not the Store's line yet. */
+      if (!itemApproval.isWithStore(item, mrf)) continue;
 
       const availability = String(line.availability || "").toUpperCase();
       if (!AVAILABILITY_VALUES.includes(availability))
@@ -1675,19 +1709,25 @@ router.post(
     const stateBeforeUnfulfilled = mrf.status;
     const anyIssued = mrf.items.some(i => (i.issuedQty || 0) > 0);
     const who = actorName(req);
+    /* Lines still waiting on the manager were never given to the Store, so the
+       Store cannot close them — they stay with the manager, and the request
+       stays open for them. The last one decided settles it
+       (mrfItemApproval.settleStoreStatus). */
+    const stillWithManager = itemApproval.awaitingLineIds(mrf).length;
 
     mrf.items.forEach(i => {
       // Anything already handed over keeps its issued state; only what is
       // still owed becomes unfulfillable.
       if ((i.issuedQty || 0) > 0) return;
       if (i.itemStatus === "REJECTED") return;
+      if (!itemApproval.isWithStore(i, mrf)) return;
       i.itemStatus = "UNFULFILLED";
       if (i.availability === "UNREVIEWED") i.availability = "NOT_AVAILABLE";
     });
 
     // If some material already went out, the request is partially issued and
     // closed — not wholly unfulfilled.
-    mrf.status = anyIssued ? "PARTIALLY_ISSUED" : "UNFULFILLED";
+    mrf.status = anyIssued ? "PARTIALLY_ISSUED" : stillWithManager ? mrf.status : "UNFULFILLED";
     mrf.unfulfilledAt = new Date();
     mrf.unfulfilledBy = getActorId(req);
     mrf.unfulfilledByName = who;
@@ -1753,6 +1793,9 @@ router.patch(
     mrf.cancelledAt = new Date();
     mrf.cancellationNote = req.body.cancellationNote || "";
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED"; });
+    /* Lines the manager never decided stay undecided — withdrawn with the
+       request, not rejected by the manager — and the roll-up says so. */
+    mrf.approvalStatus = itemApproval.approvalStatusOf(mrf);
     await commitMrf(req, mrf, {
       action: "CANCELLED",
       reason: mrf.cancellationNote || "",
@@ -2278,7 +2321,7 @@ router.post(
     let itemTargets = [];
     if (planned.length) {
       const applied = await applyIssue({
-        mrf, planned, actorId, storeNotes: "",
+        mrf, planned, actorId, actorName: req.user?.name || req.user?.email || "", storeNotes: "",
         operationKey: req.idempotent?.key || "", tenant: req.tenant,
       });
       issuedLines = applied.issuedLines;
@@ -2456,7 +2499,7 @@ async function applyLabelMove(label, session) {
   return { barcodeId: String(label.barcodeId), before: Math.round((moved.quantity - label.delta) * 10000) / 10000, after: moved.quantity, unit: label.unit };
 }
 
-async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey = "", tenant = null }) {
+async function applyIssue({ mrf, planned, actorId, actorName: performedByName = "", storeNotes = "", operationKey = "", tenant = null }) {
   const issuedLines = [];
   const stockPlans = [];
   const itemTargets = [];
@@ -2499,7 +2542,9 @@ async function applyIssue({ mrf, planned, actorId, storeNotes = "", operationKey
         type: mrfItem.variantId ? "VARIANT_REDUCE" : "REDUCE",
         quantity: deductQty,
         reason: `MRF Issue — ${mrf.mrfNumber}`,
-        performedByName: req.user?.name || req.user?.email || "",
+        /* Passed in by the route: this helper has no `req`. Reading
+           `req.user` here threw "req is not defined" on every Confirm Issue. */
+        performedByName,
         notes: `Issued to ${mrf.requestedForName} (${mrf.requestedForDept}). MRF: ${mrf.mrfNumber}`,
         performedBy: actorId,
       },
@@ -2672,6 +2717,13 @@ router.post(
       const issuedQty = parseFloat(line.issuedQty) || 0;
       if (issuedQty <= 0) continue;
 
+      if (!itemApproval.isWithStore(mrfItem, mrf))
+        return res.status(400).json({
+          success: false,
+          message: itemApproval.isAwaitingApproval(mrfItem, mrf)
+            ? `"${mrfItem.rawItemName}" is still waiting for ${mrf.approverName || "the manager"}'s approval and cannot be issued yet.`
+            : `"${mrfItem.rawItemName}" was rejected by ${mrf.approverName || "the manager"} and cannot be issued.`,
+        });
       if (["REJECTED", "UNFULFILLED"].includes(mrfItem.itemStatus))
         return res.status(400).json({
           success: false,
@@ -2750,7 +2802,7 @@ router.post(
        so a `withTransaction` retry that reruns the callback lands the same
        result exactly once and never persists a doubly-incremented quantity. */
     const { issuedLines, stockPlans, itemTargets } = await applyIssue({
-      mrf, planned, actorId: getActorId(req), storeNotes,
+      mrf, planned, actorId: getActorId(req), actorName: req.user?.name || req.user?.email || "", storeNotes,
       operationKey: req.idempotent?.key || "", tenant: req.tenant,
     });
 
@@ -3058,7 +3110,14 @@ router.get("/:id/stock-check", async (req, res) => {
     // figure here (as this endpoint used to) showed the wrong number whenever
     // the two differed — 20 pcs in stock reading as "20 packets available"
     // against a request for 2 packets.
-    const itemsWithStock = await mrfUnits.enrichItemsWithStock(mrf.items || []);
+    /* The context is built from the WHOLE request — it is what says how many
+       lines are still with the manager — and the Store is then shown only the
+       lines that reached it. */
+    const storeContext = buildContext(mrf, "store");
+    storeView(mrf);
+    const visible = storeLineIds(mrf);
+    const itemsWithStock = (await mrfUnits.enrichItemsWithStock(mrf.items || []))
+      .filter((l) => visible.has(String(l._id)));
 
     // If this MRF was spawned from a product-request match/approve, find
     // that source so the page can link back to it — that's where "Edit
@@ -3096,7 +3155,7 @@ router.get("/:id/stock-check", async (req, res) => {
       pmApprovalRequired: false,
       storeCanApprove: false,
       storeActionable: isStoreActionable(mrf),
-      context: buildContext(mrf, "store"),
+      context: storeContext,
       sourceProductRequest,
     });
   } catch (err) {
@@ -3258,6 +3317,12 @@ async function lineConversion(line, raw) {
 // / buy line follows the Service Order workflow, not inventory reservation.
 function reservableRefusal(mrf, line) {
   if (!line) return { code: "UNKNOWN_LINE", message: "That line is not part of this request." };
+  if (itemApproval.isAwaitingApproval(line, mrf)) {
+    return { code: "AWAITING_APPROVAL", message: "This line is still waiting for the manager's approval — nothing can be reserved against it yet." };
+  }
+  if (!itemApproval.isWithStore(line, mrf)) {
+    return { code: "LINE_CLOSED", message: "The manager rejected this line, so nothing can be reserved against it." };
+  }
   if (["REJECTED", "UNFULFILLED"].includes(line.itemStatus)) return { code: "LINE_CLOSED", message: "This line is closed and cannot be reserved." };
   if (!line.rawItem) {
     if (mrf.fulfilmentDecision === "buy_or_service") {
@@ -3757,6 +3822,9 @@ router.get("/reservations/queue", requireCapability(CAPABILITIES.READ), async (r
       for (const it of (m.items || [])) {
         if (!it.rawItem) continue;
         if (["REJECTED", "UNFULFILLED", "ISSUED", "RETURNED"].includes(it.itemStatus)) continue;
+        /* A line still waiting on the manager is not Store work yet — the
+           request is with the Store because ANOTHER of its lines was approved. */
+        if (!itemApproval.isWithStore(it, m)) continue;
         if ((it.issuedQty || 0) >= (it.requestedQty || 0) - reservationSvc.TOL) continue;
         if (reservedLineIds.has(String(it._id))) continue;
         const staged = autoReservation.lineStage(it);

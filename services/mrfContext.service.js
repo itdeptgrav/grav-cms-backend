@@ -9,6 +9,8 @@
 //
 //   buildContext(mrf, "requester" | "tl" | "store")
 
+const itemApproval = require("./mrfItemApproval.service");
+
 const round = (n) => Math.round((Number(n) || 0) * 1000) / 1000;
 
 const fmtQty = (qty, unit) => `${round(qty)}${unit ? ` ${unit}` : ""}`;
@@ -29,7 +31,11 @@ function summariseQuantities(mrf) {
     const issued = round(i.issuedQty);
     const returned = round(i.returnedQty);
     const dead = ["REJECTED", "UNFULFILLED"].includes(i.itemStatus);
-    const remaining = dead ? 0 : Math.max(0, round(requested - issued));
+    /* Still waiting on the manager: nothing is owed on it yet, and it is not
+       part of what the Store is working through. */
+    const awaitingApproval = i.itemStatus === "PENDING"
+      || Boolean(i.approval && i.approval.decision === "PENDING");
+    const remaining = dead || awaitingApproval ? 0 : Math.max(0, round(requested - issued));
     // availableQty is what the store reported, in the same unit. null = not
     // yet reviewed, which is different from "reported as zero".
     const available = i.availableQty === null || i.availableQty === undefined
@@ -44,11 +50,12 @@ function summariseQuantities(mrf) {
       availabilityNote: i.availabilityNote || "",
       alternativeItem: i.alternativeItem?.name ? i.alternativeItem : null,
       itemStatus: i.itemStatus,
+      awaitingApproval,
       requested, issued, returned, remaining, available,
     };
   });
 
-  const live = lines.filter(l => !["REJECTED", "UNFULFILLED"].includes(l.itemStatus));
+  const live = lines.filter(l => !["REJECTED", "UNFULFILLED"].includes(l.itemStatus) && !l.awaitingApproval);
   return {
     lines,
     totalItems: lines.length,
@@ -79,7 +86,70 @@ function lastAction(mrf) {
   return { action: e.action, actorName: e.actorName, actorRole: e.actorRole, at: e.at, detail: e.detail };
 }
 
+/**
+ * The context for one audience, with the manager's item-wise decisions folded
+ * in: how many lines are still waiting, approved, rejected — and, when a
+ * request is with the Store while some of its lines still wait, a sentence
+ * saying so, because "Approved — with the Store" alone would claim the whole
+ * request was approved.
+ */
 function buildContext(mrf, audience = "requester") {
+  const ctx = buildLifecycleContext(mrf, audience);
+  const ap = itemApproval.approvalSummary(mrf);
+  ctx.approval = {
+    status: ap.status,
+    label: itemApproval.APPROVAL_STATUS_LABEL[ap.status],
+    total: ap.total, awaiting: ap.awaiting, approved: ap.approved, rejected: ap.rejected, reduced: ap.reduced,
+  };
+  if (!ap.awaiting && !(ap.rejected && ap.approved)) return ctx;
+
+  const who = mrf.approverName || "the Primary Manager/TL";
+  const isTl = audience === "tl";
+  const isStore = audience === "store";
+  const n = (k, word) => `${k} item${k === 1 ? "" : "s"}${word ? ` ${word}` : ""}`;
+
+  if (mrf.status === "PENDING" && ap.status === itemApproval.APPROVAL_STATUS.PARTIALLY_PROCESSED) {
+    ctx.statusLabel = "Partially Processed";
+    ctx.headline = isTl ? "Some items still need your decision" : "Partly decided — waiting for the rest";
+    ctx.message = isTl
+      ? `${ap.rejected} of ${ap.total} items rejected so far; ${n(ap.awaiting, "still waiting for your decision")}.`
+      : `${n(ap.rejected, "rejected")} so far by ${who}; ${n(ap.awaiting, "still waiting for approval")}.`;
+    return ctx;
+  }
+
+  const withStore = !["PENDING", "REJECTED", "CANCELLED"].includes(mrf.status);
+  const decided = `${n(ap.approved, "approved and sent to the Store")}${ap.rejected ? `, ${n(ap.rejected, "rejected")}` : ""}`;
+  /* Past "approved", the Store's own progress (issued, returned…) is the
+     news; before it, the decisions are. */
+  const storeProgress = mrf.status !== "APPROVED" ? ` ${ctx.message}` : "";
+
+  if (ap.awaiting && withStore) {
+    if (isStore) {
+      ctx.message = `${ctx.message} ${n(ap.awaiting)} more on this request ${ap.awaiting === 1 ? "is" : "are"} still with ${who} and will arrive here once approved.`.trim();
+    } else {
+      ctx.statusLabel = "Partially Processed";
+      ctx.headline = isTl ? "Some items still need your decision" : "Partly approved — some items still waiting";
+      ctx.message = isTl
+        ? `${decided}; ${n(ap.awaiting, "still waiting for your decision")}.${storeProgress}`
+        : `${decided}; ${n(ap.awaiting, "still waiting for approval from")} ${who}.${storeProgress}`;
+      if (isTl) {
+        ctx.nextActionBy = "tl";
+        ctx.nextAction = `Decide the ${n(ap.awaiting, "still waiting")}.`;
+      }
+    }
+  } else if (!isStore && withStore && ap.status === itemApproval.APPROVAL_STATUS.PARTIALLY_APPROVED) {
+    if (mrf.status === "APPROVED") {
+      ctx.statusLabel = "Partially Approved — With Store";
+      ctx.headline = "Partly approved — sent to the Store";
+      ctx.message = `${decided}. The Store is processing the approved items.`;
+    } else {
+      ctx.message = `${ctx.message} (${decided}.)`;
+    }
+  }
+  return ctx;
+}
+
+function buildLifecycleContext(mrf, audience = "requester") {
   const q = summariseQuantities(mrf);
   const isRequester = audience === "requester";
   const isTl = audience === "tl";
@@ -184,7 +254,7 @@ function buildContext(mrf, audience = "requester") {
 
   // ── With the store: APPROVED / PARTIALLY_ISSUED / ISSUED / PARTIALLY_RETURNED ──
   const reviewed = !!mrf.storeReviewedAt;
-  const live = q.lines.filter(l => !["REJECTED", "UNFULFILLED"].includes(l.itemStatus));
+  const live = q.lines.filter(l => !["REJECTED", "UNFULFILLED"].includes(l.itemStatus) && !l.awaitingApproval);
   const notAvailable = live.filter(l => l.availability === "NOT_AVAILABLE");
   const partial = live.filter(l => l.availability === "PARTIAL");
   const alternative = live.filter(l => l.availability === "ALTERNATIVE");

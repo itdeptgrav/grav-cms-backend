@@ -10,6 +10,7 @@ const mongoose = require("mongoose");
 const Requisition = require("../../../../models/CMS_Models/Inventory/Operations/Requisition");
 const Employee = require("../../../../models/Employee");
 const MRF = require("../../../../models/CMS_Models/Inventory/Operations/MRF");
+const itemApproval = require("../../../../services/mrfItemApproval.service");
 // READ-ONLY LEGACY fallback — see the write-back block in POST / below.
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest");
 const EmployeeAuth = require("../../../../Middlewear/EmployeeAuthMiddlewear");
@@ -200,6 +201,25 @@ router.post("/", async (req, res) => {
     const cashPersonName = cashPerson
       ? ([cashPerson.firstName, cashPerson.middleName, cashPerson.lastName].filter(Boolean).join(" ").trim() || cashPerson.name || "")
       : String(pettyCashGivenTo || "").trim();
+
+    /* A purchase form raised against a material request may only name lines
+       that reached the Store. A line still waiting on the manager — or one the
+       manager rejected — is not the Store's to buy. */
+    const namedLines = cleaned.map(it => it.productId).filter(Boolean);
+    if (mongoose.Types.ObjectId.isValid(sourceMrfId) && namedLines.length) {
+      const source = await MRF.findById(sourceMrfId).lean();
+      if (source) {
+        const blocked = namedLines
+          .map(pid => (source.items || []).find(l => String(l._id) === String(pid)))
+          .filter(l => l && !itemApproval.isWithStore(l, source));
+        if (blocked.length) {
+          return res.status(400).json({
+            success: false,
+            message: `${blocked.map(l => `"${l.rawItemName}"`).join(", ")} ${blocked.length === 1 ? "has" : "have"} not been approved by the manager, so no purchase form can be raised for ${blocked.length === 1 ? "it" : "them"}.`,
+          });
+        }
+      }
+    }
 
     const requisition = new Requisition({
       items: cleaned,
