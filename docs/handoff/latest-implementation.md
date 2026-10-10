@@ -1,123 +1,116 @@
-# Latest implementation — the genuine CLO T-shirt, mapped and draped through the UI
+# Latest implementation — the /onboarding launcher as an actionables dashboard
 
-2 Oct 2026. **Committed on `NEW_CMS_BRANCH` in both repositories. Nothing pushed.**
+10 Oct 2026. **Committed and pushed on `NEW_CMS_BRANCH` in both repositories**
+(owner's request: "the onboarding page should look like a proper dashboard,
+the actionables of the entire CMS — if a person has access to five apps, that
+should be the screen for their actionables").
 
-A pattern maker can import `clo-tshirt-aama.dxf`, map all ten seams of the
-garment by clicking the pattern, save, reload, drape at Normal, and reopen the
-stored drape. That was done end to end in the browser against a throwaway
-MongoDB, and the six faults found on the way are the whole of this change.
+The previous handoff (the CLO T-shirt drape, 2 Oct 2026) is in git history.
 
-The verdict is **a complete T-shirt preview, not a fit-approval surface.** Every
-mapped seam closes, the garment is symmetric, and the cloth is not being
-stretched — but the drape ends at 0.1 mm per frame against the 0.05 mm this
-quality settles to, and it is sewn on the CUT boundary, so every dimensional
-finding is withheld and the screen says "Preview — not fully settled". It is
-never labelled fit approved.
+## What it does
 
-## What the garment did
+`/onboarding` (frontend `components/onboarding/DepartmentPortal.js`) used to be
+a grid of application tiles. It is now a dashboard for every application the
+person holds:
 
-Normal, 534 frames, ~22 s in the browser. Mean seam gaps, in the order the
-screen lists them:
+- greeting, date and a one-line summary ("13 items need your attention in 2
+  applications, 1 of them urgent"), with a Refresh button and an updated time;
+- four summary figures: waiting on you, urgent, applications with work, all clear;
+- **Needs your attention**: one ranked list across all applications (urgent →
+  needs action → to do, then by count). A line switches into the application
+  the way a tile always has (`switch-department`) and lands on the page that
+  lists those records;
+- **By application**: the busiest applications, each with a bar;
+- **Your applications**: one card per tile with its role, up to three to-do
+  lines, and a real state: loading, all clear, couldn't check, or "open to see
+  its work" for an application with no to-do list on the dashboard.
 
-| seam | declared | closed to |
-|---|---|---|
-| Left armhole | 53.3 cm | 4.5 mm |
-| Right armhole | 53.3 cm | 3.6 mm |
-| Left shoulder | 17.1 cm | 3.6 mm |
-| Right shoulder | 17.1 cm | 4.1 mm |
-| Left side seam | 40.0 cm | 0.4 mm |
-| Right side seam | 40.0 cm | 0.3 mm |
-| Left sleeve underarm | 14.9 cm | 1.5 mm |
-| Right sleeve underarm | 14.9 cm | 1.0 mm |
-| Neck band attachment | 55.8 cm | 5.1 mm |
-| Neck band join | 4.1 cm | 2.0 mm |
+## Backend
 
-Cloth under tension 259.9% at the worst point, **3.10% on average**. No edge
-left unsewn, no piece sewn to two things, no NaN. The 2D source is byte-identical
-to the file afterwards: 5 pieces, 540 outline points, unit `in`, factor 25.4.
+`GET /api/me/actionables` (`routes/Access/actionables.js`, mounted in
+`server.js` beside `/api/department-team`; it reads its own session through
+`services/cmsSession`).
 
-## The sleeve cap is four runs, and the pattern has no fault
+- `services/actionables/actionables.service.js`: the applications counted are
+  exactly `listAccessibleApps` (the tiles' own resolver). All applications are
+  asked at once, each provider under `ACTIONABLES_PROVIDER_TIMEOUT_MS` (6 s).
+  A failure is "unavailable", never "all clear". The answer is memoised per
+  identity + token version for `ACTIONABLES_CACHE_MS` (30 s; 0 disables), and
+  `?fresh=1` skips the memo.
+- `actionablesSummary.js` (pure) ranks the items, drops zero counts, keeps only
+  in-app paths (never a URL) and builds the totals.
+- `actionableProviders.js` holds one provider per department slug. Each filter
+  is the one the department's own list or overview uses, cited in the file.
+  Role rules:
+  - a viewer is shown nothing to act on;
+  - work to do needs write;
+  - a decision needs approve;
+  - the approval queue (`ChangeRequest`) shows an approver the department's
+    pending holds, and an editor only their own.
 
-The earlier reading of this file put the sleeve cap 27.8% away from the armhole
-and looked like a pattern that needed gathering. It does not. The sleeve's single
-41.7 cm run is the straight **hem**; the cap is the four published runs between
-the two underarm points, and together they are 53.4 cm against a front-plus-back
-armhole of 53.3 cm — **0.1% ease**. A different run interpretation, not a
-mismatch and not gathering.
+  Company-stamped models read the canonical (primary) company **or** no
+  company: the non-strict read-through. Demo companies are never counted.
+- No provider yet for CEO, the finishing stages or embroidery: none has a
+  stored, countable queue. Their cards say "open to see its work".
 
-The combinations a person selected, recorded so they can be checked:
+| App | Counts |
+|---|---|
+| HR | leave and regularizations to decide, document requests, held changes |
+| Sales | your overdue follow-ups, customer requests pending, held changes |
+| Merchandising | new developments, awaiting approval, clarifications |
+| Accounting (approver) | approval requests, spend at finance review |
+| Store | overdue POs, MRFs to review, requests to classify, approved purchases to order, draft POs, deliveries expected |
+| MPC | measurements still collecting people |
+| Cutting | work orders to cut (Cutting's own `workOrderScope`) |
+| QC | pieces waiting for re-inspection (`pendingReworkSnapshot`) |
+| Packaging | packed cartons not dispatched, cartons to weigh |
+| PPC | orders not yet planned, held changes (`project-manager` slug) |
+| IE | method studies and bulletins in review (approver), held changes |
+| Maintenance | overdue jobs, repairs awaiting a report, open jobs (only where `maintenance_orders` exists) |
+| Marketing | enquiries held for review, handovers returned |
+| Board (approver) | policy drafts |
+| Developer | new alerts, acknowledged unresolved alerts |
 
-- **cap, both sleeves** — `1→30`, `30→60`, `60→90`, `90→120`, in that order and
-  the same direction on both sleeves. Reversing one of them to "match the mirror"
-  is wrong and cost 27 mm on the right armhole.
-- **armhole** — front `underarm→shoulder`, then back `shoulder→underarm`, which
-  is one continuous stretch crossing the shoulder seam: `60→31` + `113→84` on the
-  left, `64→93` + `51→80` on the right. Paired start-to-start.
-- **neck opening** — six runs: front `95→0`, `0→29`, then back `115→134`,
-  `134→0`, `0→29`, `29→49` = 58.2 cm, against a 53.4 cm rib band. The band is
-  8.9% shorter **on purpose**, which is why the ease tolerance belongs to a run's
-  role and not to seams in general.
+## Also in this change: the app-access resolver restored
 
-## The six faults, all invisible to what was already checking
+`ab4dc21` (9 Oct, "maintenance reports …") deleted
+`services/access/appAccess.service.js` while `routes/auth/deptAuth.js` still
+requires it, so `/api/auth/login` and `/verify` threw MODULE_NOT_FOUND on this
+branch. It was restored from `main`'s 8 Oct version (the one-read grant index).
 
-1. **A ring on the pattern was not a click target.** Anchors were drawn inside a
-   `pointerEvents="none"` group, so a click aimed at one fell through and merely
-   selected the piece underneath.
-2. **A proposed run was measured in the file's own unit.** This export is in
-   inches, so the pick bar read 0.7 cm for a 17.1 cm shoulder seam.
-3. **Reverse wrote a word nothing reads.** It set `direction`; the solver chooses
-   between the two stretches joining a pair of ends by `theLongWay`, which had no
-   field to be stored in.
-4. **Both sleeves were placed on the left arm.** Handedness came only from a
-   piece's name and this file calls them `Pattern_1621764/5`. Readiness passed
-   nine steps of nine, every seam length matched, every run was confirmed and the
-   drape settled — with a 213 mm average gap on the right armhole. A sleeve also
-   hung 70 mm outboard of the shoulder point, dragging the shoulder seam open.
-5. **Readiness compared inches with millimetres.** R5 divided a perimeter in the
-   file's unit by seam lengths in millimetres, so one mapped shoulder seam made a
-   whole panel pass as fully sewn; and R7 refused the side seams for being
-   "0.0% apart where this seam allows 0%", which is floating-point noise on two
-   lengths that are 400.2140 mm each.
-6. **A finished drape was discarded for being 12 characters too wordy.** The
-   sentence explaining why a cut-boundary drape withholds its chest measurement
-   is 412 characters against a 400 cap, so every such drape failed to save and
-   the browser was told "Something went wrong."
+**Not fixed — the owner's call.** The same commit also:
 
-Plus one reporting fault: **2639% strain was ten edges a tenth of a millimetre
-long**, out of 11,328. The screen now names the exclusion and its size.
+- deleted `services/access/accessGrantAdmin.service.js`, which
+  `routes/Access/departmentTeam.js` and `routes/Accountant_Routes/Acc_team.js`
+  still require;
+- deleted `services/cctv/{cctvLink,config,manager}.js`;
+- removed 89 `app.use` lines from `server.js` and added 7.
 
-## Tests
+Unmounted at HEAD as a result:
 
-- frontend `node --test "components/rnd/fit/*.test.mjs"` — **177 pass**
-- backend `npx jest test/rnd/` — **354 pass**
+- the `hrContract()` guards;
+- `/api/cms/ppc`, `/api/cms/ie`, `/api/cms/merchandising`, `/api/cms/marketing`,
+  `/api/cms/maintenance`, `/api/cms/board/policies`, `/api/costings`;
+- QC raw items, finishing, carton dispatch, and more.
 
-Each fault has a regression test that fails without its fix, verified by
-reverting the fix and re-running. `run.test.mjs` now asserts the thing no
-tolerance can be traded against: **Normal must close every seam tighter than
-Draft and end at a lower movement rate.** Gap bounds are each quality's own mesh
-spacing rather than round numbers, and the woven and the knit are asserted
-separately, because a poplin shoulder carrying two sleeves cannot close the last
-millimetres without stretching and the solver is built to let the cloth win.
+See `git show ab4dc21 -- server.js`. The dashboard's counts read the models
+directly and work either way, but the pages its lines open call those APIs.
 
-## What is still not true
+## Verification
 
-- **Not settled.** 0.1 mm per frame against 0.05 mm. Preview only.
-- **Sewn on the cut boundary.** A published sewing line is still not read into
-  the mesh, so a 10 mm allowance is unaccounted for — of the order of 40 mm round
-  a chest. Every dimensional finding is withheld, by the server, not by courtesy.
-- **One vertex at 259.9%.** At the tightest fold, where cloth turns through
-  nearly 180 degrees in two triangles. Known, pinned, not hidden.
-- **Near-duplicate outline points survive the weld.** The mesher still builds
-  0.12 mm edges from them, which carry a stiffness spike. Only the reporting of
-  that was fixed here, not the mesher.
-- **Draft is rough.** 17 mm shoulders and not settled. It is for seeing whether a
-  mapping sews at all.
-- The fabric is a preset, so W5 stands. No fit findings, no grab or pin, no trial
-  comparison, no trousers or jackets.
-
-## How it was verified
-
-`scripts/rnd/fit-verification-world.js` boots mongodb-memory-server on port
-27018 and seeds one company, one login and one style from the real DXF. It never
-reads `MONGODB_URI` and never touches Atlas. No Atlas collection was dropped and
-no unrelated database was modified.
+- `node --test services/actionables/*.test.js`: 15/15. That is 5 for the pure
+  summary, 3 for the service wiring with a stubbed resolver (only allowed apps
+  asked, timeout means unavailable, memo, refusal), and 7 for the providers
+  against recording stand-ins (role rules, company read-through, filters).
+- Every provider filter was cast against its real Mongoose schema, with no
+  database. Every path exists and every value casts; the checker was confirmed
+  to catch a misspelled path.
+- `npm test`: 2201 pass, 1 fail. The failure is
+  `services/openItems.test.js` (`agedBillsForLedger`), which this change does
+  not touch.
+- Frontend: `components/onboarding/actionables.test.mjs` passes 6/6 under the
+  repo's runner. Both changed components parse, and the dashboard
+  server-renders without error in the data, loading and failed states.
+- **Not done:** no run against a live database (no `.env` in this
+  environment), so no real counts were seen, and nothing was viewed in a
+  browser.
