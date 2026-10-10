@@ -13,6 +13,7 @@
 // =============================================================================
 
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
@@ -302,10 +303,158 @@ router.get("/", companyScope, async (req, res) => {
         ? { voucherNumber: -1 }
         : { voucherDate: -1, createdAt: -1 };
 
-    const list = await Acc_ProformaInvoice.find(filter)
+    let list = await Acc_ProformaInvoice.find(filter)
       .sort(sortSpec)
       .limit(parseInt(limit, 10))
       .lean();
+
+    /* ── EVERY PROFORMA FINDS ITS OWN ORDER ──────────────────────────────
+       Sales raises a PI; approving it is what creates the MO. So a proforma
+       with no order behind it was never approved, and the list shows only
+       the ones that have one — `?withOrder=all` shows the rest, because
+       hiding a document the company really issued is worse than listing it.
+
+       Nothing stores the relationship (the accounting proforma and the sales
+       PI are different documents in different systems), so it is derived —
+       and only ever from evidence that cannot mean anything else: the order
+       number written on the proforma, or a buyer with exactly one order.
+       A buyer with several and no reference is left unmatched rather than
+       guessed at. See services/accounting/proformaOrderMatch.js.
+
+       A proven match is WRITTEN BACK, so it is resolved once and is
+       auditable afterwards rather than re-derived on every read. */
+    const matchInfo = new Map();
+    try {
+      const { resolveOrderForProforma, isProvenMatch } =
+        require("../../services/accounting/proformaOrderMatch");
+      const m = require("../../models/Customer_Models/CustomerRequest");
+      const Request = m.CustomerRequest || m;
+      const Cust = require("../../models/Customer_Models/Customer");
+
+      const unresolved = list.filter((pi) => !pi.customerRequestId);
+      if (unresolved.length) {
+        /* One pass for every buyer on the page rather than a query per PI. */
+        const { customerLookupForMany } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupForMany(unresolved.map((p) => p.buyer));
+        const customers = where
+          ? await Cust.find(where).select("name companyName gstin").lean()
+          : [];
+
+        const custIds = customers.map((c) => c._id);
+        const orders = custIds.length
+          ? await Request.find({ customerId: { $in: custIds } })
+              .select("requestId customerName customerId")
+              .lean()
+          : [];
+        const ordersByCustomer = new Map();
+        for (const o of orders) {
+          const k = String(o.customerId);
+          if (!ordersByCustomer.has(k)) ordersByCustomer.set(k, []);
+          ordersByCustomer.get(k).push(o);
+        }
+        const custByGstin = new Map(customers.filter((c) => c.gstin)
+          .map((c) => [String(c.gstin).trim().toUpperCase(), c]));
+        const custByName = new Map(customers.map((c) => [String(c.name || "").trim(), c]));
+
+        const writes = [];
+        for (const pi of unresolved) {
+          const cust =
+            custByGstin.get(String(pi.buyer?.gstin || "").trim().toUpperCase()) ||
+            custByName.get(String(pi.buyer?.name || "").trim());
+          const candidates = cust ? (ordersByCustomer.get(String(cust._id)) || []) : [];
+          const r = resolveOrderForProforma(pi, candidates);
+          matchInfo.set(String(pi._id), r);
+          if (isProvenMatch(r)) {
+            pi.customerRequestId = r.orderId;
+            pi.requestRef = r.requestRef;
+            writes.push({
+              updateOne: {
+                filter: { _id: pi._id },
+                update: { $set: { customerRequestId: r.orderId, requestRef: r.requestRef } },
+              },
+            });
+          }
+        }
+        if (writes.length) await Acc_ProformaInvoice.bulkWrite(writes, { ordered: false });
+      }
+    } catch (e) {
+      /* The list must still open if the manufacturing side is unavailable;
+         nothing is matched, and every PI simply reads as unlinked. */
+      console.error("[proforma list] order matching skipped:", e.message);
+    }
+
+    /* ── A FINISHED PROFORMA LEAVES THE LIST ────────────────────────────
+       Once every challan dispatched against a proforma's order carries an
+       invoice, there is nothing left for accounts to raise and the document
+       is history. It drops out of the working list; `?billing=all` brings
+       the finished ones back, because a document the company really issued
+       must stay reachable — this hides completed work, it deletes nothing.
+
+       TWO QUERIES FOR THE WHOLE PAGE, not two per row: the challans of
+       every listed order at once, then the vouchers naming any of those
+       challans. The invoice carries the reference (Acc_Voucher
+       .sourceChallans), so this reads the same link the dispatch panel
+       does and there is no second flag to fall out of step with it.
+
+       "Nothing dispatched yet" is NOT finished — see billingStanding. */
+    const billingByPi = new Map();
+    let finishedCount = 0;
+    try {
+      const { billingStanding } = require("../../services/accounting/proformaDispatch");
+      const orderIds = [...new Set(list.filter((p) => p.customerRequestId).map((p) => String(p.customerRequestId)))];
+      if (orderIds.length) {
+        const DispatchChallan = require("../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+        const Challan = DispatchChallan.DispatchChallan || DispatchChallan;
+        const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
+
+        const challans = await Challan.find({ manufacturingOrderId: { $in: orderIds } })
+          .select("_id manufacturingOrderId")
+          .lean();
+        const byOrder = new Map();
+        for (const c of challans) {
+          const k = String(c.manufacturingOrderId);
+          if (!byOrder.has(k)) byOrder.set(k, []);
+          byOrder.get(k).push(String(c._id));
+        }
+
+        const allChallanIds = challans.map((c) => c._id);
+        const billedIds = new Set();
+        if (allChallanIds.length) {
+          const vouchers = await Acc_Voucher.find({
+            companyId,
+            "sourceChallans.challanId": { $in: allChallanIds },
+          }).select("sourceChallans").lean();
+          for (const v of vouchers) {
+            for (const sc of v.sourceChallans || []) billedIds.add(String(sc.challanId));
+          }
+        }
+
+        for (const pi of list) {
+          if (!pi.customerRequestId) continue;
+          const ids = byOrder.get(String(pi.customerRequestId)) || [];
+          const st = billingStanding(ids.length, ids.filter((id) => billedIds.has(id)).length);
+          billingByPi.set(String(pi._id), st);
+          if (st.done) finishedCount += 1;
+        }
+      }
+    } catch (e) {
+      /* The list must still open when the dispatch side is unavailable.
+         Nothing is marked finished, so nothing is hidden — the safe way to
+         fail for a filter whose job is to REMOVE rows. */
+      console.error("[proforma list] billing standing skipped:", e.message);
+    }
+
+    const withOrder = list.filter((pi) => pi.customerRequestId);
+    const withoutOrder = list.length - withOrder.length;
+    if (String(req.query.withOrder || "linked") !== "all") list = withOrder;
+    if (String(req.query.billing || "open") !== "all") {
+      list = list.filter((pi) => !(billingByPi.get(String(pi._id)) || {}).done);
+    }
+    list = list.map((pi) => ({
+      ...pi,
+      orderMatch: matchInfo.get(String(pi._id)) || (pi.customerRequestId ? { how: "stored" } : null),
+      billing: billingByPi.get(String(pi._id)) || null,
+    }));
 
     // KPI strip data — counts per status + total value of accepted PIs
     const counts = list.reduce(
@@ -319,7 +468,16 @@ router.get("/", companyScope, async (req, res) => {
       { total: 0, totalValue: 0, acceptedValue: 0 },
     );
 
-    res.json({ success: true, proformaInvoices: list, summary: counts });
+    res.json({
+      success: true,
+      proformaInvoices: list,
+      summary: counts,
+      /* How many were left out for having no order. Named so the screen can
+         say it rather than quietly showing a shorter list. */
+      withoutOrder,
+      /* …and how many were left out for being finished. Same reason. */
+      finishedCount,
+    });
   } catch (e) {
     console.error("[proforma list]", e);
     res.status(500).json({ success: false, message: e.message });
@@ -380,6 +538,197 @@ router.get("/:id", companyScope, async (req, res) => {
     });
   } catch (e) {
     console.error("[proforma get]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// GET /:id/dispatch — what has been dispatched against this PI's order
+// -----------------------------------------------------------------------------
+// The accounts department bills what LEFT the factory, so this answers "what
+// has gone out against this proforma" in billable terms: product, variant,
+// quantity, the rate from the proforma's own line, and which challans say so.
+// The packing detail (which carton, which wearer) is deliberately rolled up —
+// see services/accounting/proformaDispatch.js.
+//
+// A PI with no linked order is not an error. It answers `linked: false` and
+// the screen offers to link one, because most proformas predate the link.
+// -----------------------------------------------------------------------------
+router.get("/:id/dispatch", companyScope, async (req, res) => {
+  try {
+    /* `buyer` and `buyersReference` ARE NOT OPTIONAL HERE. The matcher below
+       reads both — the order number written on the proforma is its strongest
+       proof, and the buyer is how the candidate orders are found at all.
+       Leaving them out of the projection made `pi.buyer` undefined, which
+       built a customer query with no criteria at all. See below. */
+    const pi = await Acc_ProformaInvoice.findById(req.params.id)
+      .select("customerRequestId requestRef items companyId buyer buyersReference")
+      .lean();
+    if (!pi) return res.status(404).json({ success: false, message: "Not found" });
+
+    /* Opened directly rather than through the list, so the match may not
+       have been derived yet. Same rule, same proof, same write-back — see
+       the list route. */
+    let orderMatch = pi.customerRequestId ? { how: "stored" } : null;
+    if (!pi.customerRequestId) {
+      try {
+        const { resolveOrderForProforma, isProvenMatch } =
+          require("../../services/accounting/proformaOrderMatch");
+        const m = require("../../models/Customer_Models/CustomerRequest");
+        const Request = m.CustomerRequest || m;
+        const Cust = require("../../models/Customer_Models/Customer");
+        /* Null when the buyer carries nothing to look one up by — see
+           customerLookupFor. An empty `$or` would match EVERYTHING. */
+        const { customerLookupFor } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupFor(pi.buyer);
+        const cust = where ? await Cust.findOne(where).select("_id").lean() : null;
+        const candidates = cust
+          ? await Request.find({ customerId: cust._id })
+              .select("requestId customerName customerId").lean()
+          : [];
+        const r = resolveOrderForProforma(pi, candidates);
+        orderMatch = r;
+        if (isProvenMatch(r)) {
+          await Acc_ProformaInvoice.updateOne(
+            { _id: pi._id },
+            { $set: { customerRequestId: r.orderId, requestRef: r.requestRef } },
+          );
+          pi.customerRequestId = r.orderId;
+          pi.requestRef = r.requestRef;
+        }
+      } catch (e) {
+        console.error("[proforma dispatch] order matching skipped:", e.message);
+      }
+    }
+
+    if (!pi.customerRequestId) {
+      return res.json({
+        success: true,
+        linked: false,
+        orderMatch,
+        order: null,
+        challans: [],
+        lines: [],
+        totals: { challanCount: 0, cartonCount: 0, units: 0, value: 0, productCount: 0, unpriced: 0 },
+      });
+    }
+
+    /* Required lazily and guarded: the manufacturing models live in another
+       part of the tree, and accounting must not fail to open a PI because a
+       CMS model moved. */
+    let DispatchChallan = null;
+    let CustomerRequest = null;
+    try {
+      DispatchChallan = require("../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+      CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+    } catch (e) {
+      console.error("[proforma dispatch] manufacturing models unavailable:", e.message);
+      return res.json({
+        success: true,
+        linked: true,
+        unavailable: "The dispatch module is not available on this deployment.",
+        order: { _id: String(pi.customerRequestId), requestId: pi.requestRef || "" },
+        challans: [], lines: [],
+        totals: { challanCount: 0, cartonCount: 0, units: 0, value: 0, productCount: 0, unpriced: 0 },
+      });
+    }
+
+    const Challan = DispatchChallan.DispatchChallan || DispatchChallan;
+    const Request = CustomerRequest.CustomerRequest || CustomerRequest;
+
+    const [challans, order] = await Promise.all([
+      Challan.find({ manufacturingOrderId: pi.customerRequestId })
+        .sort({ createdAt: 1 })
+        .lean(),
+      Request.findById(pi.customerRequestId)
+        .select("requestId customerName status customerInfo")
+        .lean(),
+    ]);
+
+    /* WHICH OF THESE HAS ALREADY BEEN BILLED.
+       The invoice carries the reference (Acc_Voucher.sourceChallans), so this
+       is one query and there is no flag on the challan to fall out of step
+       with it. A challan with an invoice is shown as spent and cannot be
+       ticked again — billing a dispatch twice is the fault the link exists
+       to stop. */
+    const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
+    const challanIds = challans.map((c) => c._id);
+    const billed = challanIds.length
+      ? await Acc_Voucher.find({
+          companyId: pi.companyId,
+          "sourceChallans.challanId": { $in: challanIds },
+        })
+          .select("voucherNumber voucherDate voucherType sourceChallans")
+          .lean()
+      : [];
+    const invoiceByChallan = new Map();
+    for (const v of billed) {
+      for (const sc of v.sourceChallans || []) {
+        invoiceByChallan.set(String(sc.challanId), {
+          _id: String(v._id),
+          voucherNumber: v.voucherNumber,
+          voucherDate: v.voucherDate,
+        });
+      }
+    }
+    const withInvoice = challans.map((c) => ({
+      ...c,
+      invoice: invoiceByChallan.get(String(c._id)) || null,
+    }));
+
+    const { dispatchRollup } = require("../../services/accounting/proformaDispatch");
+    /* The figures default to what is still BILLABLE, because that is the
+       question the panel is open to answer. The challan list still shows
+       every challan, billed or not, so nothing is hidden. */
+    const billable = withInvoice.filter((c) => !c.invoice).map((c) => String(c._id));
+
+    /* A SELECTION, when the caller names one (?challans=a,b,c).
+       The invoice form asks with the challans the user ticked, so the lines
+       and the totals it prefills are exactly what those challans dispatched —
+       and the same guard runs here as on the screen, because a URL can be
+       typed and the screen's check is a courtesy, not the rule. */
+    const asked = String(req.query.challans || "")
+      .split(",").map((x) => x.trim()).filter(Boolean);
+    let guard = null;
+    let only = billable;
+    if (asked.length) {
+      const known = new Set(withInvoice.map((c) => String(c._id)));
+      const unknown = asked.filter((id) => !known.has(id));
+      const chosen = withInvoice.filter((c) => asked.includes(String(c._id)));
+      const { selectionGuard } = require("../../services/accounting/proformaDispatch");
+      guard = unknown.length
+        ? { ok: false, reason: `Not a challan of this order: ${unknown.join(", ")}.`, customers: [], alreadyInvoiced: [] }
+        : selectionGuard(chosen);
+      only = chosen.map((c) => String(c._id));
+    }
+
+    const rolled = dispatchRollup(withInvoice, pi.items, { only });
+    /* …and the full list, so the panel can show the spent ones too. */
+    const { challanSummary } = require("../../services/accounting/proformaDispatch");
+    rolled.challans = withInvoice.map(challanSummary);
+
+    res.json({
+      success: true,
+      linked: true,
+      order: order
+        ? {
+            _id: String(order._id),
+            requestId: order.requestId || pi.requestRef || "",
+            customerName: order.customerName || "",
+            status: order.status || "",
+          }
+        : { _id: String(pi.customerRequestId), requestId: pi.requestRef || "", missing: true },
+      /* Present only when a selection was asked for. `ok: false` means the
+         caller must not raise an invoice from it — the reason is the
+         sentence to show. */
+      orderMatch,
+      guard,
+      selection: asked.length ? asked : null,
+      billableChallanIds: billable,
+      ...rolled,
+    });
+  } catch (e) {
+    console.error("[proforma dispatch]", e);
     res.status(500).json({ success: false, message: e.message });
   }
 });
@@ -486,6 +835,11 @@ router.post("/", companyScope, async (req, res) => {
       buyer: body.buyer,
       consignee,
       partyLedgerId: body.partyLedgerId || undefined,
+      /* The order this proforma is for, when the form linked one. Both are
+         optional and both are stored: the id is the join to dispatch, the
+         ref is what a list prints. */
+      customerRequestId: body.customerRequestId || null,
+      requestRef: body.requestRef || "",
       buyersReference: body.buyersReference,
       dispatchedThrough: body.dispatchedThrough,
       destination: body.destination,
@@ -538,6 +892,8 @@ router.put("/:id", companyScope, async (req, res) => {
       "buyer",
       "consignee",
       "partyLedgerId",
+      "customerRequestId",
+      "requestRef",
       "buyersReference",
       "dispatchedThrough",
       "destination",
@@ -593,6 +949,71 @@ const VALID_TRANSITIONS = {
   expired: ["draft"],
   cancelled: [],
 };
+
+// -----------------------------------------------------------------------------
+// PATCH /:id/order-link — point this PI at a manufacturing order (or clear it)
+// -----------------------------------------------------------------------------
+// Separate from PUT /:id on purpose. That route refuses an accepted or
+// cancelled PI because it edits FIGURES, and rightly so — but an ACCEPTED
+// proforma is precisely the one somebody bills a dispatch against, so
+// requiring a revert-to-draft to record which order it belongs to would mean
+// unwinding an acceptance to add a reference.
+//
+// This changes no amount, no tax and no line: it writes an id and the order's
+// human number, and nothing downstream recomputes. Cancelled is still refused
+// — a voided document should not grow new links.
+// -----------------------------------------------------------------------------
+router.patch("/:id/order-link", companyScope, async (req, res) => {
+  try {
+    const pi = await Acc_ProformaInvoice.findById(req.params.id);
+    if (!pi) return res.status(404).json({ success: false, message: "Not found" });
+    if (pi.status === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This proforma is cancelled — it cannot be linked to an order.",
+      });
+    }
+
+    const { customerRequestId = null, requestRef = "" } = req.body || {};
+
+    if (customerRequestId) {
+      if (!mongoose.Types.ObjectId.isValid(String(customerRequestId))) {
+        return res.status(400).json({ success: false, message: "That is not a valid order id." });
+      }
+      /* Proved to exist before it is stored: a dangling id would show the
+         panel an order that is not there and read as a dispatch failure. */
+      let Request = null;
+      try {
+        const m = require("../../models/Customer_Models/CustomerRequest");
+        Request = m.CustomerRequest || m;
+      } catch { Request = null; }
+      if (Request) {
+        const order = await Request.findById(customerRequestId).select("requestId").lean();
+        if (!order) {
+          return res.status(404).json({ success: false, message: "That order no longer exists." });
+        }
+        pi.requestRef = String(requestRef || order.requestId || "").trim();
+      } else {
+        pi.requestRef = String(requestRef || "").trim();
+      }
+      pi.customerRequestId = customerRequestId;
+    } else {
+      pi.customerRequestId = null;
+      pi.requestRef = "";
+    }
+
+    pi.updatedBy = req.user?.id;
+    await pi.save();
+    res.json({
+      success: true,
+      customerRequestId: pi.customerRequestId ? String(pi.customerRequestId) : null,
+      requestRef: pi.requestRef || "",
+    });
+  } catch (e) {
+    console.error("[proforma order-link]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
 
 router.patch("/:id/status", async (req, res) => {
   try {

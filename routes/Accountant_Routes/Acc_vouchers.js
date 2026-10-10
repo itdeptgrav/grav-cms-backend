@@ -3560,6 +3560,74 @@ router.post("/", auth, companyScope, async (req, res) => {
     // Resolve / canonicalise ledger entries (ids, names, auto-create by name).
     await resolveLedgerEntries(body.ledgerEntries, body.companyId);
 
+    /* ── A DISPATCH IS BILLED ONCE, AND TO ONE CUSTOMER ──────────────────
+       The screen refuses both before it offers the button, but a body can be
+       posted without the screen and these two are not correctable after the
+       fact: an invoice naming the wrong buyer, or a second invoice for goods
+       already billed, are both re-issues rather than edits. Enforced here,
+       where the document is actually written.
+
+       Only runs when the body claims challans; every other voucher is
+       untouched. */
+    if (Array.isArray(body.sourceChallans) && body.sourceChallans.length) {
+      const ids = body.sourceChallans
+        .map((c) => c && c.challanId)
+        .filter(Boolean)
+        .map(String);
+      if (ids.length !== body.sourceChallans.length) {
+        return res.status(400).json({ error: "Every source challan needs a challanId." });
+      }
+      if (new Set(ids).size !== ids.length) {
+        return res.status(400).json({ error: "The same challan is listed twice on this invoice." });
+      }
+      /* A value that is not an object id must be refused HERE. Passed to
+         `find({_id: {$in: ids}})` it throws a Mongoose CastError, which the
+         handler returns verbatim — so the caller got
+         `Cast to ObjectId failed for value "…" at path "_id" for model
+         "DispatchChallan"`, an internal message in place of an answer. */
+      const notAnId = ids.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+      if (notAnId.length) {
+        return res.status(400).json({
+          error: `Not a challan reference: ${notAnId.join(", ")}.`,
+        });
+      }
+
+      let Challan = null;
+      try {
+        const m = require("../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+        Challan = m.DispatchChallan || m;
+      } catch { Challan = null; }
+
+      if (Challan) {
+        const docs = await Challan.find({ _id: { $in: ids } })
+          .select("challanNumber manufacturingOrderId customerName")
+          .lean();
+        if (docs.length !== ids.length) {
+          return res.status(400).json({ error: "One or more of those challans no longer exists." });
+        }
+
+        const alreadyBilled = await Acc_Voucher.find({
+          companyId: body.companyId,
+          "sourceChallans.challanId": { $in: ids },
+        }).select("voucherNumber sourceChallans").lean();
+        if (alreadyBilled.length) {
+          const names = new Set();
+          for (const v of alreadyBilled) {
+            for (const sc of v.sourceChallans || []) {
+              if (ids.includes(String(sc.challanId))) names.add(`${sc.challanNumber || sc.challanId} (${v.voucherNumber})`);
+            }
+          }
+          return res.status(409).json({
+            error: `Already invoiced: ${[...names].join(", ")}. A dispatch is billed once.`,
+          });
+        }
+
+        const { selectionGuard } = require("../../services/accounting/proformaDispatch");
+        const guard = selectionGuard(docs);
+        if (!guard.ok) return res.status(400).json({ error: guard.reason });
+      }
+    }
+
     const voucher = new Acc_Voucher(body);
 
     /* A default narration when the box was left empty — see
