@@ -1271,6 +1271,11 @@ app.use("/api/change-requests", require("./routes/Access/changeRequests"));
    the header of the router for what it refuses and why. */
 app.use("/api/department-team", require("./routes/Access/departmentTeam"));
 
+/* The /onboarding dashboard's to-do counts across every application the
+   caller holds (10 Oct 2026). Reads its own session, like the two routers
+   above — see routes/Access/actionables.js. */
+app.use("/api/me", require("./routes/Access/actionables"));
+
 /* The developer side: cross-department history, anomaly alerts, live
    settings, job heartbeats. Access = platform admin or a role in the
    `developer` department (granted from CEO → Access Control). */
