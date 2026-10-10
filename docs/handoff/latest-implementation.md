@@ -1,4 +1,97 @@
-# Latest implementation — the /onboarding launcher as an actionables dashboard
+# Latest implementation — the employee home on /onboarding
+
+10 Oct 2026, later. Built on the actionables dashboard below. Owner's brief:
+"Employee Home Dashboard", plus "make sure the UI matches our apps, it
+shouldn't look alien". The owner chose to **only show what exists**: no
+company pulse, announcements, kudos, events, training or tickets, and no
+sample content. The people directory exposes name, role, department and photo
+only. Leave and payslip drawers are offered to employee logins.
+
+## Backend
+
+- `GET /api/me/home` (`routes/Access/meHome.js`, mounted in `server.js`
+  right after `/api/me/actionables`). Behind `authenticateCmsSession`,
+  `Cache-Control: private, no-store`.
+- `services/home/employeeHome.service.js`:
+  - It resolves the session to its HR `Employee`. An employee login by `_id`.
+    A department account by `employeeRef`, then badge → `biometricId`, then
+    email. An accountant by email.
+  - It reads nine sections side by side. Each has a 6 s timeout and answers
+    `ok`, `none` (nothing to read for this person) or `unavailable`, never a
+    fake zero.
+  - The sections:
+    - today's attendance (`DailyAttendance`);
+    - the person's open and coming leave;
+    - pending regularizations and document requests;
+    - planner tasks overdue or due today;
+    - today's interviews (`EmployeeTask`);
+    - today's Cowork meetings (Firestore `cowork_scheduled_meets`,
+      `participants` array-contains);
+    - the next holidays (`CompanyHoliday`);
+    - who is on approved leave today;
+    - birthdays, work anniversaries and new joiners (company people memoised
+      10 min; the birth year is never sent).
+  - The answer is memoised per identity for `HOME_CACHE_MS` (30 s);
+    `?fresh=1` skips it.
+  - `me.selfService` is true only for an employee login. The
+    `/api/employee/**` routes read the token id as the Employee `_id`, so
+    leave and payslips from the home work only there.
+- `GET /api/me/people?q=` searches colleagues: at least 2 characters, every
+  word must match, at most 8 results, `{id, name, role, department, photo}`
+  only.
+- `services/home/homeDates.js` (pure): IST day arithmetic (the
+  `Date.now() + 5.5h` / `getUTC*` pattern) and `peopleMoments`, which handles
+  the year-end wrap and Feb 29 shown on Feb 28.
+- Tests: `homeDates.test.js` (8) and `employeeHome.service.test.js` (5), all
+  passing. `npm test`: 2308 / 2309. The one failure is
+  `agedBillsForLedger … pre-migration inline output`, and it fails identically
+  without these changes.
+- No new collection (the cluster is at its cap) and no write anywhere.
+
+## Frontend (grav-cms, `components/home/`)
+
+- `HomeDashboard.js` lays out:
+  - a greeting, date and context line;
+  - a search pill (Ctrl/⌘K);
+  - a 12-column bento from `deck`: attention 8 | today 4, apps 8 | quick
+    actions 4, people full width;
+  - two columns on a tablet, and one column on a phone in priority order.
+- The sections:
+  - `AttentionPanel`: own items plus every application's queue, urgent first,
+    6 rows then "Show all".
+  - `TodayPanel`: attendance, schedule, holidays, away.
+  - `AppLauncher`: pin, reorder and recent apps, kept in localStorage.
+  - `QuickActionsPanel`: only actions that exist, plus the leave balance for
+    an employee login.
+  - `PeoplePanel`.
+  - `CommandPalette`: cmdk, covering applications, actions and people.
+  - `LeaveDrawer`: the app's own `POST /api/employee/leave-applications` and
+    withdraw.
+  - `PayslipDrawer`: the app's own history and PDF.
+- The rules are in `homeModel.mjs` (9 tests).
+- Every request sends the session as `Authorization: Bearer` (`authHeaders`).
+  `/api/employee/**` does not read the CMS `auth_token` cookie.
+- Built on the `.grav-ui` tokens, `components/marketing/ui` and the CEO
+  primitives. The header wears the shared `AccountMenu`. The old
+  `ActionablesDashboard.js` was removed (nothing referenced it).
+- The launcher's tile grid and the leave-balance row use
+  `grid-cols-[repeat(3,minmax(0,1fr))]` on purpose: `globals.css` folds any
+  plain `grid-cols-3` to one column under 768 px.
+- Checked rendered at 1440, 820 and 390 px with stubbed APIs. No horizontal
+  overflow, every control has an accessible name, Ctrl+K focuses the search,
+  Escape closes it and returns focus. Not yet seen against the live backend in
+  a browser.
+
+## Not built, because nothing stores it
+
+Announcements, kudos, events, training, tickets, room booking, expenses and a
+notification inbox. Regularization and HR-document requests are counted but
+are worked in the GRAV app. Leave and payslips stay in the app for
+non-employee logins.
+
+---
+
+# Earlier the same day — the /onboarding launcher as an actionables dashboard
 
 10 Oct 2026. **Committed and pushed on `NEW_CMS_BRANCH` in both repositories**
 (owner's request: "the onboarding page should look like a proper dashboard,

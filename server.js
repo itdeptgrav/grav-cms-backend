@@ -1447,6 +1447,9 @@ app.use("/api/department-team", require("./routes/Access/departmentTeam"));
    caller holds (10 Oct 2026). Reads its own session, like the two routers
    above — see routes/Access/actionables.js. */
 app.use("/api/me", require("./routes/Access/actionables"));
+/* The employee home on /onboarding: the person's own day and a minimal
+   colleague search (10 Oct 2026) — see routes/Access/meHome.js. */
+app.use("/api/me", require("./routes/Access/meHome"));
 
 /* The developer side: cross-department history, anomaly alerts, live
    settings, job heartbeats. Access = platform admin or a role in the
