@@ -7,6 +7,37 @@ company pulse, announcements, kudos, events, training or tickets, and no
 sample content. The people directory exposes name, role, department and photo
 only. Leave and payslip drawers are offered to employee logins.
 
+## Work first, personal second (owner, 10 Oct 2026, later still)
+
+"Less personal … more about actionables and tasks and data about the role",
+then "don't completely remove personal data, keep it secondary".
+
+- **Backend:** `/api/me/home` gains `tasks` (Firestore `cowork_tasks`,
+  keyed on the Cowork id).
+  - `items` are the person's open / in-progress tasks (`assigneeIds`), minus
+    finally-approved ones. Overdue come first; each carries progress, due,
+    `sentBack` and `inReview`.
+  - The counts are open, overdue, dueToday and sentBack.
+  - `toReview` / `reviewItems` are `pending_tl_review` submissions on tasks
+    this person approves (`approverId`) or assigned (`assignedBy`).
+  - It uses the same queries the workload route and cowork.service already
+    run, so no new Firestore index is needed.
+- **Work, at the top:**
+  - The hero's dial is the workload by urgency (items, the same counting rule
+    as the urgency figures).
+  - "Needs your attention" lists Cowork, planner and application queues only.
+    The person's own leave and attendance corrections moved to the personal
+    card (`personalItems`).
+  - "Your tasks" (`TasksPanel.js`).
+  - "Your work by application", with the role in each and its queue lines
+    (`RolesPanel.js`, from `/api/me/actionables` `apps`).
+  - Today's schedule and quick actions.
+- **Personal, under a quiet "Personal" heading:**
+  - "You": attendance, a thin shift bar, small leave rings, your requests,
+    and Time off / Payslips.
+  - The calendar, which now also marks Cowork task deadlines.
+  - "Around GRAV": who is away, and a compact celebrations list.
+
 ## Rebuilt the same evening (owner: "not even close to the reference … boring")
 
 The layout now follows the reference pack's structure, using only real data:

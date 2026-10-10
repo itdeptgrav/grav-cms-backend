@@ -61,13 +61,34 @@ function install({ leaveFails = false } = {}) {
     { _id: "t1", title: "Send tech pack", status: "todo", dueOn: new Date("2026-10-08T00:00:00Z") },
     { _id: "t2", title: "Call mill", status: "doing", dueOn: new Date("2026-10-10T00:00:00Z") },
   ]) });
-  M.firestore = () => ({
-    collection: () => ({ where: () => ({ get: async () => ({ forEach: (fn) => [
-      { id: "m1", data: () => ({ title: "Fit review", dateTime: "2026-10-10T15:00:00+05:30", participants: ["GR0067"], createdBy: "GR0067", googleMeetLink: "https://meet.google.com/x" }) },
-      { id: "m2", data: () => ({ title: "Tomorrow", dateTime: "2026-10-11T10:00:00+05:30" }) },
-      { id: "m3", data: () => ({ title: "Cancelled", dateTime: "2026-10-10T11:00:00+05:30", isCancelled: true }) },
-    ].forEach(fn) }) }) }),
+  const MEETS = [
+    { id: "m1", data: () => ({ title: "Fit review", dateTime: "2026-10-10T15:00:00+05:30", participants: ["GR0067"], createdBy: "GR0067", googleMeetLink: "https://meet.google.com/x" }) },
+    { id: "m2", data: () => ({ title: "Tomorrow", dateTime: "2026-10-11T10:00:00+05:30" }) },
+    { id: "m3", data: () => ({ title: "Cancelled", dateTime: "2026-10-10T11:00:00+05:30", isCancelled: true }) },
+  ];
+  const TASKS = [
+    { id: "c1", data: () => ({ title: "Cut sample", assigneeIds: ["GR0067"], status: "open", dueDate: "2026-10-08", progressPercent: 20 }) },
+    { id: "c2", data: () => ({ title: "Fix grading", assigneeIds: ["GR0067"], status: "in_progress", fixedDeadline: "2026-10-10T17:00:00+05:30", completionStatus: "rejected_by_tl" }) },
+    { id: "c3", data: () => ({ title: "Done one", assigneeIds: ["GR0067"], status: "in_progress", completionStatus: "tl_final_approved" }) },
+    { id: "c4", data: () => ({ title: "Review me", approverId: "GR0067", completionStatus: "pending_tl_review", completionProof: { submittedByName: "Ravi" } }) },
+    { id: "c5", data: () => ({ title: "Review me too", assignedBy: "GR0067", completionStatus: "pending_tl_review" }) },
+    { id: "c6", data: () => ({ title: "Not yet", assignedBy: "GR0067", completionStatus: null }) },
+  ];
+  // A chainable query: the filters it was given decide which rows come back.
+  const query = (rows, filters = []) => ({
+    where: (field, op, value) => query(rows, [...filters, [field, op, value]]),
+    orderBy: () => query(rows, filters),
+    limit: () => query(rows, filters),
+    get: async () => ({
+      forEach: (fn) => rows.filter((r) => filters.every(([f, op, v]) => {
+        const x = r.data()[f];
+        if (op === "array-contains") return Array.isArray(x) && x.includes(v);
+        if (op === "in") return v.includes(x);
+        return x === v;
+      })).forEach(fn),
+    }),
   });
+  M.firestore = () => ({ collection: (name) => query(name === "cowork_tasks" ? TASKS : MEETS) });
 }
 
 test("an employee login is themselves, and may self-serve", async () => {
@@ -89,6 +110,10 @@ test("an employee login is themselves, and may self-serve", async () => {
   assert.ok(Array.isArray(s.holidays.month), "the calendar's month of holidays is sent");
   assert.deepEqual(s.holidays.range, { from: "2026-10-01", before: "2026-12-01" });
   assert.deepEqual(out.shift, { start: "09:30", end: "18:30" });
+  assert.equal(s.tasks.status, "ok");
+  assert.deepEqual(s.tasks.items.map((t) => t.id), ["c1", "c2"], "overdue first; a finally-approved task is not open");
+  assert.deepEqual([s.tasks.open, s.tasks.overdue, s.tasks.dueToday, s.tasks.sentBack], [2, 1, 1, 1]);
+  assert.deepEqual(s.tasks.reviewItems.map((t) => t.id).sort(), ["c4", "c5"]);
   assert.deepEqual(s.people.birthdays.map((p) => p.name), ["Rishi Das"]);
   assert.deepEqual(s.people.joiners.map((p) => p.name), ["Asha Rao"]);
 });

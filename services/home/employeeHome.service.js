@@ -257,6 +257,73 @@ async function meetingsSection(emp, now) {
   return { status: "ok", items: items.slice(0, 10) };
 }
 
+/* ── Cowork tasks ────────────────────────────────────────────────────────
+   `assigned`: open / in-progress tasks on this person (`assigneeIds`), minus
+   ones already finally approved — the same query the workload route runs.
+   `toReview`: work submitted for completion review (`pending_tl_review`) on a
+   task this person approves or assigned. Firestore, keyed on the Cowork id. */
+const APPROVED_DONE = new Set(["tl_final_approved", "ceo_approved", "approved", "completed"]);
+const SENT_BACK = new Set(["rejected_by_tl", "tl_rejected", "rejected_by_ceo", "ceo_rejected"]);
+
+function taskDue(t) {
+  const d = asDate(t.fixedDeadline || t.dueDate);
+  return d ? d.toISOString() : null;
+}
+
+async function tasksSection(emp, now) {
+  const coworkId = String(emp?.coworkEmployeeId || emp?.biometricId || "").trim();
+  if (!coworkId) return { status: "none" };
+  const db = M.firestore();
+  const tasks = db.collection("cowork_tasks");
+  const [mine, approving, assignedByMe] = await Promise.all([
+    tasks.where("assigneeIds", "array-contains", coworkId).where("status", "in", ["open", "in_progress"]).get(),
+    tasks.where("approverId", "==", coworkId).limit(200).get(),
+    tasks.where("assignedBy", "==", coworkId).orderBy("updatedAt", "desc").limit(150).get(),
+  ]);
+  const today = istDateStr(now);
+  const assigned = [];
+  mine.forEach((doc) => {
+    const t = doc.data() || {};
+    if (t.type === "subtask" || APPROVED_DONE.has(t.completionStatus)) return;
+    const due = taskDue(t);
+    const dueDay = due ? istDateStr(new Date(due)) : null;
+    assigned.push({
+      id: doc.id,
+      title: t.title || "Task",
+      status: t.status,
+      progress: Math.max(0, Math.min(100, Number(t.progressPercent) || 0)),
+      due,
+      overdue: Boolean(dueDay) && dueDay < today,
+      dueToday: dueDay === today,
+      sentBack: SENT_BACK.has(t.completionStatus),
+      inReview: t.completionStatus === "pending_tl_review" || t.completionStatus === "pending_ceo_review",
+      from: t.assignedByName || null,
+    });
+  });
+  const seen = new Set();
+  const toReview = [];
+  for (const snap of [approving, assignedByMe]) {
+    snap.forEach((doc) => {
+      const t = doc.data() || {};
+      if (seen.has(doc.id) || t.completionStatus !== "pending_tl_review") return;
+      seen.add(doc.id);
+      toReview.push({ id: doc.id, title: t.title || "Task", by: t.completionProof?.submittedByName || null, at: t.completionProof?.submittedAt || null });
+    });
+  }
+  // Overdue first, then the nearest deadline, then no deadline.
+  assigned.sort((a, b) => Number(b.overdue) - Number(a.overdue) || String(a.due || "9").localeCompare(String(b.due || "9")));
+  return {
+    status: "ok",
+    open: assigned.length,
+    overdue: assigned.filter((t) => t.overdue).length,
+    dueToday: assigned.filter((t) => t.dueToday).length,
+    sentBack: assigned.filter((t) => t.sentBack).length,
+    items: assigned.slice(0, 8),
+    toReview: toReview.length,
+    reviewItems: toReview.slice(0, 5),
+  };
+}
+
 /* `items`: the next four from today. `month`: every holiday in this month and
    the next — what the home's calendar marks (it shows those two months). */
 async function holidaysSection(today) {
@@ -335,7 +402,7 @@ async function compute(user, now = new Date()) {
   }
   const emp = resolved.employee;
 
-  const [attendance, leave, requests, planner, interviews, meetings, holidays, away, people] = await Promise.all([
+  const [attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks] = await Promise.all([
     section("attendance", () => attendanceSection(emp, today)),
     section("leave", () => leaveSection(emp, today)),
     section("requests", () => requestsSection(emp)),
@@ -345,6 +412,7 @@ async function compute(user, now = new Date()) {
     section("holidays", () => holidaysSection(today)),
     section("away", () => awaySection(emp, today)),
     section("people", () => peopleSection(now)),
+    section("tasks", () => tasksSection(emp, now)),
   ]);
 
   return {
@@ -366,7 +434,7 @@ async function compute(user, now = new Date()) {
          for an employee login. Anyone else is pointed to their HR record. */
       selfService: Boolean(emp) && user?.subject === "employee" && String(user.id) === String(emp._id),
     },
-    sections: { attendance, leave, requests, planner, interviews, meetings, holidays, away, people },
+    sections: { attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks },
   };
 }
 
