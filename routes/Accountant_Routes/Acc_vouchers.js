@@ -3580,6 +3580,17 @@ router.post("/", auth, companyScope, async (req, res) => {
       if (new Set(ids).size !== ids.length) {
         return res.status(400).json({ error: "The same challan is listed twice on this invoice." });
       }
+      /* A value that is not an object id must be refused HERE. Passed to
+         `find({_id: {$in: ids}})` it throws a Mongoose CastError, which the
+         handler returns verbatim — so the caller got
+         `Cast to ObjectId failed for value "…" at path "_id" for model
+         "DispatchChallan"`, an internal message in place of an answer. */
+      const notAnId = ids.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+      if (notAnId.length) {
+        return res.status(400).json({
+          error: `Not a challan reference: ${notAnId.join(", ")}.`,
+        });
+      }
 
       let Challan = null;
       try {

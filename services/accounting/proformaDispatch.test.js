@@ -123,7 +123,7 @@ test("no challans is an empty answer, not a crash", () => {
 });
 
 // ── Selecting challans to invoice ─────────────────────────────────────────
-const { selectionGuard, challanParty } = require("./proformaDispatch");
+const { selectionGuard, challanParty, billingStanding } = require("./proformaDispatch");
 
 const ch = (number, orderId, extra = {}) => ({
   _id: number, challanNumber: number, manufacturingOrderId: orderId,
@@ -189,4 +189,55 @@ test("a challan carries the invoice the route resolved for it", () => {
   const s = challanSummary({ ...bulkChallan, invoice: { voucherNumber: "INV/26/0007" } });
   assert.equal(s.invoice.voucherNumber, "INV/26/0007");
   assert.equal(challanSummary(bulkChallan).invoice, null);
+});
+
+/* ── IS THIS PROFORMA FINISHED? ───────────────────────────────────────────── */
+test("nothing dispatched yet is not finished — that is the state to chase, not hide", () => {
+  const s = billingStanding(0, 0);
+  assert.equal(s.state, "none");
+  assert.equal(s.done, false);
+  assert.match(s.label, /Nothing dispatched/i);
+});
+
+test("a challan with no invoice is work", () => {
+  const s = billingStanding(1, 0);
+  assert.equal(s.state, "part");
+  assert.equal(s.done, false);
+  assert.equal(s.openCount, 1);
+  assert.equal(s.label, "1 challan to bill");
+});
+
+test("some billed, some not, says how many are left", () => {
+  const s = billingStanding(3, 1);
+  assert.equal(s.state, "part");
+  assert.equal(s.openCount, 2);
+  assert.equal(s.label, "2 of 3 challans still to bill");
+});
+
+test("every challan billed is finished, and leaves the list", () => {
+  const s = billingStanding(2, 2);
+  assert.equal(s.state, "done");
+  assert.equal(s.done, true);
+  assert.equal(s.openCount, 0);
+  assert.match(s.label, /Invoiced in full/);
+});
+
+test("more invoices than challans cannot push it past done", () => {
+  /* One invoice may bill several challans, and a challan can in principle be
+     named by two vouchers if data is repaired by hand. Neither may produce a
+     negative open count or a fourth state. */
+  const s = billingStanding(2, 5);
+  assert.equal(s.state, "done");
+  assert.equal(s.openCount, 0);
+  assert.equal(s.invoicedCount, 2);
+});
+
+test("rubbish counts settle to the safe state rather than throwing", () => {
+  for (const [a, b] of [[null, null], [undefined, 3], [-2, -9], ["x", "y"], [NaN, NaN]]) {
+    const s = billingStanding(a, b);
+    assert.ok(["none", "part", "done"].includes(s.state));
+    assert.ok(s.openCount >= 0);
+  }
+  /* A proforma whose challan count cannot be read is NOT reported finished. */
+  assert.equal(billingStanding("x", "y").done, false);
 });
