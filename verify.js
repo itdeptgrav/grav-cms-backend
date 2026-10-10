@@ -46,6 +46,7 @@ const PURE = [
   "verifyConfirmationDate",    // probation ends when joining + probation says
   "verifyCompanyDocuments",    // the company-documents model
   "verifyHrWriteCoverage",     // every HR write is guarded or deliberately exempt
+  "verifyEmployeeFieldSaves",  // a saved employee field is still there after a refresh
   "verifyNoUndefinedRefs",     // no route uses a name it never imported
 ];
 

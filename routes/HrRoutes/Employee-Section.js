@@ -66,6 +66,7 @@ const {
 const { computeSalary } = require("../../services/salaryFormula");
 
 require("dotenv").config();
+const { flattenToPaths } = require("../../services/mongoPaths");
 
 // ─── SALARY CALCULATION ─────────────────────────────────────────────
 // The formula itself lives in services/salaryFormula.js. It used to be copied
@@ -602,33 +603,47 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // between them is silently logged as edits nobody made.
     const beforeDoc = await Employee.findById(id).lean();
 
-    // ── The biometric ID is write-once ──────────────────────────────────────
-    // It is the join key across both datastores — Mongo's employee record and
-    // the Firestore cowork document share it, and every attendance row, punch
-    // and payroll item is keyed on it. Changing it does not rename those; it
-    // orphans them, and the employee silently stops having a history.
-    //
-    // So: set it once, on an employee who has none, and never again. Sent
-    // unchanged is fine and common — the form posts the whole record back —
-    // and only an actual attempt to change one is refused, loudly, because
-    // silently ignoring it would leave HR believing it had been renamed.
-    //
-    // identityId is deliberately NOT locked. It is a display/HR number with
-    // nothing keyed on it.
+    /* ── The biometric ID is editable, and it is a RENAME WITH CONSEQUENCES ──
+       It was write-once: an attempt to change it was refused with
+       BIOMETRIC_ID_IMMUTABLE. HR asked for it to be editable (10 Oct 2026),
+       so it is.
+ 
+       What has NOT changed is why it was locked. It is the join key across
+       both datastores — Mongo's employee record and the Firestore cowork
+       document share it — and about eighteen collections file their rows
+       under it, among them Attendance, Dailyattendance, Payroll,
+       LeaveManagement, OvertimeReport, AttendanceExclusion, FacePhoto,
+       FaceEnrollInvite and EmployeeDocument, plus the manufacturing and
+       request collections. Writing a new value here renames the employee's
+       key and nothing else: the existing rows keep the OLD id and stop
+       resolving to this person.
+ 
+       So the change is allowed, reported, and written into the change log
+       (recordChange below carries before/after, and the biometric ID is part
+       of the audit snapshot), and the response says what moved so the caller
+       can say it too. Re-keying the dependent rows is a separate migration
+       and deliberately not attempted inside a form save — a partial re-key
+       across eighteen collections is worse than a clean rename plus a
+       migration that can be run, checked and repeated.
+ 
+       Sent unchanged is fine and common — a section posts its own keys back —
+       and that case is dropped rather than written, so an ordinary save is
+       not recorded as a rename.
+ 
+       identityId was never locked. It is a display/HR number with nothing
+       keyed on it. */
+    let biometricIdRenamed = null;
     if (updateData.biometricId !== undefined && beforeDoc?.biometricId) {
       const next = String(updateData.biometricId || "").trim().toUpperCase();
       const current = String(beforeDoc.biometricId).trim().toUpperCase();
       if (next && next !== current) {
-        return res.status(400).json({
-          success: false,
-          code: "BIOMETRIC_ID_IMMUTABLE",
-          message:
-            `Biometric ID cannot be changed. ${beforeDoc.biometricId} is the ` +
-            `key their attendance, punches and payroll are stored under — ` +
-            `renaming it here would orphan all of it, not move it.`,
-        });
+        /* Normalised on the way in, because every reader compares it
+           case-insensitively and a stored "b-12" would match nothing. */
+        updateData.biometricId = next;
+        biometricIdRenamed = { from: beforeDoc.biometricId, to: next };
+      } else {
+        delete updateData.biometricId;
       }
-      delete updateData.biometricId;
     }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
@@ -710,10 +725,33 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       updateData.salary.adminOverride = calculated.adminOverride;
     }
 
-    const updated = await Employee.findByIdAndUpdate(id, updateData, {
-      new: true,
-      runValidators: false,
-    }).select("-password -temporaryPassword -__v");
+    /* THE SHIFT TIMES ARE THE ONE SUB-OBJECT THAT MEANT "REPLACE".
+       ------------------------------------------------------------------
+       The form sends `workShift: { mode }` with no times for General and
+       Core, deliberately: those modes read their hours from the attendance
+       settings, and copying them onto the employee freezes a snapshot that
+       stops following that page. It relied on the whole-object replace below
+       to drop any times already stored. Merging keeps them, so they are
+       cleared by name instead — the intent is preserved rather than left to
+       a side effect of how the write happened to be built. */
+    if (updateData.workShift?.mode && updateData.workShift.mode !== "custom") {
+      updateData.workShift.start = "";
+      updateData.workShift.end = "";
+      updateData.workShift.punches = null;
+    }
+
+    /* DOT PATHS, NOT NESTED OBJECTS — see services/mongoPaths.js.
+       `$set: { documents: {...} }` replaces the whole sub-document, so a
+       section save that carried an Aadhaar number erased the PAN, the UAN and
+       the uploaded files beside it; `address` replaced the same way could drop
+       `address.permanent.state`, which is what the monthly leave cap is judged
+       on. The bulk route next door always did this correctly and had the only
+       copy of the helper. */
+    const updated = await Employee.findByIdAndUpdate(
+      id,
+      { $set: flattenToPaths(updateData) },
+      { new: true, runValidators: false },
+    ).select("-password -temporaryPassword -__v");
 
     if (!updated)
       return res
@@ -779,6 +817,12 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       success: true,
       message: "Employee updated successfully",
       data: decryptedDoc,
+      /* A biometric ID rename is reported rather than left to be noticed.
+         The rows already filed under the old id keep it — see the block above
+         — and the person saving is the only one who can decide to have them
+         migrated, so they have to be told it happened. Absent on every
+         ordinary save. */
+      ...(biometricIdRenamed ? { biometricIdRenamed } : {}),
     });
   } catch (error) {
     console.error("Update employee error:", error);
@@ -1167,21 +1211,9 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Nested objects → dot paths, so a partial {salary:{gross}} or
     // {address:{current:{city}}} merges instead of replacing the sub-document.
-    const flatten = (obj, prefix = "", out = {}) => {
-      for (const [k, v] of Object.entries(obj)) {
-        const path = prefix ? `${prefix}.${k}` : k;
-        if (
-          v &&
-          typeof v === "object" &&
-          !Array.isArray(v) &&
-          !(v instanceof Date)
-        )
-          flatten(v, path, out);
-        else out[path] = v;
-      }
-      return out;
-    };
-    const paths = flatten(clean);
+    // services/mongoPaths.js — the same helper the single PUT above uses, so
+    // the two routes cannot disagree about what a partial update means.
+    const paths = flattenToPaths(clean);
 
     const results = { updated: 0, failed: [] };
     for (const empId of employeeIds) {
