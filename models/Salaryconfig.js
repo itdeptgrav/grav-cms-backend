@@ -24,7 +24,12 @@ const salaryConfigSchema = new mongoose.Schema(
         },
         epfWageCeiling: {
             type: Number, default: 15000,
-            min: [0],
+            /* Not 0. A wage ceiling of nothing is not a company rule, it is a
+               PF of nothing for everybody — and the settings screen used to be
+               able to send one, because an emptied input reaches Number() as
+               "" and `Number("") === 0`. That screen now sends the default for
+               a blank cell; this is the backstop for every other caller. */
+            min: [1, "The EPF wage ceiling must be at least ₹1"],
             comment:
                 "The Basic that EPF % is charged on stops here. Statutory: ₹15,000. " +
                 "EDLI and admin charges have had their own ceiling since they were " +
