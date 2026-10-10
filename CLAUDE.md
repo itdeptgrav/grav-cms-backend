@@ -1655,3 +1655,46 @@ journey and 24 stray Leads at the time. Several customers share a
 `flag.piAllProducts`: `piProductGate.piAllProducts()` is async, reads the
 setting (5 s cache, `forgetPiProductScope()` on a settings save) and falls back
 to `SALES_PI_ALL_PRODUCTS` only while the setting is absent.
+
+## A raw-material QC defect is a Store stock debit (10 Oct 2026, owner)
+
+`POST /api/cms/manufacturing/qc/raw-items/save` with `status: "defective"`
+now moves stock, through `services/manufacturing/qcDefectStock.service.js`:
+the label's `Barcode.quantity` drops by the defective quantity (guarded at
+zero), `RawItem.quantity` and the variant's quantity drop by the same figure
+in the item's registered unit (ONE guarded atomic update; a label unit that
+differs is converted with `receiptPosting.resolveConversion`), a
+`VARIANT_REDUCE` / `REDUCE` row with reason **"QC defect"** is pushed onto
+`RawItem.stockTransactions[]` (MO, GRN, label id, defect codes and the QC
+record id in `notes`; `performedByName` is the checker), and if the label
+sits on a shelf (`storeLocations.markingBalances`) that shelf's balance drops
+too, up to what it holds. Both Store history reads
+(`GET /inventory/stock-ledger?rawItemId=` and `GET /inventory/stock-adjustments`)
+list the row like any issue. The verdict and the debit are written in one
+transaction when the database offers them.
+
+- **The verdict is saved even when the stock cannot move.** A refused guard
+  (the label or the variant was already issued past the figure), a trashed
+  item, a missing variant or no unit conversion leaves
+  `QCRawItemInspection.stockDebit.applied: false` with `error` / `errorCode`,
+  the response carries a `warnings[]` line and the message says "Stock was
+  not reduced". Order of writes is label → item (label undone if the item
+  refuses) → shelf (best effort), so nothing is left half-applied.
+- **A re-check puts the earlier debit back first**: a `VARIANT_ADD` /
+  `ADD` row with reason "QC defect reversed", the label restored, the
+  earlier record's `stockDebit.reversedAt` / `reversalTransactionId` set,
+  then the new verdict's own debit (if defective). `/lookup` and `/save`
+  read the label's figure PLUS the standing debit, so a re-check judges the
+  whole label. A reversal that cannot be written (item gone) refuses the
+  re-check with 409 `PRIOR_DEBIT_NOT_REVERSIBLE`.
+- `recordView` carries `stockDebit`; the save response carries `stockDebit`,
+  `reversedPriorDebit` and `warnings`.
+- NOT touched: `CustomerMaterialLot` balances (its invariant has no
+  "rejected" counter) and `qcInspectionBridge` (reads only).
+
+Verified 10 Oct 2026 against the dev database on label
+6ac9d11e5cdbd5b8482ba12e (Cotton Denim · King Textiles/Blue, GRN/2026-27/0009):
+2 m defective → variant 290→288, item 490→488, label 5→3, ledger row written;
+re-check passed → all three back, credit row written; a 1000 m defect on a
+5 m label was refused with nothing moved. The test records and the two
+net-zero ledger rows were deleted afterwards.
