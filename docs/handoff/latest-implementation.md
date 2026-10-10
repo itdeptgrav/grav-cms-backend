@@ -7,6 +7,38 @@ company pulse, announcements, kudos, events, training or tickets, and no
 sample content. The people directory exposes name, role, department and photo
 only. Leave and payslip drawers are offered to employee logins.
 
+## Rebuilt the same evening (owner: "not even close to the reference … boring")
+
+The layout now follows the reference pack's structure, using only real data:
+
+- **Hero** (`HomeHero.js`): the app's own stepped slab (`SlabCard`), with the
+  person in its tab, the greeting, three clickable figures, the search, and a
+  **shift clock**. The clock is an arc from shift start to end with the "now"
+  sun and the punch-in mark. It uses the day's attendance row, else
+  `home.shift`, the factory hours from `shiftHours.js`. A woven texture is
+  drawn in the slab's ink at 5%.
+- **App dock** (`AppDock.js`): large plates with queue counts, overlapping the
+  hero's edge. "All N" opens the full pin/reorder launcher in a drawer.
+- **Needs your attention**: three figures (Urgent / Needs action / To do) that
+  filter the list. Each row has an urgency rail and its own action button.
+  The all-clear state has a drawn spool.
+- **Profile card** (`ProfileCard.js`): today's standing, then Request time off
+  and Payslips (employee login) or Raise a request and Planner (anyone else).
+  Leave left is shown as the kit's `Ring`s.
+- **Your day** (`DayPanel.js`): a timeline with a live "now" line and Join
+  links, then planner tasks due today, then who is away as an avatar stack.
+- **Calendar** (`CalendarPanel.js`): this month and next, with holidays,
+  approved and waiting leave marked, and today ringed. The next holidays are
+  listed as date tiles.
+- **Celebrations** (`PeoplePanel.js`): cards with a mark per kind, today's
+  first, and a kind filter.
+- **Backend:** `/api/me/home` adds `shift`, `holidays.month` / `range` (this
+  month and next) and `attendance.late` / `workedMins`.
+- **Checks:** desktop, tablet and phone, light and dark; no horizontal
+  overflow; keyboard paths checked.
+- **Motion:** a 520 ms rise and a slow pulse, both off under
+  `prefers-reduced-motion`.
+
 ## Backend
 
 - `GET /api/me/home` (`routes/Access/meHome.js`, mounted in `server.js`

@@ -86,6 +86,9 @@ test("an employee login is themselves, and may self-serve", async () => {
   assert.deepEqual(s.meetings.items.map((m) => m.id), ["m1"]);
   assert.equal(s.away.count, 1, "the person themself is not listed as away");
   assert.equal(s.holidays.items[0].name, "Durga Puja");
+  assert.ok(Array.isArray(s.holidays.month), "the calendar's month of holidays is sent");
+  assert.deepEqual(s.holidays.range, { from: "2026-10-01", before: "2026-12-01" });
+  assert.deepEqual(out.shift, { start: "09:30", end: "18:30" });
   assert.deepEqual(s.people.birthdays.map((p) => p.name), ["Rishi Das"]);
   assert.deepEqual(s.people.joiners.map((p) => p.name), ["Asha Rao"]);
 });

@@ -30,6 +30,7 @@
 
 "use strict";
 
+const { SHIFT } = require("../manufacturing/shiftHours");
 const mongoose = require("mongoose");
 const {
   istToday, istDateStr, peopleMoments, covers, asDate, isTodayIst, displayName,
@@ -133,6 +134,8 @@ async function attendanceSection(emp, today) {
     code: row.hrFinalStatus || row.systemPrediction || null,
     shiftStart: row.shiftStart || null,
     shiftEnd: row.shiftEnd || null,
+    late: Boolean(row.isLate),
+    workedMins: Number(row.netWorkMins) || 0,
   };
 }
 
@@ -254,10 +257,19 @@ async function meetingsSection(emp, now) {
   return { status: "ok", items: items.slice(0, 10) };
 }
 
+/* `items`: the next four from today. `month`: every holiday in this month and
+   the next — what the home's calendar marks (it shows those two months). */
 async function holidaysSection(today) {
   const { CompanyHoliday } = M.Leave();
-  const rows = await CompanyHoliday.find({ date: { $gte: today } }).select("date name type").sort({ date: 1 }).limit(4).lean();
-  return { status: "ok", items: rows.map((h) => ({ date: h.date, name: h.name, type: h.type || null })) };
+  const [y, m] = today.split("-").map(Number);
+  const from = `${y}-${String(m).padStart(2, "0")}-01`;
+  const after = m >= 11 ? `${y + 1}-${String(m - 10).padStart(2, "0")}-01` : `${y}-${String(m + 2).padStart(2, "0")}-01`;
+  const view = (h) => ({ date: h.date, name: h.name, type: h.type || null });
+  const [rows, month] = await Promise.all([
+    CompanyHoliday.find({ date: { $gte: today } }).select("date name type").sort({ date: 1 }).limit(4).lean(),
+    CompanyHoliday.find({ date: { $gte: from, $lt: after } }).select("date name type").sort({ date: 1 }).limit(40).lean(),
+  ]);
+  return { status: "ok", items: rows.map(view), month: month.map(view), range: { from, before: after } };
 }
 
 async function awaySection(emp, today) {
@@ -338,6 +350,9 @@ async function compute(user, now = new Date()) {
   return {
     generatedAt: now.toISOString(),
     today,
+    /* The factory's hours (services/manufacturing/shiftHours.js) — the home's
+       shift clock falls back to them when the day has no attendance row. */
+    shift: { start: SHIFT.start, end: SHIFT.end },
     me: {
       name: emp ? displayName(emp) : user?.name || "",
       role: emp?.designation || emp?.jobTitle || null,
