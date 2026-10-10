@@ -303,10 +303,96 @@ router.get("/", companyScope, async (req, res) => {
         ? { voucherNumber: -1 }
         : { voucherDate: -1, createdAt: -1 };
 
-    const list = await Acc_ProformaInvoice.find(filter)
+    let list = await Acc_ProformaInvoice.find(filter)
       .sort(sortSpec)
       .limit(parseInt(limit, 10))
       .lean();
+
+    /* ── EVERY PROFORMA FINDS ITS OWN ORDER ──────────────────────────────
+       Sales raises a PI; approving it is what creates the MO. So a proforma
+       with no order behind it was never approved, and the list shows only
+       the ones that have one — `?withOrder=all` shows the rest, because
+       hiding a document the company really issued is worse than listing it.
+
+       Nothing stores the relationship (the accounting proforma and the sales
+       PI are different documents in different systems), so it is derived —
+       and only ever from evidence that cannot mean anything else: the order
+       number written on the proforma, or a buyer with exactly one order.
+       A buyer with several and no reference is left unmatched rather than
+       guessed at. See services/accounting/proformaOrderMatch.js.
+
+       A proven match is WRITTEN BACK, so it is resolved once and is
+       auditable afterwards rather than re-derived on every read. */
+    const matchInfo = new Map();
+    try {
+      const { resolveOrderForProforma, isProvenMatch } =
+        require("../../services/accounting/proformaOrderMatch");
+      const m = require("../../models/Customer_Models/CustomerRequest");
+      const Request = m.CustomerRequest || m;
+      const Cust = require("../../models/Customer_Models/Customer");
+
+      const unresolved = list.filter((pi) => !pi.customerRequestId);
+      if (unresolved.length) {
+        /* One pass for every buyer on the page rather than a query per PI. */
+        const gstins = [...new Set(unresolved.map((p) => String(p.buyer?.gstin || "").trim().toUpperCase()).filter(Boolean))];
+        const names = [...new Set(unresolved.map((p) => p.buyer?.name).filter(Boolean))];
+        const customers = await Cust.find({
+          $or: [
+            ...(gstins.length ? [{ gstin: { $in: gstins } }] : []),
+            ...(names.length ? [{ name: { $in: names } }] : []),
+          ],
+        }).select("name companyName gstin").lean();
+
+        const custIds = customers.map((c) => c._id);
+        const orders = custIds.length
+          ? await Request.find({ customerId: { $in: custIds } })
+              .select("requestId customerName customerId")
+              .lean()
+          : [];
+        const ordersByCustomer = new Map();
+        for (const o of orders) {
+          const k = String(o.customerId);
+          if (!ordersByCustomer.has(k)) ordersByCustomer.set(k, []);
+          ordersByCustomer.get(k).push(o);
+        }
+        const custByGstin = new Map(customers.filter((c) => c.gstin)
+          .map((c) => [String(c.gstin).trim().toUpperCase(), c]));
+        const custByName = new Map(customers.map((c) => [String(c.name || "").trim(), c]));
+
+        const writes = [];
+        for (const pi of unresolved) {
+          const cust =
+            custByGstin.get(String(pi.buyer?.gstin || "").trim().toUpperCase()) ||
+            custByName.get(String(pi.buyer?.name || "").trim());
+          const candidates = cust ? (ordersByCustomer.get(String(cust._id)) || []) : [];
+          const r = resolveOrderForProforma(pi, candidates);
+          matchInfo.set(String(pi._id), r);
+          if (isProvenMatch(r)) {
+            pi.customerRequestId = r.orderId;
+            pi.requestRef = r.requestRef;
+            writes.push({
+              updateOne: {
+                filter: { _id: pi._id },
+                update: { $set: { customerRequestId: r.orderId, requestRef: r.requestRef } },
+              },
+            });
+          }
+        }
+        if (writes.length) await Acc_ProformaInvoice.bulkWrite(writes, { ordered: false });
+      }
+    } catch (e) {
+      /* The list must still open if the manufacturing side is unavailable;
+         nothing is matched, and every PI simply reads as unlinked. */
+      console.error("[proforma list] order matching skipped:", e.message);
+    }
+
+    const withOrder = list.filter((pi) => pi.customerRequestId);
+    const withoutOrder = list.length - withOrder.length;
+    if (String(req.query.withOrder || "linked") !== "all") list = withOrder;
+    list = list.map((pi) => ({
+      ...pi,
+      orderMatch: matchInfo.get(String(pi._id)) || (pi.customerRequestId ? { how: "stored" } : null),
+    }));
 
     // KPI strip data — counts per status + total value of accepted PIs
     const counts = list.reduce(
@@ -320,7 +406,14 @@ router.get("/", companyScope, async (req, res) => {
       { total: 0, totalValue: 0, acceptedValue: 0 },
     );
 
-    res.json({ success: true, proformaInvoices: list, summary: counts });
+    res.json({
+      success: true,
+      proformaInvoices: list,
+      summary: counts,
+      /* How many were left out for having no order. Named so the screen can
+         say it rather than quietly showing a shorter list. */
+      withoutOrder,
+    });
   } catch (e) {
     console.error("[proforma list]", e);
     res.status(500).json({ success: false, message: e.message });
@@ -404,10 +497,48 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
       .lean();
     if (!pi) return res.status(404).json({ success: false, message: "Not found" });
 
+    /* Opened directly rather than through the list, so the match may not
+       have been derived yet. Same rule, same proof, same write-back — see
+       the list route. */
+    let orderMatch = pi.customerRequestId ? { how: "stored" } : null;
+    if (!pi.customerRequestId) {
+      try {
+        const { resolveOrderForProforma, isProvenMatch } =
+          require("../../services/accounting/proformaOrderMatch");
+        const m = require("../../models/Customer_Models/CustomerRequest");
+        const Request = m.CustomerRequest || m;
+        const Cust = require("../../models/Customer_Models/Customer");
+        const gstin = String(pi.buyer?.gstin || "").trim().toUpperCase();
+        const cust = await Cust.findOne({
+          $or: [
+            ...(gstin ? [{ gstin }] : []),
+            ...(pi.buyer?.name ? [{ name: pi.buyer.name }] : []),
+          ],
+        }).select("_id").lean();
+        const candidates = cust
+          ? await Request.find({ customerId: cust._id })
+              .select("requestId customerName customerId").lean()
+          : [];
+        const r = resolveOrderForProforma(pi, candidates);
+        orderMatch = r;
+        if (isProvenMatch(r)) {
+          await Acc_ProformaInvoice.updateOne(
+            { _id: pi._id },
+            { $set: { customerRequestId: r.orderId, requestRef: r.requestRef } },
+          );
+          pi.customerRequestId = r.orderId;
+          pi.requestRef = r.requestRef;
+        }
+      } catch (e) {
+        console.error("[proforma dispatch] order matching skipped:", e.message);
+      }
+    }
+
     if (!pi.customerRequestId) {
       return res.json({
         success: true,
         linked: false,
+        orderMatch,
         order: null,
         challans: [],
         lines: [],
@@ -523,6 +654,7 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
       /* Present only when a selection was asked for. `ok: false` means the
          caller must not raise an invoice from it — the reason is the
          sentence to show. */
+      orderMatch,
       guard,
       selection: asked.length ? asked : null,
       billableChallanIds: billable,

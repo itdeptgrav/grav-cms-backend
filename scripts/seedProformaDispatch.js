@@ -50,7 +50,10 @@ const REQUEST_ID = "MO-REQ-DEMO-DISPATCH";
    only its own challans, and ticking across the two is the refusal to see. */
 const REQUEST_ID_B = "MO-REQ-DEMO-DISPATCH-B";
 const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002", "DC-DEMO-0003"];
-const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002"];
+/* The third carries NO stored link — only the order number written in its
+   buyer's reference. It exists to prove the matching is automatic: opening
+   the list resolves and persists it without anybody choosing an order. */
+const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002", "PI/DEMO/0003"];
 /* Customer has `customerId` (a String), NOT `customerCode` — keying on a
    field the schema does not declare meant strict mode dropped it, so every
    run made another customer and --undo deleted none of them. */
@@ -310,6 +313,8 @@ async function seed() {
   const made = [];
   for (const [i, voucherNumber] of PI_NUMBERS.entries()) {
     const second = i === 1;
+    /* The third is Riverside's again, deliberately UNLINKED. */
+    const third = i === 2;
     const buyer = second ? BUYER_B : BUYER;
     const doc = {
       companyId: company._id,
@@ -319,10 +324,12 @@ async function seed() {
       validTill: new Date(Date.now() + 30 * 864e5),
       buyer,
       consignee: { ...buyer, name: `${buyer.name} — Site Store` },
-      /* The link this whole feature turns on — a DIFFERENT order each. */
-      customerRequestId: second ? orderB._id : order._id,
-      requestRef: second ? REQUEST_ID_B : REQUEST_ID,
-      buyersReference: "RFQ/RH/2026/118",
+      /* The link this whole feature turns on — a DIFFERENT order each. The
+         third is left NULL so the automatic matcher has something to find. */
+      customerRequestId: third ? null : second ? orderB._id : order._id,
+      requestRef: third ? "" : second ? REQUEST_ID_B : REQUEST_ID,
+      /* …and the order's number is written where a person would write it. */
+      buyersReference: third ? `Against ${REQUEST_ID}` : "RFQ/RH/2026/118",
       dispatchedThrough: "VRL Logistics",
       destination: "Bhubaneswar",
       termsOfDelivery: "Ex-works, freight prepaid",
@@ -335,7 +342,7 @@ async function seed() {
       internalNotes: "[seed:proforma-dispatch] safe to delete",
       /* The second one is ACCEPTED on purpose: PUT /:id refuses it, so it is
          the document that proves PATCH /:id/order-link was needed. */
-      status: i === 0 ? "sent" : "accepted",
+      status: i === 0 ? "sent" : i === 1 ? "accepted" : "sent",
     };
     const pi = await Acc_ProformaInvoice.findOneAndUpdate(
       { companyId: company._id, financialYear: doc.financialYear, voucherNumber },
@@ -396,6 +403,22 @@ async function verify({ company, order, orderB, proformas }) {
   const sameCustomer = selectionGuard(challans);
   if (!sameCustomer.ok) problems.push(`one customer's challans were refused: ${sameCustomer.reason}`);
 
+  /* ── The third proforma must match itself ──────────────────────────────
+     It is stored with no order; only the order number is written on it. If
+     the matcher cannot resolve that, "automatically matched" is not true. */
+  const { resolveOrderForProforma, isProvenMatch } = require("../services/accounting/proformaOrderMatch");
+  const third = proformas.find((p) => p.voucherNumber === "PI/DEMO/0003");
+  const auto = third
+    ? resolveOrderForProforma(
+        { buyersReference: third.buyersReference, customerRequestId: third.customerRequestId },
+        [{ _id: order._id, requestId: REQUEST_ID, customerName: order.customerName }],
+      )
+    : null;
+  if (!auto || auto.how !== "reference" || String(auto.orderId) !== String(order._id)) {
+    problems.push(`PI/DEMO/0003 should match ${REQUEST_ID} by its written reference, got ${auto?.how}`);
+  }
+  if (auto && !isProvenMatch(auto)) problems.push("a reference match must be written back automatically");
+
   console.log("");
   console.log(`  Order A (${REQUEST_ID}): ${aNumbers.join(", ")}`);
   console.log(`  Order B (${REQUEST_ID_B}): ${bNumbers.join(", ")}`);
@@ -411,6 +434,7 @@ async function verify({ company, order, orderB, proformas }) {
     console.log("  ✓ the value total excludes what the proforma does not price");
     console.log("  ✓ each proforma sees only its own order's challans");
     console.log("  ✓ two customers' challans cannot share one invoice");
+    console.log("  ✓ PI/DEMO/0003 carries no link and matches its order by the number on it");
   }
 
   console.log("\n─────────── open these ───────────");
