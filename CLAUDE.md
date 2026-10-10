@@ -1698,3 +1698,18 @@ Verified 10 Oct 2026 against the dev database on label
 re-check passed → all three back, credit row written; a 1000 m defect on a
 5 m label was refused with nothing moved. The test records and the two
 net-zero ledger rows were deleted afterwards.
+
+## The receive pages weigh too (11 Oct 2026, owner)
+
+"The weight-basis checkbox on the raw item barcode print page needs to be on
+the GRN / receive page as well, since labels are generated there too."
+`GET /api/cms/inventory/operations/purchase-orders/data/raw-items/:id/units`
+— the read the purchase receive page has always made for its "into stock"
+column — now also answers `weighing: { item: [...], byVariant: { <variantId>:
+[...] } }`: the conversions flagged `measureByWeight` (fromUnit, toUnit,
+quantity, tareQuantity or null). Additive; `baseUnit` and `availableUnits`
+are byte-identical. The CMS label workspace (`CountLabelWorkspace`, mounted
+on the purchase-order, customer-material and material-request receive pages)
+reads it for the session's `rawItemId` and offers the scale panel for the
+session's `variantId`. Nothing about `reserveBatch` changed: the derived
+figure arrives as the same `quantityPerLabel` a person would have typed.

@@ -340,7 +340,7 @@ router.get("/data/raw-items-with-variants", requireCapability(CAPABILITIES.READ)
 router.get("/data/raw-items/:id/units", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {
     const rawItem = await RawItem.findById(req.params.id)
-      .select("unit customUnit name")
+      .select("unit customUnit name unitConversions variants._id variants.unitConversions")
       .lean();
     if (!rawItem)
       return res
@@ -395,7 +395,27 @@ router.get("/data/raw-items/:id/units", requireCapability(CAPABILITIES.READ), as
       }
     }
 
-    res.json({ success: true, baseUnit, availableUnits: available });
+    /* MEASURED BY WEIGHT (11 Oct 2026, owner). The receive pages print raw
+       item labels for a line, and small parts are weighed, not counted: a
+       variant's conversion flagged `measureByWeight` (1 Pcs = 0.2234 Gram)
+       is what the scale reads through, `tareQuantity` the packaging deducted.
+       Additive: `weighing.byVariant[variantId]` and `weighing.item` list those
+       conversions, so the label workspace can offer the same "Measure by
+       weight" the Material labels page has. Every field above is unchanged. */
+    const weighable = (list) => (Array.isArray(list) ? list : [])
+      .filter((uc) => uc && uc.measureByWeight === true && uc.fromUnit && uc.toUnit && Number(uc.quantity) > 0)
+      .map((uc) => ({
+        fromUnit: uc.fromUnit, toUnit: uc.toUnit, quantity: Number(uc.quantity), measureByWeight: true,
+        tareQuantity: Number.isFinite(Number(uc.tareQuantity)) && Number(uc.tareQuantity) > 0 ? Number(uc.tareQuantity) : null,
+      }));
+    const byVariant = {};
+    for (const v of rawItem.variants || []) {
+      const list = weighable(v.unitConversions);
+      if (v && v._id && list.length) byVariant[String(v._id)] = list;
+    }
+    const weighing = { item: weighable(rawItem.unitConversions), byVariant };
+
+    res.json({ success: true, baseUnit, availableUnits: available, weighing });
   } catch (err) {
     console.error("Error fetching unit conversions:", err);
     res.status(500).json({ success: false, message: err.message });
