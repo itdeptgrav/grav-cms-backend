@@ -139,6 +139,47 @@ function resolveOrderForProforma(pi, orders) {
   };
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+   WHICH CUSTOMER IS THIS PROFORMA'S BUYER?
+
+   Returns a Mongo filter, or NULL when the buyer carries nothing to look one
+   up by. Null means "do not run a query", and both callers must honour it.
+
+   WHY THIS IS A FUNCTION AND NOT THREE LINES INLINE. The routes each built
+   `{ $or: [ ...(gstin ? [..] : []), ...(name ? [..] : []) ] }`. When the
+   buyer had neither — which happened because a route's projection left
+   `buyer` out entirely — that is `{ $or: [] }`, and Mongoose STRIPS an empty
+   `$or`: the query becomes `{}` and returns whichever customer is first in
+   the collection. Its sole order then resolved as a PROVEN match and was
+   written to the proforma, binding it permanently to a stranger's order with
+   that stranger's dispatches offered to invoice. Nothing on screen looked
+   wrong.
+
+   A buyer we cannot identify has no candidate orders. That is the honest
+   answer, and `resolveOrderForProforma([])` already words it.
+   ───────────────────────────────────────────────────────────────────────── */
+function customerLookupFor(buyer) {
+  const gstin = String(buyer?.gstin || "").trim().toUpperCase();
+  const name = String(buyer?.name || "").trim();
+  const clauses = [];
+  if (gstin) clauses.push({ gstin });
+  if (name) clauses.push({ name });
+  return clauses.length ? { $or: clauses } : null;
+}
+
+/* The same question for a PAGE of proformas: one query for every buyer on
+   it. Null for the same reason, and on the same rule. */
+function customerLookupForMany(buyers) {
+  const gstins = [...new Set((buyers || [])
+    .map((b) => String(b?.gstin || "").trim().toUpperCase()).filter(Boolean))];
+  const names = [...new Set((buyers || [])
+    .map((b) => String(b?.name || "").trim()).filter(Boolean))];
+  const clauses = [];
+  if (gstins.length) clauses.push({ gstin: { $in: gstins } });
+  if (names.length) clauses.push({ name: { $in: names } });
+  return clauses.length ? { $or: clauses } : null;
+}
+
 /** May this resolution be WRITTEN to the proforma without anybody asking? */
 const isProvenMatch = (r) => ["reference", "sole-order"].includes(r?.how);
 
@@ -148,4 +189,6 @@ module.exports = {
   normName,
   resolveOrderForProforma,
   isProvenMatch,
+  customerLookupFor,
+  customerLookupForMany,
 };

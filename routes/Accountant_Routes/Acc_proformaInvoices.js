@@ -334,14 +334,11 @@ router.get("/", companyScope, async (req, res) => {
       const unresolved = list.filter((pi) => !pi.customerRequestId);
       if (unresolved.length) {
         /* One pass for every buyer on the page rather than a query per PI. */
-        const gstins = [...new Set(unresolved.map((p) => String(p.buyer?.gstin || "").trim().toUpperCase()).filter(Boolean))];
-        const names = [...new Set(unresolved.map((p) => p.buyer?.name).filter(Boolean))];
-        const customers = await Cust.find({
-          $or: [
-            ...(gstins.length ? [{ gstin: { $in: gstins } }] : []),
-            ...(names.length ? [{ name: { $in: names } }] : []),
-          ],
-        }).select("name companyName gstin").lean();
+        const { customerLookupForMany } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupForMany(unresolved.map((p) => p.buyer));
+        const customers = where
+          ? await Cust.find(where).select("name companyName gstin").lean()
+          : [];
 
         const custIds = customers.map((c) => c._id);
         const orders = custIds.length
@@ -559,8 +556,13 @@ router.get("/:id", companyScope, async (req, res) => {
 // -----------------------------------------------------------------------------
 router.get("/:id/dispatch", companyScope, async (req, res) => {
   try {
+    /* `buyer` and `buyersReference` ARE NOT OPTIONAL HERE. The matcher below
+       reads both — the order number written on the proforma is its strongest
+       proof, and the buyer is how the candidate orders are found at all.
+       Leaving them out of the projection made `pi.buyer` undefined, which
+       built a customer query with no criteria at all. See below. */
     const pi = await Acc_ProformaInvoice.findById(req.params.id)
-      .select("customerRequestId requestRef items companyId")
+      .select("customerRequestId requestRef items companyId buyer buyersReference")
       .lean();
     if (!pi) return res.status(404).json({ success: false, message: "Not found" });
 
@@ -575,13 +577,11 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
         const m = require("../../models/Customer_Models/CustomerRequest");
         const Request = m.CustomerRequest || m;
         const Cust = require("../../models/Customer_Models/Customer");
-        const gstin = String(pi.buyer?.gstin || "").trim().toUpperCase();
-        const cust = await Cust.findOne({
-          $or: [
-            ...(gstin ? [{ gstin }] : []),
-            ...(pi.buyer?.name ? [{ name: pi.buyer.name }] : []),
-          ],
-        }).select("_id").lean();
+        /* Null when the buyer carries nothing to look one up by — see
+           customerLookupFor. An empty `$or` would match EVERYTHING. */
+        const { customerLookupFor } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupFor(pi.buyer);
+        const cust = where ? await Cust.findOne(where).select("_id").lean() : null;
         const candidates = cust
           ? await Request.find({ customerId: cust._id })
               .select("requestId customerName customerId").lean()
