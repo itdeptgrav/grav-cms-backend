@@ -121,3 +121,72 @@ test("no challans is an empty answer, not a crash", () => {
   assert.equal(r.totals.value, 0);
   assert.deepEqual(dispatchRollup(null, null).lines, []);
 });
+
+// ── Selecting challans to invoice ─────────────────────────────────────────
+const { selectionGuard, challanParty } = require("./proformaDispatch");
+
+const ch = (number, orderId, extra = {}) => ({
+  _id: number, challanNumber: number, manufacturingOrderId: orderId,
+  customerName: extra.customerName || "Riverside", ...extra,
+});
+
+test("one customer's challans may share an invoice", () => {
+  const g = selectionGuard([ch("DC-1", "order-a"), ch("DC-2", "order-a")]);
+  assert.equal(g.ok, true);
+  assert.equal(g.reason, null);
+});
+
+/* An invoice names ONE buyer, and unlike a wrong rate this cannot be
+   corrected on the invoice afterwards. */
+test("two customers' challans never share an invoice", () => {
+  const g = selectionGuard([
+    ch("DC-1", "order-a", { customerName: "Riverside" }),
+    ch("DC-9", "order-b", { customerName: "Mayfair" }),
+  ]);
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /2 different customers/);
+  assert.deepEqual(g.customers.sort(), ["Mayfair", "Riverside"]);
+});
+
+test("a challan already billed is refused, by name and invoice", () => {
+  const g = selectionGuard([
+    ch("DC-1", "order-a"),
+    ch("DC-2", "order-a", { invoice: { voucherNumber: "INV/26/0007" } }),
+  ]);
+  assert.equal(g.ok, false);
+  assert.match(g.reason, /DC-2 \(INV\/26\/0007\)/);
+  assert.match(g.reason, /billed once/);
+});
+
+test("nothing selected is refused in words", () => {
+  assert.equal(selectionGuard([]).ok, false);
+  assert.match(selectionGuard([]).reason, /at least one/i);
+  assert.equal(selectionGuard(null).ok, false);
+});
+
+test("challans of one order are one party even with a drifting name", () => {
+  const a = challanParty(ch("DC-1", "order-a", { customerName: "Riverside Hotels" }));
+  const b = challanParty(ch("DC-2", "order-a", { customerName: "RIVERSIDE  HOTELS." }));
+  assert.equal(a.key, b.key, "the order is the identity, not the typed name");
+  const g = selectionGuard([
+    ch("DC-1", "order-a", { customerName: "Riverside Hotels" }),
+    ch("DC-2", "order-a", { customerName: "RIVERSIDE  HOTELS." }),
+  ]);
+  assert.equal(g.ok, true);
+});
+
+test("the roll-up narrows to the ticked challans", () => {
+  const all = dispatchRollup([bulkChallan, personChallan], piItems);
+  const one = dispatchRollup([bulkChallan, personChallan], piItems, { only: ["c1"] });
+  assert.equal(all.totals.units, 21);
+  assert.equal(one.totals.units, 15, "only the bulk challan's units");
+  assert.equal(one.totals.challanCount, 1);
+  // …and an empty selection bills nothing, rather than everything.
+  assert.equal(dispatchRollup([bulkChallan], piItems, { only: [] }).totals.units, 0);
+});
+
+test("a challan carries the invoice the route resolved for it", () => {
+  const s = challanSummary({ ...bulkChallan, invoice: { voucherNumber: "INV/26/0007" } });
+  assert.equal(s.invoice.voucherNumber, "INV/26/0007");
+  assert.equal(challanSummary(bulkChallan).invoice, null);
+});

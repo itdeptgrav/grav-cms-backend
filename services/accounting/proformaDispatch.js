@@ -94,6 +94,10 @@ function challanSummary(challan) {
   return {
     _id: challan?._id ? String(challan._id) : null,
     challanNumber: challan?.challanNumber || "",
+    /* Resolved by the route from the invoices that reference this challan —
+       the one place the fact lives. Null means it has not been billed. */
+    invoice: challan?.invoice || null,
+    customerName: challan?.customerName || "",
     dispatchDate: challan?.dispatchDate || challan?.createdAt || null,
     dispatchType: challan?.dispatchType || "bulk",
     cartonCount: Number(challan?.cartonCount) || (challan?.cartons || []).length,
@@ -146,8 +150,16 @@ function indexProformaItems(items) {
  * @param {Array} challans  DispatchChallan documents for the order
  * @param {Array} piItems   the proforma invoice's own line items
  */
-function dispatchRollup(challans, piItems) {
-  const list = Array.isArray(challans) ? challans : [];
+function dispatchRollup(challans, piItems, opts = {}) {
+  const all = Array.isArray(challans) ? challans : [];
+  /* `only` narrows the roll-up to the challans the user ticked, so the
+     figures under a selection are the figures that will be invoiced. Absent,
+     every challan counts — which is what the panel shows before anything is
+     ticked. */
+  const only = opts.only ? new Set([...opts.only].map(String)) : null;
+  const list = only
+    ? all.filter((c) => c?._id && only.has(String(c._id)))
+    : all;
   const index = indexProformaItems(piItems);
 
   const byKey = new Map();
@@ -221,12 +233,83 @@ function dispatchRollup(challans, piItems) {
   };
 }
 
+/**
+ * Which customer a challan was dispatched for, normalised for comparison.
+ *
+ * The order is the real identity (a customer's NAME is typed and drifts), so
+ * it is preferred; the name is the fallback for a challan whose order is
+ * missing.
+ */
+function challanParty(challan) {
+  const orderId = challan?.manufacturingOrderId;
+  return {
+    orderId: orderId ? String(orderId?._id ?? orderId) : "",
+    customerName: challan?.customerName || "",
+    key: orderId
+      ? `order:${String(orderId?._id ?? orderId)}`
+      : `name:${normaliseProduct(challan?.customerName)}`,
+  };
+}
+
+/**
+ * May these challans go on ONE invoice?
+ *
+ * An invoice names a single buyer, so challans for two customers cannot share
+ * one — and unlike a wrong rate, that is not something anybody can correct on
+ * the invoice afterwards. A challan already billed is refused for the same
+ * reason in reverse: billing it twice is the fault this link exists to stop.
+ *
+ * @param {Array} challans  the challans the user ticked
+ * @returns {{ ok: boolean, reason: string|null, customers: string[],
+ *             alreadyInvoiced: string[] }}
+ */
+function selectionGuard(challans) {
+  const list = (Array.isArray(challans) ? challans : []).filter(Boolean);
+  if (!list.length) {
+    return { ok: false, reason: "Choose at least one challan to invoice.", customers: [], alreadyInvoiced: [] };
+  }
+
+  const alreadyInvoiced = list
+    .filter((c) => c.invoice && c.invoice.voucherNumber)
+    .map((c) => `${c.challanNumber} (${c.invoice.voucherNumber})`);
+  if (alreadyInvoiced.length) {
+    return {
+      ok: false,
+      reason:
+        `Already invoiced: ${alreadyInvoiced.join(", ")}. ` +
+        "A dispatch is billed once.",
+      customers: [],
+      alreadyInvoiced,
+    };
+  }
+
+  const keys = new Map();
+  for (const c of list) {
+    const p = challanParty(c);
+    if (!keys.has(p.key)) keys.set(p.key, p.customerName || p.orderId || "unknown");
+  }
+  if (keys.size > 1) {
+    return {
+      ok: false,
+      reason:
+        `These challans belong to ${keys.size} different customers ` +
+        `(${[...keys.values()].join(", ")}). One invoice bills one customer.`,
+      customers: [...keys.values()],
+      alreadyInvoiced: [],
+    };
+  }
+
+  return { ok: true, reason: null, customers: [...keys.values()], alreadyInvoiced: [] };
+}
+
 module.exports = {
   normaliseProduct,
   variantLabel,
   lineKey,
   challanProductLines,
   challanSummary,
+  challanParty,
+  selectionGuard,
   indexProformaItems,
   dispatchRollup,
 };

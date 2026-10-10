@@ -246,6 +246,41 @@ const tallyVoucherSchema = new mongoose.Schema(
       gstin: { type: String, trim: true },
     },
 
+    /* ─── THE DISPATCHES THIS INVOICE BILLS ─────────────────────────────────
+       Nothing linked a delivery challan to the invoice that billed it. The
+       `dispatchDetails` block below is free TEXT for the printed header — a
+       typed delivery-note number, not a reference — so the same dispatch
+       could be invoiced twice and no screen and no query would notice.
+
+       This is the reference. It is kept on the INVOICE and nowhere else, on
+       purpose: a denormalised "invoiced" flag on the challan would be a
+       second copy of the same fact, and the two drift the first time an
+       invoice is deleted or a save half-fails. "Has this challan been
+       billed?" is therefore one query against this array, which cannot
+       disagree with itself.
+
+       An invoice may bill SEVERAL challans (a month of deliveries on one
+       bill) and a challan is billed at most once. Every challan on one
+       invoice must belong to one customer — enforced where invoices are
+       raised from dispatches, because an invoice names a single buyer and
+       mixing two customers' goods onto it is not a thing that can be
+       corrected afterwards. */
+    sourceChallans: [
+      new mongoose.Schema(
+        {
+          challanId: { type: mongoose.Schema.Types.ObjectId, ref: "DispatchChallan", required: true },
+          challanNumber: { type: String, trim: true, default: "" },
+          dispatchDate: { type: Date, default: null },
+          /* The order the challan was dispatched against, carried so a
+             receivables question can be answered without loading it. */
+          manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          requestRef: { type: String, trim: true, default: "" },
+          units: { type: Number, default: 0 },
+        },
+        { _id: false },
+      ),
+    ],
+
     // ─── Dispatch details (printed in the invoice header) ───────────────────
     // The fields that appear in the Tally-style invoice header's right-hand
     // meta block and the consignee row. All optional. Captured per-invoice on
@@ -711,6 +746,9 @@ tallyVoucherSchema.index({ companyId: 1, voucherDate: -1 });
 // It is intentionally NOT declared here so autoIndex doesn't race/conflict with
 // the legacy full-unique index it replaces.
 tallyVoucherSchema.index({ companyId: 1, partyLedgerId: 1 });
+/* "Which invoice billed this challan?" — the question the dispatch panel
+   asks for every challan it lists. Sparse: almost no voucher has one. */
+tallyVoucherSchema.index({ "sourceChallans.challanId": 1 }, { sparse: true });
 tallyVoucherSchema.index({ companyId: 1, financialYear: 1 });
 tallyVoucherSchema.index({ "ledgerEntries.ledgerId": 1, voucherDate: -1 });
 
