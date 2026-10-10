@@ -302,6 +302,46 @@ function selectionGuard(challans) {
   return { ok: true, reason: null, customers: [...keys.values()], alreadyInvoiced: [] };
 }
 
+/* ─────────────────────────────────────────────────────────────────────────
+   IS THIS PROFORMA FINISHED?
+
+   A proforma is work for accounts for exactly as long as something it is
+   responsible for is still unbilled. Once every challan dispatched against
+   its order carries an invoice, there is nothing left to raise and the
+   document is history — so it leaves the working list.
+
+   Three states, and the difference between two of them is the whole point:
+
+     "none"  no challan has been dispatched against the order yet. NOT
+             finished: the dispatch is still to come, and this is the state
+             a proforma sits in for most of its life.
+     "part"  some challans are billed, some are not. Work.
+     "done"  at least one challan exists and every one of them is billed.
+
+   `none` and `done` both have "nothing to bill right now" in common, and
+   collapsing them is the mistake to avoid: it would hide every proforma
+   whose goods have not shipped — the ones most likely to need chasing.
+
+   Pure, so the list route can run it over a batch and the test can run it
+   over a table.
+   ───────────────────────────────────────────────────────────────────────── */
+function billingStanding(challanCount, invoicedCount) {
+  const total = Math.max(0, Number(challanCount) || 0);
+  const billed = Math.min(total, Math.max(0, Number(invoicedCount) || 0));
+  if (total === 0) {
+    return { state: "none", challanCount: 0, invoicedCount: 0, openCount: 0, done: false,
+             label: "Nothing dispatched yet" };
+  }
+  if (billed >= total) {
+    return { state: "done", challanCount: total, invoicedCount: billed, openCount: 0, done: true,
+             label: total === 1 ? "Invoiced in full" : `Invoiced in full — ${total} challans` };
+  }
+  return { state: "part", challanCount: total, invoicedCount: billed, openCount: total - billed, done: false,
+           label: billed === 0
+             ? (total === 1 ? "1 challan to bill" : `${total} challans to bill`)
+             : `${total - billed} of ${total} challans still to bill` };
+}
+
 module.exports = {
   normaliseProduct,
   variantLabel,
@@ -312,4 +352,5 @@ module.exports = {
   selectionGuard,
   indexProformaItems,
   dispatchRollup,
+  billingStanding,
 };

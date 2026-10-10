@@ -334,14 +334,11 @@ router.get("/", companyScope, async (req, res) => {
       const unresolved = list.filter((pi) => !pi.customerRequestId);
       if (unresolved.length) {
         /* One pass for every buyer on the page rather than a query per PI. */
-        const gstins = [...new Set(unresolved.map((p) => String(p.buyer?.gstin || "").trim().toUpperCase()).filter(Boolean))];
-        const names = [...new Set(unresolved.map((p) => p.buyer?.name).filter(Boolean))];
-        const customers = await Cust.find({
-          $or: [
-            ...(gstins.length ? [{ gstin: { $in: gstins } }] : []),
-            ...(names.length ? [{ name: { $in: names } }] : []),
-          ],
-        }).select("name companyName gstin").lean();
+        const { customerLookupForMany } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupForMany(unresolved.map((p) => p.buyer));
+        const customers = where
+          ? await Cust.find(where).select("name companyName gstin").lean()
+          : [];
 
         const custIds = customers.map((c) => c._id);
         const orders = custIds.length
@@ -386,12 +383,77 @@ router.get("/", companyScope, async (req, res) => {
       console.error("[proforma list] order matching skipped:", e.message);
     }
 
+    /* ── A FINISHED PROFORMA LEAVES THE LIST ────────────────────────────
+       Once every challan dispatched against a proforma's order carries an
+       invoice, there is nothing left for accounts to raise and the document
+       is history. It drops out of the working list; `?billing=all` brings
+       the finished ones back, because a document the company really issued
+       must stay reachable — this hides completed work, it deletes nothing.
+
+       TWO QUERIES FOR THE WHOLE PAGE, not two per row: the challans of
+       every listed order at once, then the vouchers naming any of those
+       challans. The invoice carries the reference (Acc_Voucher
+       .sourceChallans), so this reads the same link the dispatch panel
+       does and there is no second flag to fall out of step with it.
+
+       "Nothing dispatched yet" is NOT finished — see billingStanding. */
+    const billingByPi = new Map();
+    let finishedCount = 0;
+    try {
+      const { billingStanding } = require("../../services/accounting/proformaDispatch");
+      const orderIds = [...new Set(list.filter((p) => p.customerRequestId).map((p) => String(p.customerRequestId)))];
+      if (orderIds.length) {
+        const DispatchChallan = require("../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+        const Challan = DispatchChallan.DispatchChallan || DispatchChallan;
+        const { Acc_Voucher } = require("../../models/Accountant_model/Acc_VoucherModels");
+
+        const challans = await Challan.find({ manufacturingOrderId: { $in: orderIds } })
+          .select("_id manufacturingOrderId")
+          .lean();
+        const byOrder = new Map();
+        for (const c of challans) {
+          const k = String(c.manufacturingOrderId);
+          if (!byOrder.has(k)) byOrder.set(k, []);
+          byOrder.get(k).push(String(c._id));
+        }
+
+        const allChallanIds = challans.map((c) => c._id);
+        const billedIds = new Set();
+        if (allChallanIds.length) {
+          const vouchers = await Acc_Voucher.find({
+            companyId,
+            "sourceChallans.challanId": { $in: allChallanIds },
+          }).select("sourceChallans").lean();
+          for (const v of vouchers) {
+            for (const sc of v.sourceChallans || []) billedIds.add(String(sc.challanId));
+          }
+        }
+
+        for (const pi of list) {
+          if (!pi.customerRequestId) continue;
+          const ids = byOrder.get(String(pi.customerRequestId)) || [];
+          const st = billingStanding(ids.length, ids.filter((id) => billedIds.has(id)).length);
+          billingByPi.set(String(pi._id), st);
+          if (st.done) finishedCount += 1;
+        }
+      }
+    } catch (e) {
+      /* The list must still open when the dispatch side is unavailable.
+         Nothing is marked finished, so nothing is hidden — the safe way to
+         fail for a filter whose job is to REMOVE rows. */
+      console.error("[proforma list] billing standing skipped:", e.message);
+    }
+
     const withOrder = list.filter((pi) => pi.customerRequestId);
     const withoutOrder = list.length - withOrder.length;
     if (String(req.query.withOrder || "linked") !== "all") list = withOrder;
+    if (String(req.query.billing || "open") !== "all") {
+      list = list.filter((pi) => !(billingByPi.get(String(pi._id)) || {}).done);
+    }
     list = list.map((pi) => ({
       ...pi,
       orderMatch: matchInfo.get(String(pi._id)) || (pi.customerRequestId ? { how: "stored" } : null),
+      billing: billingByPi.get(String(pi._id)) || null,
     }));
 
     // KPI strip data — counts per status + total value of accepted PIs
@@ -413,6 +475,8 @@ router.get("/", companyScope, async (req, res) => {
       /* How many were left out for having no order. Named so the screen can
          say it rather than quietly showing a shorter list. */
       withoutOrder,
+      /* …and how many were left out for being finished. Same reason. */
+      finishedCount,
     });
   } catch (e) {
     console.error("[proforma list]", e);
@@ -492,8 +556,13 @@ router.get("/:id", companyScope, async (req, res) => {
 // -----------------------------------------------------------------------------
 router.get("/:id/dispatch", companyScope, async (req, res) => {
   try {
+    /* `buyer` and `buyersReference` ARE NOT OPTIONAL HERE. The matcher below
+       reads both — the order number written on the proforma is its strongest
+       proof, and the buyer is how the candidate orders are found at all.
+       Leaving them out of the projection made `pi.buyer` undefined, which
+       built a customer query with no criteria at all. See below. */
     const pi = await Acc_ProformaInvoice.findById(req.params.id)
-      .select("customerRequestId requestRef items companyId")
+      .select("customerRequestId requestRef items companyId buyer buyersReference")
       .lean();
     if (!pi) return res.status(404).json({ success: false, message: "Not found" });
 
@@ -508,13 +577,11 @@ router.get("/:id/dispatch", companyScope, async (req, res) => {
         const m = require("../../models/Customer_Models/CustomerRequest");
         const Request = m.CustomerRequest || m;
         const Cust = require("../../models/Customer_Models/Customer");
-        const gstin = String(pi.buyer?.gstin || "").trim().toUpperCase();
-        const cust = await Cust.findOne({
-          $or: [
-            ...(gstin ? [{ gstin }] : []),
-            ...(pi.buyer?.name ? [{ name: pi.buyer.name }] : []),
-          ],
-        }).select("_id").lean();
+        /* Null when the buyer carries nothing to look one up by — see
+           customerLookupFor. An empty `$or` would match EVERYTHING. */
+        const { customerLookupFor } = require("../../services/accounting/proformaOrderMatch");
+        const where = customerLookupFor(pi.buyer);
+        const cust = where ? await Cust.findOne(where).select("_id").lean() : null;
         const candidates = cust
           ? await Request.find({ customerId: cust._id })
               .select("requestId customerName customerId").lean()

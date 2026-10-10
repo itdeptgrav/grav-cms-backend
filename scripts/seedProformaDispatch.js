@@ -49,11 +49,11 @@ const REQUEST_ID = "MO-REQ-DEMO-DISPATCH";
    "every PI is showing all the dispatch" was. With it, each proforma shows
    only its own challans, and ticking across the two is the refusal to see. */
 const REQUEST_ID_B = "MO-REQ-DEMO-DISPATCH-B";
-const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002", "DC-DEMO-0003"];
+const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002", "DC-DEMO-0003", "DC-DEMO-0004", "DC-DEMO-0005"];
 /* The third carries NO stored link — only the order number written in its
    buyer's reference. It exists to prove the matching is automatic: opening
    the list resolves and persists it without anybody choosing an order. */
-const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002", "PI/DEMO/0003"];
+const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002", "PI/DEMO/0003", "PI/DEMO/0004"];
 /* Customer has `customerId` (a String), NOT `customerCode` — keying on a
    field the schema does not declare meant strict mode dropped it, so every
    run made another customer and --undo deleted none of them. */
@@ -63,6 +63,9 @@ const CUSTOMER_ID = "DEMO-RIVERSIDE";
    /(\.\w{2,3})+$/, which refuses a 4-letter TLD like ".test". */
 const CUSTOMER_EMAIL = "accounts@riversidedemo.com";
 const CUSTOMER_ID_B = "DEMO-HILLVIEW";
+const CUSTOMER_ID_C = "DEMO-NORTHGATE";
+const REQUEST_ID_C = "MO-REQ-DEMO-DISPATCH-C";
+const CUSTOMER_EMAIL_C = "accounts@northgatedemo.com";
 const CUSTOMER_EMAIL_B = "accounts@hillviewdemo.com";
 
 const arg = (name, fallback = null) => {
@@ -132,15 +135,15 @@ const BUYER = {
 };
 
 async function undo() {
-  const order = await CustomerRequest.findOne({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B] } }).lean();
+  const order = await CustomerRequest.findOne({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B, REQUEST_ID_C] } }).lean();
   const r = {
     challans: (await DispatchChallan.deleteMany({ challanNumber: { $in: CHALLANS } })).deletedCount,
     proformas: (await Acc_ProformaInvoice.deleteMany({ voucherNumber: { $in: PI_NUMBERS } })).deletedCount,
-    orders: (await CustomerRequest.deleteMany({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B] } })).deletedCount,
+    orders: (await CustomerRequest.deleteMany({ requestId: { $in: [REQUEST_ID, REQUEST_ID_B, REQUEST_ID_C] } })).deletedCount,
     customers: (await Customer.deleteMany({
       $or: [
-        { customerId: { $in: [CUSTOMER_ID, CUSTOMER_ID_B] } },
-        { email: { $in: [CUSTOMER_EMAIL, CUSTOMER_EMAIL_B] } },
+        { customerId: { $in: [CUSTOMER_ID, CUSTOMER_ID_B, CUSTOMER_ID_C] } },
+        { email: { $in: [CUSTOMER_EMAIL, CUSTOMER_EMAIL_B, CUSTOMER_EMAIL_C] } },
       ],
     })).deletedCount,
   };
@@ -299,6 +302,70 @@ async function seed() {
     { upsert: true, new: true, setDefaultsOnInsert: true },
   );
 
+  /* ── A THIRD order: ONE CHALLAN, THREE DIFFERENT PRODUCTS ──────────────
+     The first two challans carry one product in two sizes. A real challan
+     often carries unrelated products, and the roll-up has to keep them as
+     separate lines while still folding the variants of each. This order is
+     also the one whose single challan gets invoiced during the UI walk, so
+     it is the case that proves a finished proforma leaves the list.
+
+     Its buyer name is also spelled differently from its ledger ("Northgate
+     Apparel (DEMO)" against the ledger's "Northgate Apparel Private
+     Limited"), so the ledger matcher is exercised on a real near-miss. */
+  const BUYER_C = {
+    name: "Northgate Apparel (DEMO)",
+    addressLines: ["Unit 7, Export Promotion Park"], city: "Bhubaneswar",
+    state: "Odisha", stateCode: "21", pincode: "751019", country: "India",
+    gstin: "21AAGCN4455K1Z2",
+  };
+  let customerC =
+    (await Customer.findOne({ customerId: CUSTOMER_ID_C })) ||
+    (await Customer.findOne({ email: CUSTOMER_EMAIL_C }));
+  if (!customerC) {
+    customerC = await Customer.create({
+      customerId: CUSTOMER_ID_C, name: BUYER_C.name, companyName: BUYER_C.name,
+      email: CUSTOMER_EMAIL_C, phone: "9000000003", gstin: BUYER_C.gstin,
+    });
+  }
+  const quotationItemsC = [
+    { productName: "Chef Coat", variant: "Size: M", quantity: 30, rate: 800, unit: "Nos", hsnCode: "6203", gstRate: 12 },
+    { productName: "Chef Coat", variant: "Size: L", quantity: 20, rate: 850, unit: "Nos", hsnCode: "6203", gstRate: 12 },
+    { productName: "Apron", variant: "", quantity: 60, rate: 220, unit: "Nos", hsnCode: "6211", gstRate: 5 },
+    { productName: "Service Cap", variant: "", quantity: 60, rate: 95, unit: "Nos", hsnCode: "6505", gstRate: 5 },
+  ];
+  let orderC = await CustomerRequest.findOne({ requestId: REQUEST_ID_C });
+  if (!orderC) orderC = new CustomerRequest({ requestId: REQUEST_ID_C });
+  orderC.customerId = customerC._id;
+  orderC.customerName = BUYER_C.name;
+  orderC.status = "production";
+  orderC.customerInfo = { name: BUYER_C.name, gstin: BUYER_C.gstin, deliveryDeadline: new Date(Date.now() + 12 * 864e5) };
+  orderC.quotations = [{ items: quotationItemsC, grandTotal: 69090, status: "sales_approved" }];
+  await orderC.save();
+
+  /* One challan, four product-variant lines across three products. */
+  await DispatchChallan.findOneAndUpdate(
+    { challanNumber: CHALLANS[3] },
+    { $set: {
+        challanNumber: CHALLANS[3], manufacturingOrderId: orderC._id, requestId: REQUEST_ID_C,
+        customerName: BUYER_C.name, dispatchType: "bulk", source: "carton",
+        dispatchDate: new Date(Date.now() - 1 * 864e5),
+        bulkProducts: [
+          { productName: "Chef Coat", quantity: 30, variantAttributes: [{ name: "Size", value: "M" }] },
+          { productName: "Chef Coat", quantity: 20, variantAttributes: [{ name: "Size", value: "L" }] },
+          { productName: "Apron", quantity: 60, variantAttributes: [] },
+          { productName: "Service Cap", quantity: 60, variantAttributes: [] },
+        ],
+        cartons: [
+          { cartonNumber: "CTN-DEMO-0007", totalQuantity: 50, lines: [] },
+          { cartonNumber: "CTN-DEMO-0008", totalQuantity: 120, lines: [] },
+        ],
+        cartonCount: 2, totalUnits: 170, totalPersons: 0, totalProducts: 4,
+        transport: { transporter: "TCI Express", lrNumber: "TCI-90031", vehicleNumber: "OD02XY7788" },
+        dispatchedBy: "Seed script",
+      } },
+    { upsert: true, new: true, setDefaultsOnInsert: true },
+  );
+
   // ── Two proformas, EACH on its own order ────────────────────────────────
   const voucherDate = new Date();
   const items = [
@@ -310,12 +377,21 @@ async function seed() {
   const itemsB = [piLine({ name: "Spa Robe — Size: Free", hsn: "6208", qty: 20, rate: 900, taxRate: 12 })];
   const totalsB = piTotals(itemsB);
 
+  const itemsC = [
+    piLine({ name: "Chef Coat — Size: M", hsn: "6203", qty: 30, rate: 800, taxRate: 12 }),
+    piLine({ name: "Chef Coat — Size: L", hsn: "6203", qty: 20, rate: 850, taxRate: 12 }),
+    piLine({ name: "Apron", hsn: "6211", qty: 60, rate: 220, taxRate: 5 }),
+    piLine({ name: "Service Cap", hsn: "6505", qty: 60, rate: 95, taxRate: 5 }),
+  ];
+  const totalsC = piTotals(itemsC);
+
   const made = [];
   for (const [i, voucherNumber] of PI_NUMBERS.entries()) {
     const second = i === 1;
+    const fourth = i === 3;
     /* The third is Riverside's again, deliberately UNLINKED. */
     const third = i === 2;
-    const buyer = second ? BUYER_B : BUYER;
+    const buyer = fourth ? BUYER_C : second ? BUYER_B : BUYER;
     const doc = {
       companyId: company._id,
       voucherNumber,
@@ -326,8 +402,8 @@ async function seed() {
       consignee: { ...buyer, name: `${buyer.name} — Site Store` },
       /* The link this whole feature turns on — a DIFFERENT order each. The
          third is left NULL so the automatic matcher has something to find. */
-      customerRequestId: third ? null : second ? orderB._id : order._id,
-      requestRef: third ? "" : second ? REQUEST_ID_B : REQUEST_ID,
+      customerRequestId: fourth ? orderC._id : third ? null : second ? orderB._id : order._id,
+      requestRef: fourth ? REQUEST_ID_C : third ? "" : second ? REQUEST_ID_B : REQUEST_ID,
       /* …and the order's number is written where a person would write it. */
       buyersReference: third ? `Against ${REQUEST_ID}` : "RFQ/RH/2026/118",
       dispatchedThrough: "VRL Logistics",
@@ -336,13 +412,13 @@ async function seed() {
       paymentTerms: "50% advance, balance on delivery",
       otherReferences: "Seeded demonstration document",
       isInterState: false,
-      items: second ? itemsB : items,
-      ...(second ? totalsB : totals),
+      items: fourth ? itemsC : second ? itemsB : items,
+      ...(fourth ? totalsC : second ? totalsB : totals),
       narration: "Uniform supply for the Nayapalli property.",
       internalNotes: "[seed:proforma-dispatch] safe to delete",
       /* The second one is ACCEPTED on purpose: PUT /:id refuses it, so it is
          the document that proves PATCH /:id/order-link was needed. */
-      status: i === 0 ? "sent" : i === 1 ? "accepted" : "sent",
+      status: i === 1 ? "accepted" : "sent",
     };
     const pi = await Acc_ProformaInvoice.findOneAndUpdate(
       { companyId: company._id, financialYear: doc.financialYear, voucherNumber },
@@ -352,11 +428,11 @@ async function seed() {
     made.push(pi);
   }
 
-  return { company, order, orderB, proformas: made };
+  return { company, order, orderB, orderC, proformas: made };
 }
 
 /* ── Prove it, with the real service the screen reads ────────────────────── */
-async function verify({ company, order, orderB, proformas }) {
+async function verify({ company, order, orderB, orderC, proformas }) {
   const challans = await DispatchChallan.find({ manufacturingOrderId: order._id }).sort({ createdAt: 1 }).lean();
   const pi = proformas[0];
   const r = dispatchRollup(challans, pi.items);
@@ -402,6 +478,33 @@ async function verify({ company, order, orderB, proformas }) {
   if (mixed.ok) problems.push("a selection spanning two customers was allowed");
   const sameCustomer = selectionGuard(challans);
   if (!sameCustomer.ok) problems.push(`one customer's challans were refused: ${sameCustomer.reason}`);
+
+  /* ── ONE CHALLAN, SEVERAL DIFFERENT PRODUCTS ──────────────────────────
+     Order C's single challan carries three products, one of them in two
+     sizes. The roll-up must give four lines — folding the two Chef Coat
+     sizes apart, not together, and not merging unrelated products — and
+     every one of them must be priced, because the proforma prices them all. */
+  const challansC = await DispatchChallan.find({ manufacturingOrderId: orderC._id }).lean();
+  const piC = proformas.find((p) => p.voucherNumber === "PI/DEMO/0004");
+  if (challansC.length !== 1) problems.push(`order C should have exactly 1 challan, got ${challansC.length}`);
+  if (piC) {
+    const rc = dispatchRollup(challansC, piC.items);
+    if (rc.lines.length !== 4) problems.push(`order C's challan should roll up to 4 lines, got ${rc.lines.length}`);
+    const products = new Set(rc.lines.map((l) => l.productName));
+    if (products.size !== 3) problems.push(`order C should show 3 distinct products, got ${products.size}`);
+    const coats = rc.lines.filter((l) => /Chef Coat/i.test(l.productName));
+    if (coats.length !== 2) problems.push(`Chef Coat should stay two lines (M and L), got ${coats.length}`);
+    if (coats.some((l) => l.rate === null)) problems.push("both Chef Coat sizes are priced on PI/DEMO/0004");
+    if (rc.totals.unpriced !== 0) problems.push(`order C prices everything it dispatched, got ${rc.totals.unpriced} unpriced`);
+    if (rc.totals.units !== 170) problems.push(`order C dispatched 170 units, got ${rc.totals.units}`);
+    /* 30×800 + 20×850 + 60×220 + 60×95 = 24000+17000+13200+5700 */
+    if (rc.totals.value !== 59900) problems.push(`order C priced value should be 59,900, got ${rc.totals.value}`);
+    console.log("");
+    console.log(`Order ${REQUEST_ID_C} · 1 challan · ${rc.lines.length} lines · ${products.size} products · ${rc.totals.units} units · ${money(rc.totals.value)}`);
+    for (const l of rc.lines) {
+      console.log(`  ${l.productName.padEnd(22)} ${String(l.variant || "—").padEnd(10)} ${String(l.quantity).padStart(4)}  ${money(l.rate).padStart(12)}  ${money(l.amount).padStart(14)}`);
+    }
+  }
 
   /* ── The third proforma must match itself ──────────────────────────────
      It is stored with no order; only the order number is written on it. If
