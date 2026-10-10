@@ -13,6 +13,7 @@
 // =============================================================================
 
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
@@ -385,6 +386,90 @@ router.get("/:id", companyScope, async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
+// GET /:id/dispatch — what has been dispatched against this PI's order
+// -----------------------------------------------------------------------------
+// The accounts department bills what LEFT the factory, so this answers "what
+// has gone out against this proforma" in billable terms: product, variant,
+// quantity, the rate from the proforma's own line, and which challans say so.
+// The packing detail (which carton, which wearer) is deliberately rolled up —
+// see services/accounting/proformaDispatch.js.
+//
+// A PI with no linked order is not an error. It answers `linked: false` and
+// the screen offers to link one, because most proformas predate the link.
+// -----------------------------------------------------------------------------
+router.get("/:id/dispatch", companyScope, async (req, res) => {
+  try {
+    const pi = await Acc_ProformaInvoice.findById(req.params.id)
+      .select("customerRequestId requestRef items companyId")
+      .lean();
+    if (!pi) return res.status(404).json({ success: false, message: "Not found" });
+
+    if (!pi.customerRequestId) {
+      return res.json({
+        success: true,
+        linked: false,
+        order: null,
+        challans: [],
+        lines: [],
+        totals: { challanCount: 0, cartonCount: 0, units: 0, value: 0, productCount: 0, unpriced: 0 },
+      });
+    }
+
+    /* Required lazily and guarded: the manufacturing models live in another
+       part of the tree, and accounting must not fail to open a PI because a
+       CMS model moved. */
+    let DispatchChallan = null;
+    let CustomerRequest = null;
+    try {
+      DispatchChallan = require("../../models/CMS_Models/Manufacturing/Dispatch/DispatchChallan");
+      CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+    } catch (e) {
+      console.error("[proforma dispatch] manufacturing models unavailable:", e.message);
+      return res.json({
+        success: true,
+        linked: true,
+        unavailable: "The dispatch module is not available on this deployment.",
+        order: { _id: String(pi.customerRequestId), requestId: pi.requestRef || "" },
+        challans: [], lines: [],
+        totals: { challanCount: 0, cartonCount: 0, units: 0, value: 0, productCount: 0, unpriced: 0 },
+      });
+    }
+
+    const Challan = DispatchChallan.DispatchChallan || DispatchChallan;
+    const Request = CustomerRequest.CustomerRequest || CustomerRequest;
+
+    const [challans, order] = await Promise.all([
+      Challan.find({ manufacturingOrderId: pi.customerRequestId })
+        .sort({ createdAt: 1 })
+        .lean(),
+      Request.findById(pi.customerRequestId)
+        .select("requestId customerName status customerInfo")
+        .lean(),
+    ]);
+
+    const { dispatchRollup } = require("../../services/accounting/proformaDispatch");
+    const rolled = dispatchRollup(challans, pi.items);
+
+    res.json({
+      success: true,
+      linked: true,
+      order: order
+        ? {
+            _id: String(order._id),
+            requestId: order.requestId || pi.requestRef || "",
+            customerName: order.customerName || "",
+            status: order.status || "",
+          }
+        : { _id: String(pi.customerRequestId), requestId: pi.requestRef || "", missing: true },
+      ...rolled,
+    });
+  } catch (e) {
+    console.error("[proforma dispatch]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
+// -----------------------------------------------------------------------------
 // POST / — create a new PI
 // -----------------------------------------------------------------------------
 // Required body fields:
@@ -486,6 +571,11 @@ router.post("/", companyScope, async (req, res) => {
       buyer: body.buyer,
       consignee,
       partyLedgerId: body.partyLedgerId || undefined,
+      /* The order this proforma is for, when the form linked one. Both are
+         optional and both are stored: the id is the join to dispatch, the
+         ref is what a list prints. */
+      customerRequestId: body.customerRequestId || null,
+      requestRef: body.requestRef || "",
       buyersReference: body.buyersReference,
       dispatchedThrough: body.dispatchedThrough,
       destination: body.destination,
@@ -538,6 +628,8 @@ router.put("/:id", companyScope, async (req, res) => {
       "buyer",
       "consignee",
       "partyLedgerId",
+      "customerRequestId",
+      "requestRef",
       "buyersReference",
       "dispatchedThrough",
       "destination",
@@ -593,6 +685,71 @@ const VALID_TRANSITIONS = {
   expired: ["draft"],
   cancelled: [],
 };
+
+// -----------------------------------------------------------------------------
+// PATCH /:id/order-link — point this PI at a manufacturing order (or clear it)
+// -----------------------------------------------------------------------------
+// Separate from PUT /:id on purpose. That route refuses an accepted or
+// cancelled PI because it edits FIGURES, and rightly so — but an ACCEPTED
+// proforma is precisely the one somebody bills a dispatch against, so
+// requiring a revert-to-draft to record which order it belongs to would mean
+// unwinding an acceptance to add a reference.
+//
+// This changes no amount, no tax and no line: it writes an id and the order's
+// human number, and nothing downstream recomputes. Cancelled is still refused
+// — a voided document should not grow new links.
+// -----------------------------------------------------------------------------
+router.patch("/:id/order-link", companyScope, async (req, res) => {
+  try {
+    const pi = await Acc_ProformaInvoice.findById(req.params.id);
+    if (!pi) return res.status(404).json({ success: false, message: "Not found" });
+    if (pi.status === "cancelled") {
+      return res.status(400).json({
+        success: false,
+        message: "This proforma is cancelled — it cannot be linked to an order.",
+      });
+    }
+
+    const { customerRequestId = null, requestRef = "" } = req.body || {};
+
+    if (customerRequestId) {
+      if (!mongoose.Types.ObjectId.isValid(String(customerRequestId))) {
+        return res.status(400).json({ success: false, message: "That is not a valid order id." });
+      }
+      /* Proved to exist before it is stored: a dangling id would show the
+         panel an order that is not there and read as a dispatch failure. */
+      let Request = null;
+      try {
+        const m = require("../../models/Customer_Models/CustomerRequest");
+        Request = m.CustomerRequest || m;
+      } catch { Request = null; }
+      if (Request) {
+        const order = await Request.findById(customerRequestId).select("requestId").lean();
+        if (!order) {
+          return res.status(404).json({ success: false, message: "That order no longer exists." });
+        }
+        pi.requestRef = String(requestRef || order.requestId || "").trim();
+      } else {
+        pi.requestRef = String(requestRef || "").trim();
+      }
+      pi.customerRequestId = customerRequestId;
+    } else {
+      pi.customerRequestId = null;
+      pi.requestRef = "";
+    }
+
+    pi.updatedBy = req.user?.id;
+    await pi.save();
+    res.json({
+      success: true,
+      customerRequestId: pi.customerRequestId ? String(pi.customerRequestId) : null,
+      requestRef: pi.requestRef || "",
+    });
+  } catch (e) {
+    console.error("[proforma order-link]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
 
 router.patch("/:id/status", async (req, res) => {
   try {
