@@ -194,6 +194,64 @@ async function tlApproved(mrf) {
   });
 }
 
+/**
+ * The manager decided some lines — item by item.
+ *
+ * The requester hears exactly which items were approved and which rejected
+ * (with the reason); the Store hears about the approved ones, which are on its
+ * desk now. `batchKey` is the submission's own key: two submissions a minute
+ * apart are two notifications, not one swallowed by the dedupe window.
+ */
+async function itemsDecided(mrf, { approved = [], rejected = [], awaiting = 0, handedToStore = false, batchKey = "" } = {}) {
+  const by = mrf.tlApprovedByName || mrf.approverName || "your Primary Manager/TL";
+  const actor = (approved[0] || rejected[0])?.approval?.decidedByName || by;
+  const qty = (l) => {
+    const a = l.approval || {};
+    return a.rejectedQty > 0
+      ? `${fmtQty(a.approvedQty, l.unit)} of ${fmtQty(a.requestedQty, l.unit)}`
+      : fmtQty(a.approvedQty ?? l.requestedQty, l.unit);
+  };
+  const approvedText = approved.map((l) => `${l.rawItemName} (${qty(l)})`).join(", ");
+  const rejectedText = rejected.map((l) => `${l.rawItemName}${l.approval?.reason ? ` — ${l.approval.reason}` : ""}`).join("; ");
+  const waitingText = awaiting ? ` ${awaiting} item(s) still awaiting a decision.` : "";
+  const tag = `mrf-decided-${mrf._id}-${batchKey}`;
+
+  const bits = [];
+  if (approved.length) bits.push(`Approved and sent to the Store: ${approvedText}.`);
+  if (rejected.length) bits.push(`Rejected: ${rejectedText}.`);
+
+  await notifyCowork({
+    recipientIds: [requesterId(mrf)],
+    type: "request",
+    tag,
+    title: approved.length && rejected.length
+      ? "Material request partly approved"
+      : approved.length ? "Items on your material request approved" : "Items on your material request rejected",
+    body: N(mrf, `${actor} decided ${approved.length + rejected.length} item(s). ${bits.join(" ")}${waitingText}`),
+    data: linkData(mrf),
+  });
+
+  if (tlId(mrf).length) {
+    await notifyCowork({
+      recipientIds: [tlId(mrf)],
+      type: "request",
+      tag: `${tag}-ack`,
+      title: "Your decisions were recorded",
+      body: N(mrf, `${bits.join(" ")}${waitingText}`),
+      data: tlLinkData(mrf),
+    });
+  }
+
+  if (approved.length) {
+    await notifyStore({
+      mrf,
+      tag: `mrf-store-${mrf._id}-${batchKey}`,
+      title: handedToStore ? "MRF approved by TL" : "More items approved on an MRF",
+      body: N(mrf, `${approved.length} item(s) approved by ${actor} for ${mrf.requestedForName} and ready for Store processing: ${approvedText}.`),
+    });
+  }
+}
+
 /** TL rejected — dead end, requester needs the reason. */
 async function tlRejected(mrf) {
   const by = mrf.tlRejectedByName || mrf.approverName || "your Primary Manager/TL";
@@ -260,8 +318,10 @@ async function availabilityUpdated(mrf, summary = []) {
 async function issued(mrf, lines = []) {
   if (!lines.length) return;
 
+  /* Lines still waiting on the manager are not the Store's to owe yet. */
   const stillPending = (mrf.items || [])
     .filter(i => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus))
+    .filter(i => !(i.approval && i.approval.decision === "PENDING"))
     .reduce((s, i) => s + Math.max(0, (i.requestedQty || 0) - (i.issuedQty || 0)), 0);
 
   const issuedText = lines
@@ -527,7 +587,7 @@ async function productRequestTlRejected(doc) {
 
 module.exports = {
   notifyCowork, notifyStore,
-  submitted, autoForwarded, tlApproved, tlRejected,
+  submitted, autoForwarded, tlApproved, tlRejected, itemsDecided,
   availabilityUpdated, issued, returned, unfulfilled, cancelled,
   chatMessage, subjectChatMessage,
   productRequestSubmitted, productRequestAutoForwarded,

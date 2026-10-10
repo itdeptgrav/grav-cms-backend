@@ -24,6 +24,7 @@ const NotificationService = require("../../../../services/NotificationService")
 const RawItemAddRequest = require("../../../../models/CMS_Models/Inventory/Operations/RawItemAddRequest")
 
 const mrfApprover = require("../../../../services/mrfApprover.service")
+const itemApproval = require("../../../../services/mrfItemApproval.service")
 const autoReservation = require("../../../../services/storePurchase/autoReservation.service")
 const customerSuppliedRouting = require("../../../../services/storePurchase/customerSuppliedRouting.service")
 const mrfNotify = require("../../../../services/mrfNotify.service")
@@ -117,7 +118,7 @@ const tenantContext = require("../../../../services/storePurchase/tenantContext.
 const mrfAuthority = require("../../../../services/storePurchase/mrfAuthority.service")
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service")
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service")
-const documentSequence = require("../../../../services/storePurchase/documentSequence.service")
+const mrfNumber = require("../../../../services/storePurchase/mrfNumber.service")
 const { fail, sendError } = require("../../../../services/storePurchase/errors")
 
 const MRF_ENTITY = "MRF"
@@ -328,24 +329,6 @@ const recoverMrf = async (req, mrf, entry, payload, status = 200) => {
 }
 
 /**
- * The request is already in the state this call wanted.
- *
- * ── WHY THIS IS NOT JUST AN EARLY RETURN ────────────────────────────────────
- * It used to answer "Already approved" and stop. That is right about the
- * request and wrong about the record: if the decision committed and the
- * history write then failed, every retry took this path and cheerfully
- * reported success while nothing immutable said who decided. The state agreed;
- * the audit trail was missing, permanently and invisibly.
- *
- * So the shortcut repairs first. `unitOfWork.recover` writes the entry only if
- * it is genuinely absent, which makes calling it on every replay harmless.
- */
-const alreadyInState = async (req, mrf, entry, message) => {
-  const payload = { success: true, message, mrf, alreadyDone: true }
-  return recoverMrf(req, mrf, entry, payload)
-}
-
-/**
  * Note a state change in the request's own thread.
  *
  * Awaited rather than fired and forgotten: the thread is how the requester
@@ -478,6 +461,51 @@ router.get("/my-approver", async (req, res) => {
 // ═════════════════════════════════════════════════════════════════════════════
 
 /**
+ * Counts over a whole set of requests, by the manager's decisions.
+ *
+ * `pending` keeps its name because both frontends read it — it now means
+ * "still has a line waiting" (awaiting + partially processed), which is what
+ * the badge on Approvals and the Awaiting tile always meant to say. `issued`
+ * is the Store's and is unchanged.
+ */
+async function approvalStats(match) {
+  const S = itemApproval.APPROVAL_STATUS
+  const [row] = await MRF.aggregate([
+    { $match: match },
+    { $addFields: { _approval: itemApproval.approvalStatusExpr() } },
+    {
+      $group: {
+        _id: null,
+        total: { $sum: 1 },
+        pending: {
+          $sum: {
+            $cond: [{
+              $and: [
+                { $in: ["$_approval", [S.AWAITING_APPROVAL, S.PARTIALLY_PROCESSED]] },
+                { $not: [{ $in: ["$status", ["CANCELLED", "REJECTED"]] }] },
+              ],
+            }, 1, 0],
+          },
+        },
+        awaitingApproval: { $sum: { $cond: [{ $eq: ["$_approval", S.AWAITING_APPROVAL] }, 1, 0] } },
+        partiallyProcessed: { $sum: { $cond: [{ $eq: ["$_approval", S.PARTIALLY_PROCESSED] }, 1, 0] } },
+        approved: { $sum: { $cond: [{ $eq: ["$_approval", S.APPROVED] }, 1, 0] } },
+        partiallyApproved: { $sum: { $cond: [{ $eq: ["$_approval", S.PARTIALLY_APPROVED] }, 1, 0] } },
+        rejected: { $sum: { $cond: [{ $eq: ["$_approval", S.REJECTED] }, 1, 0] } },
+        cancelled: { $sum: { $cond: [{ $eq: ["$status", "CANCELLED"] }, 1, 0] } },
+        issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
+      },
+    },
+  ])
+  const stats = row || {
+    total: 0, pending: 0, awaitingApproval: 0, partiallyProcessed: 0,
+    approved: 0, partiallyApproved: 0, rejected: 0, cancelled: 0, issued: 0,
+  }
+  delete stats._id
+  return stats
+}
+
+/**
  * GET /approvals — every MRF this user is the Primary Manager/TL for.
  *
  * Matched on approverBiometricId, which was resolved from the requester's HR
@@ -511,18 +539,42 @@ router.get("/approvals", async (req, res) => {
       ],
     }
 
+    /* ── THE QUEUE IS FILTERED BY THE MANAGER'S DECISIONS ─────────────────
+       Not by `status`, which is the Store's lifecycle: a request reaches the
+       Store when its first line is approved, and the rest of its lines are
+       still this manager's to decide. "PENDING" therefore means "has a line
+       still waiting" — awaiting or partially processed — and the decided
+       filters read `approvalStatus`. Old requests with no stored approval
+       status are classified from their `status` (see approvalStatusMatch). */
+    const S = itemApproval.APPROVAL_STATUS
+    const QUEUE_FILTERS = {
+      PENDING: [S.AWAITING_APPROVAL, S.PARTIALLY_PROCESSED],
+      AWAITING_APPROVAL: [S.AWAITING_APPROVAL],
+      PARTIALLY_PROCESSED: [S.PARTIALLY_PROCESSED],
+      APPROVED: [S.APPROVED],
+      PARTIALLY_APPROVED: [S.PARTIALLY_APPROVED],
+      REJECTED: [S.REJECTED],
+      CANCELLED: [S.CANCELLED],
+    }
+    const want = String(status || "PENDING").toUpperCase()
     const filter = { ...scope }
-    if (status && status !== "ALL") filter.status = status
+    const and = []
+    if (want !== "ALL") {
+      and.push(itemApproval.approvalStatusMatch(QUEUE_FILTERS[want] || [want]))
+      /* A withdrawn request has nothing left to decide, whatever its lines say. */
+      if (want === "PENDING") and.push({ status: { $nin: ["CANCELLED", "REJECTED"] } })
+    }
     if (search) {
-      filter.$and = [{
+      and.push({
         $or: [
           { mrfNumber: { $regex: search, $options: "i" } },
           { requestedForName: { $regex: search, $options: "i" } },
           { requestedForId: { $regex: search, $options: "i" } },
           { reason: { $regex: search, $options: "i" } },
         ],
-      }]
+      })
     }
+    if (and.length) filter.$and = and
 
     const skip = (parseInt(page) - 1) * parseInt(limit)
     const total = await MRF.countDocuments(filter)
@@ -532,23 +584,10 @@ router.get("/approvals", async (req, res) => {
       .lean()
 
     markOverdue(mrfs)
+    mrfs.forEach(itemApproval.annotate)
     withContext(mrfs, "tl")
 
-    const statsAgg = await MRF.aggregate([
-      { $match: scope },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: 1 },
-          pending: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
-          approved: { $sum: { $cond: [{ $eq: ["$status", "APPROVED"] }, 1, 0] } },
-          rejected: { $sum: { $cond: [{ $eq: ["$status", "REJECTED"] }, 1, 0] } },
-          issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
-        },
-      },
-    ])
-    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, rejected: 0, issued: 0 }
-    delete stats._id
+    const stats = await approvalStats(scope)
 
     // A request with items not yet matched to the catalogue is still just an
     // MRF — those items carry itemStatus "UNMATCHED" once approved, and the
@@ -569,9 +608,238 @@ router.get("/approvals", async (req, res) => {
   }
 })
 
+/* ═════════════════════════════════════════════════════════════════════════════
+ * DECIDING — item by item
+ *
+ * Every way a manager decides goes through `decideLines`: the item-wise
+ * submission, and the Approve all / Reject all buttons the request has always
+ * had. Each line is decided once; an approved line reaches the Store at once,
+ * without waiting for the rest of the request. The rules are
+ * services/mrfItemApproval.service.js — this is the HTTP around them.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** The reason recorded on a line rejected through the old per-item toggle,
+ *  which never asked for one. */
+const NOT_APPROVED_REASON = "Not approved when the request was approved."
+
+/** A request as a screen should read it: every line's decision stamped on. */
+const annotated = (mrf) => itemApproval.annotate(typeof mrf.toObject === "function" ? mrf.toObject() : mrf)
+
+const qtyText = (q, unit) => `${Math.round((Number(q) || 0) * 1000) / 1000}${unit ? ` ${unit}` : ""}`
+
+/** One sentence for the request's thread, naming what moved. */
+function decisionSentence(actorName, outcome) {
+  const who = actorName || "The approver"
+  const parts = []
+  if (outcome.approved.length) {
+    const names = outcome.approved.map((l) => {
+      const a = l.approval || {}
+      return a.rejectedQty > 0
+        ? `${l.rawItemName} (${qtyText(a.approvedQty, l.unit)} of ${qtyText(a.requestedQty, l.unit)})`
+        : `${l.rawItemName} (${qtyText(a.approvedQty, l.unit)})`
+    })
+    parts.push(`approved ${names.join(", ")} — ${outcome.approved.length === 1 ? "it is" : "they are"} now with the Store`)
+  }
+  if (outcome.rejected.length) {
+    parts.push(`rejected ${outcome.rejected.map((l) => `${l.rawItemName} (reason: ${l.approval?.reason || "—"})`).join(", ")}`)
+  }
+  let text = `${who} ${parts.join("; and ")}.`
+  if (outcome.summary.awaiting) {
+    text += ` ${outcome.summary.awaiting} item${outcome.summary.awaiting === 1 ? " is" : "s are"} still awaiting a decision.`
+  }
+  return text
+}
+
 /**
- * PATCH /:id/tl-approve — the only approval step in the flow.
- * On success the request moves straight to the Store.
+ * Decide some or all of a request's waiting lines and answer the caller.
+ *
+ * @param {(mrf) => object[]|{refusal: string}} build  the decisions, from the request as loaded
+ * @param {string} historyAction     the immutable history action name
+ */
+async function decideLines(req, res, { build, historyAction, note = "", recoveredMessage = "Already decided" }) {
+  const scope = { _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) }
+  const loaded = await MRF.findOne(scope)
+  if (!loaded) return res.status(404).json({ success: false, message: "MRF not found" })
+
+  /* ── AN INTERRUPTED DECISION FINISHES; IT DOES NOT START AGAIN ──────────
+   * The change committed on an earlier attempt and something after it did
+   * not — usually the history write. Falling through to the checks below
+   * would refuse this as "already decided": true of the request, useless to
+   * the caller, and it would leave the missing history missing for ever. */
+  if (req.idempotent?.recovering) {
+    return await recoverMrf(req, loaded, { action: historyAction, previousState: "PENDING" }, {
+      success: true, message: recoveredMessage, mrf: annotated(loaded), alreadyDone: true,
+    })
+  }
+
+  /* Resolve a pre-routing approver onto the request FIRST, so the matrix
+     judges the request as it will be stored. */
+  const backfill = await backfillApprover(loaded, req.user)
+  const actor = await resolveEmployee(req.user.id)
+  const actorName = buildFullName(actor) || req.user.name || ""
+
+  /* ── DECIDED ON A FRESH COPY, EVERY ATTEMPT ──────────────────────────────
+   * Everything from the authority check to the save runs INSIDE the unit of
+   * work, on a request read inside it. A transaction that is retried — a write
+   * conflict with the background reservation still saving the previous
+   * submission is the ordinary cause — rolls the first save back, and saving
+   * the same in-memory document again writes NOTHING (mongoose already
+   * considers it saved), while the history entry commits and the caller is told
+   * it worked. Re-reading and re-applying makes the retry a genuine retry; in a
+   * deployment without transactions this runs once. Any refusal thrown in here
+   * aborts the attempt with nothing written. */
+  let mrf = loaded
+  let outcome = null
+  try {
+    await unitOfWork.run(req.tenant, {
+      idempotencyRecord: req.idempotent?.record,
+      mutate: async (session) => {
+        mrf = session ? await MRF.findOne(scope).session(session) : loaded
+        if (!mrf) throw fail("NOT_FOUND", "That material request was not found.")
+        if (backfill) applyBackfill(mrf, backfill)
+        await may(req, "APPROVE", mrf)
+
+        const decisions = build(mrf)
+        if (decisions && decisions.refusal) throw fail("VALIDATION", decisions.refusal)
+        const checked = itemApproval.validateDecisions(mrf, decisions)
+        if (!checked.ok) {
+          throw fail(checked.code === "ALREADY_DECIDED" ? "INVALID_TRANSITION" : "VALIDATION", checked.message, {
+            itemId: checked.itemId || null, field: checked.field || null,
+          })
+        }
+        outcome = itemApproval.applyDecisions(mrf, checked.decisions, {
+          id: actor?._id || null, name: actorName, biometricId: req.user.id,
+        })
+        if (note && outcome.approved.length) mrf.storeNotes = note
+
+        await mrf.save(session ? { session } : {})
+        return {
+          entityType: MRF_ENTITY,
+          entityId: mrf._id,
+          result: true,
+          entry: {
+            entityType: MRF_ENTITY,
+            entityId: mrf._id,
+            documentNumber: mrf.mrfNumber,
+            requestId: req.id || "",
+            idempotencyKey: req.idempotent?.key || "",
+            action: historyAction,
+            previousState: outcome.previousStatus,
+            resultingState: mrf.status,
+            reason: outcome.rejected.map((l) => `${l.rawItemName}: ${l.approval?.reason || ""}`).join("; ").slice(0, 500) || note || "",
+            metadata: {
+              lineCount: (mrf.items || []).length,
+              approvalStatus: outcome.summary.status,
+              approvedLineIds: outcome.approved.map((l) => String(l._id)),
+              rejectedLineIds: outcome.rejected.map((l) => String(l._id)),
+              approvedQtys: outcome.approved.map((l) => Number(l.approval?.approvedQty) || 0),
+              awaitingCount: outcome.summary.awaiting,
+              handedToStore: outcome.handedToStore,
+            },
+          },
+        }
+      },
+    })
+  } catch (err) {
+    /* Without a transaction: two submissions on one request at once, and the
+       second read the request before the first saved. Nothing of it landed. */
+    if (err?.name === "VersionError") {
+      throw fail("INVALID_TRANSITION",
+        "This request changed while you were deciding — it has been refreshed. Check the items and submit again.",
+        { reason: "CONCURRENT_DECISION" })
+    }
+    throw err
+  }
+
+  await noteInThread(req, mrf, decisionSentence(actorName, outcome), actorName)
+  /* The whole request decided in one go reads exactly as it always did —
+     "approved and forwarded" / "rejected". Anything item-wise names the items.
+     Notifying is after the commit and can never undo or fail the decision. */
+  const wholeApproval = outcome.handedToStore && !outcome.rejected.length
+    && outcome.summary.status === itemApproval.APPROVAL_STATUS.APPROVED
+  const notify = outcome.fullyRejected
+    ? () => mrfNotify.tlRejected(mrf)
+    : wholeApproval
+      ? () => mrfNotify.tlApproved(mrf)
+      : () => mrfNotify.itemsDecided(mrf, {
+        approved: outcome.approved,
+        rejected: outcome.rejected,
+        awaiting: outcome.summary.awaiting,
+        handedToStore: outcome.handedToStore,
+        batchKey: req.idempotent?.key || String(Date.now()),
+      })
+  Promise.resolve().then(notify).catch(e => console.error("[mrf decisions notify]", e?.message || e))
+
+  /* ── APPROVED LINES REACH THE STORE NOW ─────────────────────────────────
+     Approval is what makes a line eligible, so approval is what attempts the
+     hold — for the lines approved in THIS submission as much as the first.
+     AFTER the commit and outside it: a shelf read that fails must never
+     un-approve a decision a person already made. Both are idempotent for lines
+     already handled, and both skip lines still waiting on the manager. */
+  if (outcome.approved.length) {
+    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
+    autoReservation.attemptInBackground({
+      tenant: req.tenant, mrfId: mrf._id,
+      trigger: autoReservation.TRIGGERS.TL_APPROVED,
+      actorName, actorId: actor?._id || null,
+    })
+  }
+
+  const obj = annotated(mrf)
+  const s = outcome.summary
+  const message = outcome.fullyRejected
+    ? "Request rejected"
+    : [
+      outcome.approved.length ? `${outcome.approved.length} item${outcome.approved.length === 1 ? "" : "s"} approved and sent to the Store` : "",
+      outcome.rejected.length ? `${outcome.rejected.length} rejected` : "",
+      s.awaiting ? `${s.awaiting} still awaiting your decision` : "",
+    ].filter(Boolean).join(" · ")
+  const payload = { success: true, message, mrf: obj, context: buildContext(obj, "tl") }
+  return req.idempotent
+    ? await req.idempotent.succeed(200, payload, { entityType: MRF_ENTITY, entityId: mrf._id })
+    : res.json(payload)
+}
+
+/** A structured refusal (forbidden, wrong tenant, invalid transition) must
+ *  reach the client as itself, not as a generic 500. */
+function decisionError(label, err, res) {
+  if (err?.name === "StorePurchaseError") return sendError(res, err)
+  console.error(`[CoworkMRF ${label}]`, err)
+  return res.status(500).json({ success: false, message: err.message })
+}
+
+/**
+ * PATCH /:id/item-decisions — the manager decides lines one by one.
+ *
+ * Body: `{ decisions: [{ itemId, decision: "APPROVED"|"REJECTED",
+ *                         approvedQty?, reason? }] }`
+ *
+ * Any subset of the lines still waiting. Approved lines go to the Store at
+ * once; the rest stay in the manager's queue. A rejection needs a reason, as
+ * does approving less than was asked. A line already decided is refused —
+ * decisions are final.
+ */
+router.patch(
+  "/:id/item-decisions",
+  refuseLegacyWrite,
+  withIdempotency("MRF_TL_ITEM_DECISIONS"),
+  async (req, res) => {
+    try {
+      return await decideLines(req, res, {
+        historyAction: "TL_ITEM_DECISIONS",
+        build: () => (Array.isArray(req.body?.decisions) ? req.body.decisions : []),
+      })
+    } catch (err) { return decisionError("item-decisions", err, res) }
+  },
+)
+
+/**
+ * PATCH /:id/tl-approve — Approve all: every line still waiting, in full.
+ *
+ * Kept exactly as callers already use it (the CMS Material Requests app sends
+ * an empty body). On a request some of whose lines were already decided it
+ * approves the REST — the lines decided earlier keep their decisions.
+ * `itemDecisions` (the old per-item toggle) still rejects the lines it names.
  *
  * Deliberately does NOT block on stock. The store reports availability after
  * approval; a TL approving "yes, this person may have it" is a separate
@@ -582,212 +850,57 @@ router.patch(
   refuseLegacyWrite,
   withIdempotency("MRF_TL_APPROVE"),
   async (req, res) => {
-  try {
-    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-
-    /* ── AN INTERRUPTED DECISION FINISHES; IT DOES NOT START AGAIN ──────────
-     * The change committed on an earlier attempt and something after it did
-     * not — usually the history write. Falling through to the transition
-     * checks below would refuse this as "already {state}": true of the
-     * request, useless to the caller, and it would leave the missing history
-     * missing forever. So recovery comes first — repair the record, then
-     * answer as the first attempt would have. */
-    if (req.idempotent?.recovering) {
-      return await recoverMrf(req, mrf, { action: "TL_APPROVED", previousState: "PENDING" }, {
-        success: true, message: "Already approved", mrf, alreadyDone: true,
+    try {
+      const { itemDecisions, note = "" } = req.body || {}
+      return await decideLines(req, res, {
+        historyAction: "TL_APPROVED",
+        note: String(note || "").trim(),
+        recoveredMessage: "Already approved",
+        build: (mrf) => {
+          const waiting = new Set(itemApproval.awaitingLineIds(mrf))
+          const lines = (mrf.items || []).filter((l) => waiting.has(String(l._id)))
+          const map = itemDecisions && typeof itemDecisions === "object" ? itemDecisions : {}
+          const out = lines.map((l) => {
+            const d = String(map[String(l._id)] || "").toUpperCase()
+            return d === "REJECTED" || d === "REJECT"
+              ? { itemId: String(l._id), decision: "REJECTED", reason: String(note || "").trim() || NOT_APPROVED_REASON }
+              : { itemId: String(l._id), decision: "APPROVED" }
+          })
+          const anyApprovedBefore = itemApproval.approvalSummary(mrf).approved > 0
+          if (out.length && !anyApprovedBefore && out.every((d) => d.decision === "REJECTED")) {
+            return { refusal: "Every item was rejected — use Reject on the whole request instead." }
+          }
+          return out
+        },
       })
-    }
-
-    /* Resolve a pre-routing approver onto the request FIRST, so the matrix
-       judges the request as it will be stored, then ask the one matrix. */
-    const backfill = await backfillApprover(mrf, req.user)
-    if (backfill) applyBackfill(mrf, backfill)
-    await may(req, "APPROVE", mrf)
-
-    if (mrf.status === "CANCELLED")
-      return res.status(400).json({ success: false, message: "This request was cancelled by the requester." })
-    if (mrf.tlApproved)
-      return await alreadyInState(req, mrf, {
-        action: "TL_APPROVED", previousState: "PENDING",
-      }, "Already approved")
-    if (mrf.status !== "PENDING")
-      return res.status(400).json({ success: false, message: `Cannot approve — this request is already ${mrf.status.toLowerCase().replace(/_/g, " ")}.` })
-
-    const { itemDecisions, note = "" } = req.body
-
-    // Per-item approve/reject. Everything not explicitly rejected is approved
-    // — except a line the requester raised without a catalogue match, which
-    // becomes UNMATCHED: TL-approved (they may have it), but the Store still
-    // has to match it to an item or register it before it's issuable.
-    const nextStatus = (item) => (item.rawItem ? "APPROVED" : "UNMATCHED")
-    if (itemDecisions && typeof itemDecisions === "object") {
-      mrf.items.forEach(item => {
-        const d = itemDecisions[String(item._id)]
-        item.itemStatus = d === "REJECTED" || d === "reject" ? "REJECTED" : nextStatus(item)
-      })
-      if (mrf.items.every(i => i.itemStatus === "REJECTED"))
-        return res.status(400).json({
-          success: false,
-          message: "Every item was rejected — use Reject on the whole request instead.",
-        })
-    } else {
-      mrf.items.forEach(item => { item.itemStatus = nextStatus(item) })
-    }
-
-    const actor = await resolveEmployee(req.user.id)
-    const actorName = buildFullName(actor) || req.user.name || ""
-
-    mrf.tlApproved = true
-    mrf.tlApprovedBy = actor?._id || null
-    mrf.tlApprovedByName = actorName
-    mrf.tlApprovedAt = new Date()
-    mrf.tlRejected = false
-    mrf.tlRejectedBy = null; mrf.tlRejectedAt = null; mrf.tlRejectionNote = ""
-    mrf.status = "APPROVED"
-    mrf.approvedAt = new Date()
-    if (note) mrf.storeNotes = note
-
-    const rejectedCount = mrf.items.filter(i => i.itemStatus === "REJECTED").length
-    mrf.logEvent({
-      action: "TL_APPROVED",
-      actorName, actorRole: "tl",
-      detail: rejectedCount
-        ? `Approved with ${rejectedCount} item(s) rejected.${note ? ` Note: ${note}` : ""}`
-        : (note || "Approved and forwarded to the Store."),
-    })
-
-    /* The decision and the record of it land together. Written separately,
-       a history failure left the request approved with nothing immutable
-       saying who approved it — and the `alreadyDone` shortcut below then
-       hid that gap from every retry. */
-    await commitMrf(req, mrf, {
-      action: "TL_APPROVED",
-      previousState: "PENDING",
-      resultingState: mrf.status,
-      reason: note || "",
-      metadata: { lineCount: (mrf.items || []).length },
-    })
-
-    await noteInThread(req, mrf, `${actorName || "The TL"} approved this request — it is now with the Store.`, actorName)
-    mrfNotify.tlApproved(mrf).catch(e => console.error("[tlApprove notify]", e.message))
-
-    /* ── THE STORE NO LONGER RESERVES BY HAND ───────────────────────────────
-       Approval is what makes a line eligible, so approval is what attempts the
-       hold. AFTER the commit and deliberately not inside it: a shelf read that
-       fails must never un-approve a decision a person already made. The outcome
-       is written onto each line, and a line that could not be held appears in
-       the Store's Needs-attention queue with a retry. */
-    /* ── AND THE LINES THE CUSTOMER IS SENDING ──────────────────
-       The same approval, routed the other way: a customer-supplied line
-       produces a customer-material expectation, never a reservation and
-       never a purchase. Both run after the commit for the same reason —
-       neither may be able to undo a decision a person already made. */
-    customerSuppliedRouting.routeInBackground({ tenant: req.tenant, mrfId: mrf._id })
-    autoReservation.attemptInBackground({
-      tenant: req.tenant, mrfId: mrf._id,
-      trigger: autoReservation.TRIGGERS.TL_APPROVED,
-      actorName, actorId: actor?._id || null,
-    })
-
-    const approvedPayload = { success: true, message: "Approved and sent to the Store", mrf, context: buildContext(mrf.toObject(), "tl") }
-    return req.idempotent
-      ? await req.idempotent.succeed(200, approvedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
-      : res.json(approvedPayload)
-  } catch (err) {
-    /* A structured refusal (forbidden, wrong tenant, invalid transition)
-       must reach the client as itself, not as a generic 500. */
-    if (err?.name === "StorePurchaseError") return sendError(res, err)
-    console.error("[CoworkMRF tl-approve]", err)
-    res.status(500).json({ success: false, message: err.message })
-  }
-},
+    } catch (err) { return decisionError("tl-approve", err, res) }
+  },
 )
 
-/** PATCH /:id/tl-reject — reason is mandatory, the requester is told why. */
+/**
+ * PATCH /:id/tl-reject — Reject all: every line still waiting.
+ *
+ * The reason is mandatory and the requester sees it. Lines approved earlier
+ * stay approved and stay with the Store — this only answers what is still
+ * waiting. With nothing approved, the whole request is rejected.
+ */
 router.patch(
   "/:id/tl-reject",
   refuseLegacyWrite,
   withIdempotency("MRF_TL_REJECT"),
   async (req, res) => {
-  try {
-    const note = String(req.body.note || req.body.rejectionNote || "").trim()
-    if (!note)
-      return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
-
-    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) })
-    if (!mrf) return res.status(404).json({ success: false, message: "MRF not found" })
-
-    /* ── AN INTERRUPTED DECISION FINISHES; IT DOES NOT START AGAIN ──────────
-     * The change committed on an earlier attempt and something after it did
-     * not — usually the history write. Falling through to the transition
-     * checks below would refuse this as "already {state}": true of the
-     * request, useless to the caller, and it would leave the missing history
-     * missing forever. So recovery comes first — repair the record, then
-     * answer as the first attempt would have. */
-    if (req.idempotent?.recovering) {
-      return await recoverMrf(req, mrf, { action: "TL_REJECTED", previousState: "PENDING" }, {
-        success: true, message: "Already rejected", mrf, alreadyDone: true,
+    try {
+      const note = String(req.body?.note || req.body?.rejectionNote || "").trim()
+      if (!note)
+        return res.status(400).json({ success: false, message: "A rejection reason is required — the requester sees it." })
+      return await decideLines(req, res, {
+        historyAction: "TL_REJECTED",
+        recoveredMessage: "Already rejected",
+        build: (mrf) => itemApproval.awaitingLineIds(mrf)
+          .map((itemId) => ({ itemId, decision: "REJECTED", reason: note })),
       })
-    }
-
-    /* Resolve a pre-routing approver onto the request FIRST, so the matrix
-       judges the request as it will be stored, then ask the one matrix. */
-    const backfill = await backfillApprover(mrf, req.user)
-    if (backfill) applyBackfill(mrf, backfill)
-    await may(req, "REJECT", mrf)
-
-    if (["ISSUED", "PARTIALLY_ISSUED", "PARTIALLY_RETURNED", "COMPLETED"].includes(mrf.status))
-      return res.status(400).json({ success: false, message: "Cannot reject — the Store has already issued material against this request." })
-    if (mrf.status === "CANCELLED")
-      return res.status(400).json({ success: false, message: "This request was already cancelled." })
-    if (mrf.tlRejected)
-      return await alreadyInState(req, mrf, {
-        action: "TL_REJECTED", previousState: "PENDING",
-      }, "Already rejected")
-
-    const actor = await resolveEmployee(req.user.id)
-    const actorName = buildFullName(actor) || req.user.name || ""
-
-    mrf.tlRejected = true
-    mrf.tlRejectedBy = actor?._id || null
-    mrf.tlRejectedByName = actorName
-    mrf.tlRejectedAt = new Date()
-    mrf.tlRejectionNote = note
-    mrf.tlApproved = false
-    mrf.status = "REJECTED"
-    mrf.rejectedAt = new Date()
-    mrf.rejectionNote = note
-    mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
-
-    mrf.logEvent({ action: "TL_REJECTED", actorName, actorRole: "tl", detail: note })
-    /* The change and the record of it land together — written separately,
-       a history failure left the request changed with nothing immutable
-       saying who changed it, and the `alreadyDone` shortcut then hid the
-       gap from every retry. */
-    await commitMrf(req, mrf, {
-      action: "TL_REJECTED",
-      previousState: "PENDING",
-      resultingState: mrf.status,
-      reason: req.body?.note || req.body?.reason || "",
-      metadata: { lineCount: (mrf.items || []).length },
-    })
-
-    await noteInThread(req, mrf, `${actorName || "The TL"} rejected this request. Reason: ${note}`, actorName)
-    mrfNotify.tlRejected(mrf).catch(e => console.error("[tlReject notify]", e.message))
-
-    const rejectedPayload = { success: true, message: "Request rejected", mrf, context: buildContext(mrf.toObject(), "tl") }
-    return req.idempotent
-      ? await req.idempotent.succeed(200, rejectedPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
-      : res.json(rejectedPayload)
-  } catch (err) {
-    /* A structured refusal (forbidden, wrong tenant, invalid transition)
-       must reach the client as itself, not as a generic 500. */
-    if (err?.name === "StorePurchaseError") return sendError(res, err)
-    console.error("[CoworkMRF tl-reject]", err)
-    res.status(500).json({ success: false, message: err.message })
-  }
-},
+    } catch (err) { return decisionError("tl-reject", err, res) }
+  },
 )
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -817,22 +930,13 @@ router.get("/", async (req, res) => {
       .lean()
 
     markOverdue(mrfs)
+    mrfs.forEach(itemApproval.annotate)
     withContext(mrfs, "requester")
 
-    const statsAgg = await MRF.aggregate([
-      { $match: { requestedFor: emp._id, ...tenantContext.tenantFilter(req.tenant) } },
-      {
-        $group: {
-          _id: null,
-          total: { $sum: 1 },
-          pending: { $sum: { $cond: [{ $eq: ["$status", "PENDING"] }, 1, 0] } },
-          approved: { $sum: { $cond: [{ $eq: ["$status", "APPROVED"] }, 1, 0] } },
-          issued: { $sum: { $cond: [{ $in: ["$status", ["ISSUED", "PARTIALLY_ISSUED"]] }, 1, 0] } },
-        }
-      },
-    ])
-    const stats = statsAgg[0] || { total: 0, pending: 0, approved: 0, issued: 0 }
-    delete stats._id
+    /* By the manager's decisions, across ALL of this person's requests — not
+       the page. A request with one line still waiting is "pending" even after
+       its other lines reached the Store. */
+    const stats = await approvalStats({ requestedFor: emp._id, ...tenantContext.tenantFilter(req.tenant) })
 
     res.json({ success: true, mrfs, stats, pagination: { total, page: parseInt(page), limit: parseInt(limit), totalPages: Math.ceil(total / parseInt(limit)) } })
   } catch (err) {
@@ -954,9 +1058,8 @@ async function createMrfRequest(req, res) {
 
     /* Server-owned and atomic: one $inc, so two requests submitted in
        the same moment cannot receive the same number. */
-    const allocated = await documentSequence.allocate({
+    const allocated = await mrfNumber.allocate({
       companyId: req.tenant.companyId,
-      documentType: "MATERIAL_REQUEST",
       siteId: req.tenant.siteId || null,
     })
     const mrf = new MRF({
@@ -983,9 +1086,14 @@ async function createMrfRequest(req, res) {
       // No TL to approve → it goes straight to the Store, already approved
       // (or UNMATCHED, for a line with no catalogue item yet).
       status: autoForward ? "APPROVED" : "PENDING",
+      /* Every line waits on the manager on its own — recorded, not inferred,
+         so a line still waiting is never mistaken for one the Store may act on
+         once a sibling line has been approved. An auto-forwarded request had
+         no manager to decide; its lines carry no decision record. */
+      approvalStatus: autoForward ? "APPROVED" : "AWAITING_APPROVAL",
       items: autoForward
         ? builtItems.map(i => ({ ...i, itemStatus: i.rawItem ? "APPROVED" : "UNMATCHED" }))
-        : builtItems,
+        : builtItems.map(i => ({ ...i, approval: { decision: "PENDING", requestedQty: i.requestedQty } })),
       ...(autoForward ? { approvedAt: new Date() } : {}),
     })
 
@@ -1033,7 +1141,7 @@ async function createMrfRequest(req, res) {
       mrfNotify.submitted(mrf).catch(e => console.error("[mrf submitted notify]", e.message))
     }
 
-    const obj = mrf.toObject()
+    const obj = itemApproval.annotate(mrf.toObject())
     const createdPayload = {
       success: true,
       message: autoForward
@@ -1213,6 +1321,7 @@ router.get("/:id", async (req, res) => {
     const via = await may(req, "VIEW", mrf)
 
     markOverdue([mrf])
+    itemApproval.annotate(mrf)
     const audience = via?.via === "requester" ? "requester" : "tl"
     const itemsWithStock = await enrichItemsWithStock(mrf.items || [])
 
@@ -1222,9 +1331,15 @@ router.get("/:id", async (req, res) => {
       itemsWithStock,
       context: buildContext(mrf, audience),
       audience,
-      canApprove: access.canApprove && mrf.status === "PENDING",
+      /* This read `access.canApprove`, and `access` was never defined in this
+         file — every detail read threw and answered 500. The approver may
+         decide while any line is still waiting. */
+      canApprove: via?.via === "approver" && (mrf.approvalCounts?.awaiting || 0) > 0,
     })
-  } catch (err) { res.status(500).json({ success: false, message: err.message }) }
+  } catch (err) {
+    if (err?.name === "StorePurchaseError") return sendError(res, err)
+    res.status(500).json({ success: false, message: err.message })
+  }
 })
 
 /**
@@ -1283,6 +1398,9 @@ router.patch(
     mrf.cancelledAt = new Date()
     mrf.cancellationNote = req.body.cancellationNote || "Cancelled by employee"
     mrf.items.forEach(i => { if (i.itemStatus !== "ISSUED") i.itemStatus = "REJECTED" })
+    /* Lines nobody decided stay undecided — withdrawn, not rejected by the
+       manager — and the roll-up says so. */
+    mrf.approvalStatus = itemApproval.approvalStatusOf(mrf)
     mrf.logEvent({
       action: "CANCELLED", actorName, actorRole: "employee",
       detail: mrf.cancellationNote + (wasApproved ? " (was already with the Store)" : ""),
@@ -1313,7 +1431,8 @@ router.patch(
     await noteInThread(req, mrf, `${actorName || "The requester"} cancelled this request. ${mrf.cancellationNote}`, actorName)
     mrfNotify.cancelled(mrf).catch(e => console.error("[mrf cancel notify]", e.message))
 
-    const cancelledPayload = { success: true, message: "Request cancelled", mrf, context: buildContext(mrf.toObject(), "requester") }
+    const cancelledObj = itemApproval.annotate(mrf.toObject())
+    const cancelledPayload = { success: true, message: "Request cancelled", mrf: cancelledObj, context: buildContext(cancelledObj, "requester") }
     return req.idempotent
       ? await req.idempotent.succeed(200, cancelledPayload, { entityType: MRF_ENTITY, entityId: mrf._id })
       : res.json(cancelledPayload)

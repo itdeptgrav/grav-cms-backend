@@ -102,6 +102,7 @@ const REASONS = Object.freeze({
   ALREADY_RESERVED: "ALREADY_RESERVED",
   ALREADY_SATISFIED: "ALREADY_SATISFIED",
   NOT_APPROVED: "NOT_APPROVED",
+  AWAITING_APPROVAL: "AWAITING_APPROVAL",
   CUSTOMER_SUPPLIED: "CUSTOMER_SUPPLIED",
   // ATTENTION
   ITEM_MISSING: "ITEM_MISSING",
@@ -147,6 +148,20 @@ const isApprovedRequest = (mrf) =>
  */
 function skipReason(mrf, line) {
   if (!line) return { reason: REASONS.LINE_CLOSED, message: "That line is not part of this request." };
+  /* ── NOT APPROVED YET ────────────────────────────────────────────────────
+     A request reaches the Store as soon as ONE of its lines is approved; the
+     others may still be waiting on the manager. Holding stock for a line the
+     manager may yet reject would take it from work that is approved. When the
+     line is approved, the approval itself triggers this service again. */
+  if (line.approval && line.approval.decision === "PENDING") {
+    return {
+      reason: REASONS.AWAITING_APPROVAL,
+      message: "This line is still waiting for the manager's approval — stock is reserved once it is approved.",
+    };
+  }
+  if (line.approval && line.approval.decision === "REJECTED") {
+    return { reason: REASONS.LINE_CLOSED, message: "The manager rejected this line — nothing is reserved against it." };
+  }
   /* ── THE CUSTOMER IS SENDING THIS ONE ─────────────────────────────────
      Holding company stock against a line the customer is supplying would
      reserve the factory's own material for a need that is not the factory's to

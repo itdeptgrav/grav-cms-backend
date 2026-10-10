@@ -28,6 +28,7 @@
 
 const { CAPABILITIES, hasAll } = require("./capabilities");
 const { fail } = require("./errors");
+const itemApproval = require("../mrfItemApproval.service");
 
 /** Every id a person could be known by across the two doors. */
 function actorIdentifiers(ctx, employee) {
@@ -150,10 +151,16 @@ function assertMay(action, { mrf, ctx, employee }) {
           reason: "SELF_APPROVAL",
         });
       }
-      if (mrf.status !== "PENDING") {
+      /* ── ITEM-WISE: WAITING MEANS "A LINE IS STILL WAITING" ──────────────
+         A request reaches the Store the moment its first line is approved, so
+         `status !== "PENDING"` no longer means "nothing left to decide" — the
+         rest of its lines may still be in this manager's queue. What may be
+         decided is exactly the lines still waiting; with none, the request is
+         refused the way it always was. */
+      if (!itemApproval.awaitingLineIds(mrf).length) {
         throw fail("INVALID_TRANSITION",
-          mrf.tlApproved ? "This request has already been approved."
-            : mrf.tlRejected ? "This request has already been rejected."
+          mrf.tlRejected ? "This request has already been rejected."
+            : mrf.tlApproved ? "This request has already been approved."
               : "This request is not waiting for a decision.",
           { state: mrf.status });
       }

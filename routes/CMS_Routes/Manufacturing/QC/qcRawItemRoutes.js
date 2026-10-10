@@ -62,6 +62,8 @@ const { resolveQcActor } = require("../../../../services/manufacturing/qcActor")
 const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarcodeIdentity");
 const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
 const qcGrns = require("../../../../services/manufacturing/qcRawItemGrns");
+const qcDefectStock = require("../../../../services/manufacturing/qcDefectStock.service");
+const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 
 const SLUG = "qc";
 const oid = (v) => new mongoose.Types.ObjectId(String(v));
@@ -485,7 +487,7 @@ router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
 });
 
 function recordView(r) {
-  return { _id: r._id, date: r.date, inspectedAt: r.inspectedAt, moNumber: r.moNumber, customerName: r.customerName, manufacturingOrderId: String(r.manufacturingOrderId), barcodeId: String(r.barcodeId), rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, quantity: r.quantity, unit: r.unit, purchaseOrderNumber: r.purchaseOrderNumber, vendorName: r.vendorName, goodsReceiptId: r.goodsReceiptId ? String(r.goodsReceiptId) : null, goodsReceiptNumber: r.goodsReceiptNumber || "", materialRequestNumber: r.materialRequestNumber || "", status: r.status, passedQuantity: r.passedQuantity, defectiveQuantity: r.defectiveQuantity, defects: r.defects || [], note: r.note || "", inspectedByName: r.inspectedByName, inspectedByEmail: r.inspectedByEmail, superseded: Boolean(r.superseded), hourKey: r.hourKey };
+  return { _id: r._id, date: r.date, inspectedAt: r.inspectedAt, moNumber: r.moNumber, customerName: r.customerName, manufacturingOrderId: String(r.manufacturingOrderId), barcodeId: String(r.barcodeId), rawItemName: r.rawItemName, rawItemSku: r.rawItemSku, variantLabel: r.variantLabel, quantity: r.quantity, unit: r.unit, purchaseOrderNumber: r.purchaseOrderNumber, vendorName: r.vendorName, goodsReceiptId: r.goodsReceiptId ? String(r.goodsReceiptId) : null, goodsReceiptNumber: r.goodsReceiptNumber || "", materialRequestNumber: r.materialRequestNumber || "", status: r.status, passedQuantity: r.passedQuantity, defectiveQuantity: r.defectiveQuantity, defects: r.defects || [], note: r.note || "", inspectedByName: r.inspectedByName, inspectedByEmail: r.inspectedByEmail, superseded: Boolean(r.superseded), hourKey: r.hourKey, stockDebit: stockDebitView(r.stockDebit) };
 }
 
 /* ── the scan ────────────────────────────────────────────────────────────── */
@@ -583,12 +585,19 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
     const ref = b.customerMaterial?.orderRef || "";
     if (ref && ref !== mo.requestId && ref !== moNumberOf(mo)) warnings.push(`This material was received for ${ref}, not ${moNumberOf(mo)}.`);
     if (receipt?.customerRequestId && String(receipt.customerRequestId) !== String(mo._id)) warnings.push(`This label was received on ${receipt.receiptNumber} for ${receipt.orderRef || "another order"}, not ${moNumberOf(mo)}.`);
-    if (!(b.quantity > 0)) warnings.push("This label shows no quantity left (it was used up).");
+    /* A standing defective verdict on THIS order already took its defective
+       quantity off the label (10 Oct 2026). A re-check judges the whole label
+       again and /save puts that debit back first, so the screen is shown the
+       figure /save will use — and told what the label reads meanwhile. */
+    const restoring = onThis?.stockDebit?.applied && !onThis.stockDebit.reversedAt ? r4(onThis.stockDebit.quantity) : 0;
+    const shownQty = r4((b.quantity || 0) + restoring);
+    if (!(shownQty > 0)) warnings.push("This label shows no quantity left (it was used up).");
+    if (restoring) warnings.push(`The label reads ${r4(b.quantity)} ${b.unit || ""} because ${restoring} ${b.unit || ""} was taken off the Store's stock for the standing defect. A re-check puts it back first and judges the full ${shownQty} ${b.unit || ""}.`.replace(/\s+([.,])/g, "$1"));
     if (elsewhere.length) warnings.push(`Already checked on ${elsewhere.map((e) => e.moNumber).join(", ")}.`);
 
     res.json({
       success: true,
-      sticker: { ...stickerView(b), ...src },
+      sticker: { ...stickerView(b), ...src, ...(restoring ? { quantity: shownQty, labelReads: r4(b.quantity), restoringDebit: restoring } : {}) },
       goodsReceipt: receipt,
       grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
       order: {
@@ -606,8 +615,21 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
   } catch (err) { console.error("[qc raw-items lookup]", err); res.status(500).json({ success: false, message: err.message }); }
 });
 
-/** Record the verdict. `recheck: true` replaces an earlier verdict for the same sticker on the same order. */
+/**
+ * Record the verdict. `recheck: true` replaces an earlier verdict for the same sticker on the same order.
+ *
+ * ── A DEFECT IS A STOCK DEBIT (10 Oct 2026, owner) ─────────────────────────
+ * A defective verdict takes the defective quantity off the Store's on-hand for
+ * the raw item and its variant, off the label, and off the shelf the label
+ * sits on, with a stock transaction on the RawItem so the Store's history
+ * shows it like any issue (services/manufacturing/qcDefectStock.service.js).
+ * A re-check that replaces a defective verdict puts the earlier debit back
+ * first. The verdict and its stock effect are written in ONE transaction when
+ * the database offers them. If the Store's balance cannot cover the debit the
+ * verdict is still saved and the record says the stock did not move.
+ */
 router.post("/save", requireChecker, async (req, res) => {
+  let session = null;
   try {
     const { moId, barcodeId, status, defects, defectiveQuantity, note, recheck, goodsReceiptId } = req.body || {};
     if (!isId(moId)) return res.status(400).json({ success: false, message: "Choose the order first." });
@@ -631,7 +653,16 @@ router.post("/save", requireChecker, async (req, res) => {
       linkLabel = Boolean(receipt);
     }
     if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
-    const qty = r4(b.quantity);
+
+    const prior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: mo._id, superseded: { $ne: true } });
+    if (prior && !recheck) return res.status(409).json({ success: false, code: "ALREADY_CHECKED", message: `This raw item was already ${prior.status} on ${moNumberOf(mo)} by ${prior.inspectedByName || "QC"}. Check it again to replace that verdict.`, prior: recordView(prior) });
+
+    /* The label's figure already had the earlier verdict's defect taken off
+       it. A re-check judges the WHOLE label again, so that figure is put back
+       before the quantity is read — the reversal below does the same to the
+       stock, inside the transaction. */
+    const restoring = prior && prior.stockDebit?.applied && !prior.stockDebit.reversedAt ? r4(prior.stockDebit.quantity) : 0;
+    const qty = r4((b.quantity || 0) + restoring);
     if (!(qty > 0)) return res.status(409).json({ success: false, message: "This raw item shows no quantity left — there is nothing to check." });
 
     let picked = [];
@@ -648,12 +679,11 @@ router.post("/save", requireChecker, async (req, res) => {
       if (!(defQty > 0) || defQty > qty) return res.status(400).json({ success: false, message: `The defective quantity must be between 0 and ${qty} ${b.unit || ""}.`.trim() });
       if (codes.includes("OTHER") && !str(note)) return res.status(400).json({ success: false, message: "Write what the problem is when the reason is Other." });
     }
-    const prior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: mo._id, superseded: { $ne: true } });
-    if (prior && !recheck) return res.status(409).json({ success: false, code: "ALREADY_CHECKED", message: `This raw item was already ${prior.status} on ${moNumberOf(mo)} by ${prior.inspectedByName || "QC"}. Check it again to replace that verdict.`, prior: recordView(prior) });
 
     // A check kept on a device while the server was down carries when it was made.
     const now = boundedRecordedAt(req.body?.recordedAt);
-    const doc = await QCRawItemInspection.create({
+    const actor = { id: who.id || req.qcUser?.id, name: who.name, email: who.email };
+    const fields = {
       date: shift.istDayKeyOf(now), hourKey: shift.shiftBuckets()[shift.bucketIndexOf(now)]?.key || "",
       manufacturingOrderId: mo._id, moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "", isJobWork: isJobWork(mo),
       barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantId: b.variantId || null, variantLabel: (b.variantCombination || []).join(" · "), quantity: qty, unit: b.unit || "", purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "",
@@ -664,15 +694,88 @@ router.post("/save", requireChecker, async (req, res) => {
       materialRequestId: receipt?.requestId || null, materialRequestNumber: receipt?.requestNumber || "",
       status, passedQuantity: status === "passed" ? qty : r4(qty - defQty), defectiveQuantity: status === "passed" ? 0 : defQty, defects: picked, note: str(note).slice(0, 500),
       inspectedByEmail: who.email, inspectedByName: who.name, inspectedByBiometricId: who.biometricId, inspectedAt: now,
-    });
-    if (prior) { prior.superseded = true; prior.supersededById = doc._id; prior.supersededAt = now; await prior.save(); }
-    if (linkLabel && !b.goodsReceiptId) {
-      await Barcode.updateOne({ _id: b._id, goodsReceiptId: null }, { $set: { goodsReceiptId: receipt.goodsReceiptId, goodsReceiptNumber: receipt.receiptNumber, goodsReceiptLineId: receipt.line?.goodsReceiptLineId || null } });
-    }
+    };
+
+    /* ── ONE UNIT OF WORK ─────────────────────────────────────────────────── */
+    const useTxn = await unitOfWork.transactionsAvailable();
+    session = useTxn ? await mongoose.startSession() : null;
+    const sopt = session ? { session } : {};
+    let doc = null;
+    let reversal = null;
+    const work = async () => {
+      [doc] = await QCRawItemInspection.create([fields], sopt);
+      if (prior) {
+        /* the earlier debit goes back BEFORE the new one is taken; a failure
+           here aborts the whole save — see the catch below */
+        reversal = await qcDefectStock.reverseDefectDebit({ session, prior, actor, replacedById: doc._id });
+        prior.superseded = true; prior.supersededById = doc._id; prior.supersededAt = now;
+        if (reversal) {
+          prior.stockDebit.reversedAt = reversal.reversedAt;
+          prior.stockDebit.reversalTransactionId = reversal.reversalTransactionId;
+          prior.stockDebit.reversedById = reversal.reversedById;
+          prior.markModified("stockDebit");
+        }
+        await prior.save(sopt);
+      }
+      if (status === "defective") {
+        doc.stockDebit = await qcDefectStock.applyDefectDebit({ session, inspection: doc, barcode: b, actor, labelQuantity: defQty, labelUnit: b.unit || "" });
+        await doc.save(sopt);
+      }
+      if (linkLabel && !b.goodsReceiptId) {
+        await Barcode.updateOne({ _id: b._id, goodsReceiptId: null }, { $set: { goodsReceiptId: receipt.goodsReceiptId, goodsReceiptNumber: receipt.receiptNumber, goodsReceiptLineId: receipt.line?.goodsReceiptLineId || null } }, sopt);
+      }
+    };
+    if (session) await session.withTransaction(work); else await work();
+
     const rl = (await rollups([String(mo._id)])).get(String(mo._id)) || ZERO;
-    res.status(201).json({ success: true, record: recordView(doc), replaced: prior ? String(prior._id) : null, orderTotals: rl, goodsReceipt: receipt, labelLinked: linkLabel, message: status === "passed" ? `Passed: ${qty} ${b.unit || ""} of ${b.rawItemName}.` : `Defect marked on ${b.rawItemName}: ${defQty} ${b.unit || ""} defective, ${r4(qty - defQty)} passed.` });
-  } catch (err) { console.error("[qc raw-items save]", err); res.status(500).json({ success: false, message: err.message }); }
+    const sd = doc.stockDebit;
+    const warnings = [];
+    let stockLine = "";
+    if (status === "defective") {
+      if (sd?.applied) {
+        const scope = sd.variantId != null && sd.variantNewQuantity != null ? `variant now ${sd.variantNewQuantity} ${sd.baseUnit}` : `item now ${sd.newQuantity} ${sd.baseUnit}`;
+        stockLine = ` Stock reduced by ${sd.baseQuantity} ${sd.baseUnit} (${scope}); the label now reads ${sd.labelAfter} ${b.unit || ""}.`.replace(/\s+\./g, ".");
+      } else {
+        warnings.push(`The defect was recorded but the Store's stock was NOT reduced: ${sd?.error || "unknown reason"}`);
+        stockLine = " Stock was not reduced — see the warning.";
+      }
+    }
+    if (reversal) warnings.push(`The earlier verdict's debit of ${prior.stockDebit.quantity} ${b.unit || ""} was put back before this one was applied.`);
+
+    res.status(201).json({
+      success: true, record: recordView(doc), replaced: prior ? String(prior._id) : null, orderTotals: rl, goodsReceipt: receipt, labelLinked: linkLabel,
+      stockDebit: stockDebitView(sd), reversedPriorDebit: Boolean(reversal), warnings,
+      message: status === "passed"
+        ? `Passed: ${qty} ${b.unit || ""} of ${b.rawItemName}.`
+        : `Defect marked on ${b.rawItemName}: ${defQty} ${b.unit || ""} defective, ${r4(qty - defQty)} passed.${stockLine}`,
+    });
+  } catch (err) {
+    console.error("[qc raw-items save]", err);
+    if (["ITEM_NOT_FOUND", "INSUFFICIENT_STOCK", "EXCEEDS_LABEL"].includes(err.code)) {
+      return res.status(409).json({ success: false, code: "PRIOR_DEBIT_NOT_REVERSIBLE", message: `The earlier verdict's stock debit could not be put back, so this re-check was not saved: ${err.message}` });
+    }
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    if (session) await session.endSession().catch(() => {});
+  }
 });
+
+/** The Store-side receipt of a defect, for the record view and the screen. */
+function stockDebitView(sd) {
+  if (!sd) return null;
+  return {
+    applied: Boolean(sd.applied), at: sd.at || null,
+    quantity: sd.quantity ?? null, unit: sd.unit || "", baseQuantity: sd.baseQuantity ?? null, baseUnit: sd.baseUnit || "",
+    rawItemId: sd.rawItemId ? String(sd.rawItemId) : null, variantId: sd.variantId ? String(sd.variantId) : null,
+    transactionId: sd.transactionId ? String(sd.transactionId) : null,
+    previousQuantity: sd.previousQuantity ?? null, newQuantity: sd.newQuantity ?? null,
+    variantPreviousQuantity: sd.variantPreviousQuantity ?? null, variantNewQuantity: sd.variantNewQuantity ?? null,
+    labelBefore: sd.labelBefore ?? null, labelAfter: sd.labelAfter ?? null,
+    location: sd.location ? { locationCode: sd.location.locationCode || "", quantity: sd.location.quantity ?? 0 } : null,
+    error: sd.error || "", errorCode: sd.errorCode || "",
+    reversedAt: sd.reversedAt || null, reversalTransactionId: sd.reversalTransactionId ? String(sd.reversalTransactionId) : null,
+  };
+}
 
 /* ── the GRN book (8 Oct 2026) ───────────────────────────────────────────── */
 
