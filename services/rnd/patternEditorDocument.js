@@ -89,6 +89,15 @@ const SEAM_CONFIDENCE = Object.freeze({
   CONFIRMED: "confirmed",
 });
 
+/* An internal path is not a seam merely because it looks like one. Until the
+   operation is named and confirmed, its effect on the 3D garment is unknown. */
+const INTERNAL_OPERATION = Object.freeze({
+  UNSET: "", DART: "dart", PLEAT: "pleat", FOLD: "fold",
+  TOPSTITCH: "topstitch", PLACKET: "placket",
+  POCKET_ATTACHMENT: "pocket-attachment", DECORATION: "decoration",
+  REFERENCE_ONLY: "reference-only",
+});
+
 const str = (v) => (typeof v === "string" ? v.trim() : "");
 const num = (v) => (Number.isFinite(v) ? v : null);
 const list = (v) => (Array.isArray(v) ? v : []);
@@ -168,6 +177,24 @@ function documentProblems(doc) {
     }
     if (p.provenance && !Object.values(PROVENANCE).includes(str(p.provenance.geometry))) {
       out.push(`${where}: "${p.provenance.geometry}" is not a provenance`);
+    }
+    const lineIds = new Set();
+    for (const [lineIndex, line] of list(p.internalLines).entries()) {
+      const label = `${where}: internal line ${lineIndex + 1}`;
+      const lineId = str(line.lineId);
+      if (!lineId) out.push(`${label} has no id`);
+      else if (lineIds.has(lineId)) out.push(`${label} repeats id ${lineId}`);
+      else lineIds.add(lineId);
+      if (list(line.points).length < 2 || list(line.points).some((q) => !Number.isFinite(q.x) || !Number.isFinite(q.y))) {
+        out.push(`${label} needs at least two finite points`);
+      }
+      if (!Object.values(INTERNAL_OPERATION).includes(str(line.operation))) {
+        out.push(`${label} has an unknown construction operation "${line.operation}"`);
+      }
+      if (line.confirmed && !str(line.operation)) out.push(`${label} cannot be confirmed without an operation`);
+      if (line.confirmed && str(line.operation) === INTERNAL_OPERATION.REFERENCE_ONLY && !str(line.note)) {
+        out.push(`${label} needs a reason when marked reference-only`);
+      }
     }
   });
 
@@ -335,6 +362,9 @@ function normaliseFromPatternSet(patternSet, { seed = "i", simulationInputs = nu
         lineId: mint("i"),
         points: list(l.points).map((p) => ({ x: round4(p.x * mmPerUnit), y: round4(p.y * mmPerUnit) })),
         closed: bool(l.closed),
+        operation: INTERNAL_OPERATION.UNSET,
+        confirmed: false,
+        note: "",
         provenance: PROVENANCE.IMPORTED,
       })),
       sewingLine: list(piece.sewLine).length
@@ -681,7 +711,7 @@ module.exports = {
   sideLength,
   sidePath,
   orderedRunsOf: orderedRuns,
-  EDGE_CLASS, POINT_KIND, PROVENANCE, MEASURE_KIND, SEAM_ALIGNMENT, SEAM_CONFIDENCE,
+  EDGE_CLASS, POINT_KIND, PROVENANCE, MEASURE_KIND, SEAM_ALIGNMENT, SEAM_CONFIDENCE, INTERNAL_OPERATION,
   documentProblems, runProblems, normaliseFromPatternSet, editorDocumentFor,
   round4,
 };

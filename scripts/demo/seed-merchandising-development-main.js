@@ -23,7 +23,29 @@ const {
   MerchandisingAuditEvent,
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 
+const brief = require("../../services/sales/developmentBriefCarryForward");
+const { VOCABULARY } = require("../../services/sales/developmentBriefVocabulary");
+const { fail } = require("../../services/storePurchase/errors");
+
 const PREFIX = "DEMO-DEV-";
+
+/**
+ * The demo's brief, through the service's own rules.
+ *
+ * The seed used to write fields straight onto the document, which meant it
+ * could record a brief the product itself would refuse — a fit nobody offers,
+ * a detail against "not required". Running it through the same merge and the
+ * same validation the Sales door uses makes the demo prove the contract
+ * instead of bypassing it.
+ */
+function shapeBriefForDemo(body) {
+  const groups = brief.validateBrief(
+    brief.carryForwardBrief(null, body),
+    { vocabulary: VOCABULARY, fail },
+  );
+  const ceiling = body.targetPriceCeiling;
+  return { ...groups, targetPriceCeiling: ceiling };
+}
 const arg = (name) => {
   const at = process.argv.indexOf(name);
   return at >= 0 ? String(process.argv[at + 1] || "").trim() : "";
@@ -43,31 +65,78 @@ const checker = { name: "Rahul Demo", email: "merch.approver@grav.local" };
 const resortReferences = [
   {
     url: "/demo/merchandising/development/rs-510/resort-shirt-front.jpg",
-    caption: "Buyer reference · Front view",
+    caption: "Front view, as the buyer sent it",
+    referenceType: "PRODUCT",
   },
   {
     url: "/demo/merchandising/development/rs-510/resort-shirt-back.jpg",
-    caption: "Buyer reference · Back view",
+    caption: "Back view, straight hem and side vents",
+    referenceType: "PRODUCT",
   },
   {
     url: "/demo/merchandising/development/rs-510/cotton-linen-texture.jpg",
-    caption: "Material reference · Warm-ivory cotton-linen texture",
+    caption: "Warm-ivory cotton-linen texture",
+    referenceType: "TRIM",
   },
   {
     url: "/demo/merchandising/development/rs-510/coconut-buttons.jpg",
-    caption: "Trim reference · Coconut-look four-hole buttons",
+    caption: "Coconut-look four-hole buttons, 18L",
+    referenceType: "TRIM",
   },
   {
     url: "/demo/merchandising/development/rs-510/camp-collar-detail.jpg",
-    caption: "Construction reference · Camp collar and front placket",
+    caption: "Camp collar and front placket",
+    referenceType: "ARTWORK",
   },
 ];
 
+/* ── THE BUYER'S BRIEF, AS SALES RECORDED IT ────────────────────────────────
+   Everything below used to live inside `resortBrief` as prose, which is how a
+   merchandiser ended up reading a paragraph to find out what the buyer would
+   pay and what they must not do. These are the typed fields Sales now
+   authors, in the same shape the Sales form posts.
+
+   The summary is kept, shortened to what it is for: the sentence that carries
+   the intent. The FACTS are fields. */
+const resortBuyerBrief = Object.freeze({
+  targetPriceCeiling: { amount: 850, currency: "INR", basis: "PER_PIECE" },
+  customerDirection: {
+    market: { choice: "UK" },
+    season: { choice: "RESORT", year: 2027 },
+    intendedUse: { choice: "RESORT_HOLIDAY" },
+    targetCustomer: "[DEMO DATA] men 30-45, premium UK high street",
+  },
+  productDirection: {
+    fit: { choice: "RELAXED", note: "camp collar, straight hem, side vents" },
+    fabric: { values: ["COTTON_WOVEN", "LINEN"], note: "textured, soft hand" },
+    composition: "cotton-linen, majority natural fibre",
+    weightOrFeel: "soft hand, dry handle; not papery",
+    coloursWanted: "warm ivory - not optic white",
+    performance: { values: ["BREATHABLE", "OPAQUE", "SOFT_HANDLE"] },
+    trimsAndBranding: "natural coconut-look 18L front buttons plus one spare; "
+      + "tonal sewing thread; woven main and size labels; care label; hangtag",
+    avoid: "avoid excessive transparency; keep all visible stitching tonal",
+  },
+  developmentNeed: {
+    sampleType: { choice: "PROTO" },
+    sampleQuantity: 2,
+    sampleSizes: ["M"],
+    samplePackaging: "recyclable first-proto sample packaging, no polybag",
+    printing: { state: "NOT_REQUIRED" },
+    embroidery: { state: "NOT_REQUIRED" },
+    washFinish: { state: "NOT_CONFIRMED" },
+    testing: { values: ["COLOUR_FASTNESS", "SHRINKAGE"] },
+    certification: { values: ["OEKO_TEX"] },
+    sustainability: { values: ["RECYCLABLE_PACKAGING"] },
+  },
+});
+
 const resortBrief = [
-  "[DEMO DATA] Northstar Apparel · Resort 2027 · UK market · men's woven shirts.",
-  "Develop a relaxed short-sleeve resort shirt in warm ivory with a camp collar, straight hem and side vents.",
-  "Select a breathable, soft-hand textured fabric with adequate opacity; tonal sewing thread; natural coconut-look 18L front buttons plus one spare; woven main and size labels; care label; hangtag; and recyclable first-proto sample packaging.",
-  "Sample: two pieces in size M. Avoid excessive transparency and keep all visible stitching tonal.",
+  "[DEMO DATA] Northstar Apparel's Resort 2027 drop for the UK.",
+  "Develop a relaxed short-sleeve resort shirt in warm ivory with a camp collar,",
+  "straight hem and side vents. The buyer's own references are attached; the",
+  "fabric, trims, labels and sample packaging are Merchandising's to choose",
+  "against the brief beside this.",
 ].join(" ");
 
 async function enrichDemoRecords(companyId) {
@@ -84,11 +153,18 @@ async function enrichDemoRecords(companyId) {
     SalesDevelopmentRequest.updateOne(
       { _id: request._id, companyId },
       {
+        /* ── SHAPED BY THE REAL SERVICE, NOT TYPED INTO THE DOCUMENT ────
+           `resortBuyerBrief` is the body the Sales FORM posts, and it is
+           carried through the service's own validation and carry-forward
+           (`shapeBriefForDemo`) before it reaches here — so a choice this
+           demo invents, or a detail against an answer that is not Required,
+           fails the seed instead of producing a demo record the product
+           could never have made. */
         $set: {
           requirementSummary: resortBrief,
           referenceImages: resortReferences,
           requestedCategories: ["FABRIC", "TRIMS", "LABELS", "ACCESSORIES", "SAMPLE_PACKAGING"],
-          targetPriceCeiling: { amount: 850, currency: "INR", basis: "PER_PIECE" },
+          ...shapeBriefForDemo(resortBuyerBrief),
         },
       },
     ),

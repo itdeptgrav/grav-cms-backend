@@ -78,6 +78,7 @@ const ALIASES = Object.freeze({
   "employee.is_physically_challenged": ["physically challenged", "physical challenge status"],
   "employee.shift": ["work shift", "shift"],
   "employee.needs_to_operate": ["needs to operate", "machine operator status"],
+  "compensation.configured_salary_summary": ["salary", "salary details", "salary breakdown", "compensation", "pay package"],
   "compensation.configured_gross_monthly": ["gross salary", "monthly gross", "current gross"],
   "compensation.configured_basic_monthly": ["basic salary", "monthly basic"],
   "compensation.configured_hra_monthly": ["hra", "house rent allowance"],
@@ -91,6 +92,8 @@ const ALIASES = Object.freeze({
   "compensation.configured_stipend_monthly": ["stipend"],
   "payroll.gross_earnings": ["payroll gross", "gross paid", "gross earnings"],
   "payroll.net_pay": ["payroll net", "net paid", "net pay"],
+  "payroll.salary_summary": ["payslip", "pay slip", "payroll summary", "salary slip"],
+  "payroll.annual_salary_summary": ["annual salary summary", "yearly salary summary"],
 });
 
 const rows = [
@@ -138,6 +141,7 @@ const rows = [
   ["employee.needs_to_operate", "Needs-to-operate status", "needsToOperate", CURRENT, "boolean"],
 
   // Employee compensation master — configured monthly values, not payroll.
+  ["compensation.configured_salary_summary", "Current configured salary", "salary", CURRENT, "configured_salary_summary"],
   ["compensation.configured_gross_monthly", "Configured gross monthly salary", "salary.gross", CURRENT, "money"],
   ["compensation.configured_basic_monthly", "Configured basic monthly salary", "salary.basic", CURRENT, "money"],
   ["compensation.configured_hra_monthly", "Configured monthly HRA", "salary.hra", CURRENT, "money"],
@@ -161,6 +165,8 @@ const rows = [
   ["payroll.status", "Payroll status", "status", MONTH, "text"],
   ["payroll.annual_gross", "Annual payroll gross earnings", "totalGross", YEAR, "money"],
   ["payroll.annual_net_pay", "Annual payroll net pay", "totalNetPay", YEAR, "money"],
+  ["payroll.salary_summary", "Posted payroll summary", null, MONTH, "payroll_salary_summary"],
+  ["payroll.annual_salary_summary", "Annual payroll summary", null, YEAR, "annual_salary_summary"],
 ];
 
 const METRICS = Object.freeze(Object.fromEntries(rows.map(([id, label, path, temporal, valueType]) => [
@@ -189,16 +195,31 @@ const CATALOGUE = compileSemanticCatalogue({
 // language matching: when a request carries an explicit payroll period, the
 // period variant is the only semantically valid source for that measure.
 const PERIOD_VARIANTS = Object.freeze({
-  "compensation.configured_gross_monthly": "payroll.gross_earnings",
-  "compensation.configured_net_salary_monthly": "payroll.net_pay",
-  "compensation.configured_total_deduction_monthly": "payroll.total_deductions",
+  "compensation.configured_salary_summary": Object.freeze({
+    month: "payroll.salary_summary",
+    year: "payroll.annual_salary_summary",
+  }),
+  "compensation.configured_gross_monthly": Object.freeze({
+    month: "payroll.gross_earnings",
+    year: "payroll.annual_gross",
+  }),
+  "compensation.configured_net_salary_monthly": Object.freeze({
+    month: "payroll.net_pay",
+    year: "payroll.annual_net_pay",
+  }),
+  "compensation.configured_total_deduction_monthly": Object.freeze({
+    month: "payroll.total_deductions",
+  }),
 });
 
 const metricIds = () => Object.keys(METRICS);
 const metric = (id) => METRICS[id] || null;
 const metricForRequest = (id, { month, year } = {}) => {
-  const hasPeriod = month !== undefined || year !== undefined;
-  return metric(hasPeriod && PERIOD_VARIANTS[id] ? PERIOD_VARIANTS[id] : id);
+  const variants = PERIOD_VARIANTS[id];
+  if (!variants) return metric(id);
+  if (month !== undefined && variants.month) return metric(variants.month);
+  if (year !== undefined && variants.year) return metric(variants.year);
+  return metric(id);
 };
 
 function metricGlossary() {
@@ -262,6 +283,52 @@ function formatValue(value, valueType) {
 
 function renderMetricAnswer({ definition, employee, source }) {
   if (!definition) return null;
+  if (definition.valueType === "configured_salary_summary") {
+    const salary = valueAt(source, definition.path);
+    if (!salary || typeof salary !== "object") {
+      return `${employee}'s current configured salary is not recorded or is not available to your account.`;
+    }
+    const parts = [
+      ["gross", salary.gross],
+      ["basic", salary.basic],
+      ["HRA", salary.hra],
+      ["special allowance", salary.specialAllowance],
+      ["food allowance", salary.foodAllowance],
+      ["total deductions", salary.totalDeduction],
+      ["net salary", salary.netSalary],
+      ["employer cost/CTC", salary.employerCost],
+      ["stipend", salary.stipend],
+    ].filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([label, value]) => `${label} ${formatValue(value, "money")}`);
+    return parts.length
+      ? `${employee}'s current configured monthly salary: ${parts.join(", ")}.`
+      : `${employee}'s current configured salary is not recorded or is not available to your account.`;
+  }
+  if (definition.valueType === "payroll_salary_summary") {
+    const parts = [
+      ["gross", source && source.earnings && source.earnings.gross],
+      ["basic", source && source.earnings && source.earnings.basic],
+      ["total deductions", source && source.deductions && source.deductions.total],
+      ["net pay", source && source.netPay],
+    ].filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([label, value]) => `${label} ${formatValue(value, "money")}`);
+    if (source && source.payableDays !== undefined) parts.push(`payable days ${source.payableDays}`);
+    if (source && source.status) parts.push(`status ${source.status}`);
+    return parts.length
+      ? `${employee}'s posted payroll for ${source.period}: ${parts.join(", ")}.`
+      : `${employee}'s posted payroll summary is not available.`;
+  }
+  if (definition.valueType === "annual_salary_summary") {
+    const parts = [
+      ["gross", source && source.totalGross],
+      ["net pay", source && source.totalNetPay],
+    ].filter(([, value]) => value !== undefined && value !== null && value !== "")
+      .map(([label, value]) => `${label} ${formatValue(value, "money")}`);
+    if (source && source.monthsPaid !== undefined) parts.push(`${source.monthsPaid} payroll months`);
+    return parts.length
+      ? `${employee}'s posted payroll summary for ${source.year}: ${parts.join(", ")}.`
+      : `${employee}'s annual payroll summary is not available.`;
+  }
   const value = formatValue(valueAt(source, definition.path), definition.valueType);
   if (value === null) return `${employee}'s ${definition.label.toLowerCase()} is not recorded or is not available to your account.`;
   return `${employee}'s ${definition.label.toLowerCase()} is ${value}.`;

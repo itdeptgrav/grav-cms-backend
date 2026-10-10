@@ -13,6 +13,7 @@ const catalogues = new Map();
 
 const normalize = (value) => String(value || "")
   .toLowerCase()
+  .replace(/[\u2019']s\b/g, "")
   .replace(/[^a-z0-9]+/g, " ")
   .replace(/\s+/g, " ")
   .trim();
@@ -68,13 +69,22 @@ function compileSemanticCatalogue({ id, domains = [], metrics = [], entities = [
     domains: Object.freeze(Object.fromEntries(domainById)),
     entities: Object.freeze(Object.fromEntries(entityById)),
     metrics: Object.freeze(Object.fromEntries(metricById)),
-    resolveMetric(text) {
-      return longestUnique([...metricById.values()], text, (definition) => [definition.label, ...(definition.aliases || [])]);
+    resolveMetric(text, { entity, domain } = {}) {
+      const candidates = [...metricById.values()].filter((definition) => (
+        (!entity || definition.entity === entity) && (!domain || definition.domain === domain)
+      ));
+      return longestUnique(candidates, text, (definition) => [definition.label, ...(definition.aliases || [])]);
     },
     detectDomains(text) {
-      return [...domainById.values()]
+      const detected = new Set([...domainById.values()]
         .filter((domain) => [domain.label, ...(domain.aliases || [])].some((term) => includesTerm(text, term)))
-        .map((domain) => domain.id);
+        .map((domain) => domain.id));
+      for (const metric of metricById.values()) {
+        if (metric.domain && [metric.label, ...(metric.aliases || [])].some((term) => includesTerm(text, term))) {
+          detected.add(metric.domain);
+        }
+      }
+      return [...detected];
     },
     stripMetricTerms(text, definition) {
       let output = String(text || "");
@@ -96,13 +106,25 @@ function compileSemanticCatalogue({ id, domains = [], metrics = [], entities = [
         for (const term of terms) {
           const key = normalize(term);
           if (!key) continue;
-          const owners = aliases.get(key) || new Set();
+          // A word such as "status" is legitimately reusable for different
+          // entity types. Runtime resolution is entity-first, so only aliases
+          // that collide inside the same entity are ambiguous.
+          const scope = `${metric.entity || "*"}:${key}`;
+          const owners = aliases.get(scope) || new Set();
           owners.add(metric.id);
-          aliases.set(key, owners);
+          aliases.set(scope, owners);
         }
       }
-      for (const [term, owners] of aliases) {
-        if (owners.size > 1) issues.push({ type: "ambiguous_metric_alias", term, owners: [...owners].sort() });
+      for (const [scope, owners] of aliases) {
+        if (owners.size > 1) {
+          const split = scope.indexOf(":");
+          issues.push({
+            type: "ambiguous_metric_alias",
+            entity: scope.slice(0, split),
+            term: scope.slice(split + 1),
+            owners: [...owners].sort(),
+          });
+        }
       }
       return { ok: issues.length === 0, issues, domainCount: domainById.size, entityCount: entityById.size, metricCount: metricById.size };
     },
@@ -125,7 +147,16 @@ function semanticToolCandidates(tools, text) {
       const detected = detectedByCatalogue.get(semantic.catalogue);
       return (semantic.domains || []).some((domain) => detected.has(domain));
     });
-    if (candidates.length) return candidates;
+    // A business domain can legitimately expose several capabilities (for
+    // example, an exact record lookup, a collection query and a workflow
+    // register). Once the catalogue has established the domain, prefer the
+    // capabilities whose own relevance contract also matches the wording.
+    // Fall back to every domain candidate when none claims the wording so the
+    // model can still handle paraphrases outside the deterministic matchers.
+    const relevant = candidates.filter((tool) => {
+      try { return tool.matches(text) === true; } catch { return false; }
+    });
+    return relevant.length ? relevant : candidates;
   }
   const relevant = selectable.filter((tool) => {
     try { return tool.matches(text) === true; } catch { return false; }

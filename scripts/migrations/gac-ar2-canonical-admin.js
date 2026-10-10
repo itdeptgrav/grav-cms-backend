@@ -11,9 +11,10 @@
 //
 // What --apply does (all idempotent; a second run plans nothing):
 //   1. Creates — or updates — the canonical DeptUser for the target email.
-//      On CREATE its passwordHash is the target's existing Acc_User bcrypt
-//      hash, copied as an opaque string: the password is never known, never
-//      printed, never re-hashed. An existing DeptUser keeps its own hash.
+//      On CREATE its passwordHash is copied from the identity that currently
+//      signs in: the active Employee when one exists, otherwise the existing
+//      Acc_User. The bcrypt string stays opaque: the password is never known,
+//      printed or re-hashed. An existing DeptUser keeps its own hash.
 //   2. Home application: the Executive Office (`ceo`).
 //   3. `isAdmin: true`, set explicitly on that row. Administrator status is
 //      never derived from the Accounting owner role.
@@ -53,6 +54,7 @@ const TARGET_EMAIL = "ray@grav.in";
 const DUPLICATE_EMAIL = "ceo@grav.in";
 const HOME_SLUG = "ceo";
 const BCRYPT_RE = /^\$2[aby]\$\d\d\$.{53}$/;
+const { isEmployed } = require("../../services/employmentStatus");
 
 const lower = (v) => String(v || "").toLowerCase().trim();
 
@@ -66,9 +68,12 @@ async function planMigration(m, { targetEmail = TARGET_EMAIL, duplicateEmail = D
   const blockers = [];
   const actions = [];
 
-  const [home, accUsers, existing, dup, activeAdminsBefore] = await Promise.all([
+  const [home, accUsers, employees, existing, dup, activeAdminsBefore] = await Promise.all([
     m.AccessDepartment.findOne({ slug: HOME_SLUG }).lean(),
     m.Acc_User.find({ email: target }).select("passwordHash role isActive name organizationId").lean(),
+    m.Employee
+      ? m.Employee.find({ email: target }).select("password firstName lastName isActive status").lean()
+      : [],
     m.DeptUser.findOne({ email: target }).lean(),
     m.DeptUser.findOne({ email: duplicate }).lean(),
     m.DeptUser.countDocuments({ isAdmin: true, isActive: true }),
@@ -76,17 +81,40 @@ async function planMigration(m, { targetEmail = TARGET_EMAIL, duplicateEmail = D
 
   if (!home || !home.isActive) blockers.push("HOME_APPLICATION_MISSING_OR_INACTIVE");
   const activeAcc = accUsers.filter((a) => a.isActive !== false);
+  const activeEmployees = employees.filter(isEmployed);
+  let credential = null;
   if (!existing) {
-    if (activeAcc.length === 0) blockers.push("TARGET_HAS_NO_ACTIVE_CREDENTIAL");
-    if (activeAcc.length > 1) blockers.push("TARGET_CREDENTIAL_AMBIGUOUS");
-    if (activeAcc.length === 1 && !BCRYPT_RE.test(String(activeAcc[0].passwordHash || ""))) {
-      blockers.push("TARGET_CREDENTIAL_NOT_BCRYPT");
+    /* Preserve the credential of the identity that signs in TODAY. Employee
+       precedes Acc_User in the canonical resolver, so when a restored database
+       contains an Employee but has lost the previously-created DeptUser, using
+       an older Accounting hash would silently change the person's password. */
+    if (activeEmployees.length > 1) blockers.push("TARGET_EMPLOYEE_CREDENTIAL_AMBIGUOUS");
+    if (activeEmployees.length === 1) {
+      if (!BCRYPT_RE.test(String(activeEmployees[0].password || ""))) {
+        blockers.push("TARGET_EMPLOYEE_CREDENTIAL_NOT_BCRYPT");
+      } else {
+        credential = {
+          hash: activeEmployees[0].password,
+          name: [activeEmployees[0].firstName, activeEmployees[0].lastName].filter(Boolean).join(" ") || target,
+          source: "employee",
+        };
+      }
+    } else {
+      if (activeAcc.length === 0) blockers.push("TARGET_HAS_NO_ACTIVE_CREDENTIAL");
+      if (activeAcc.length > 1) blockers.push("TARGET_CREDENTIAL_AMBIGUOUS");
+      if (activeAcc.length === 1 && !BCRYPT_RE.test(String(activeAcc[0].passwordHash || ""))) {
+        blockers.push("TARGET_CREDENTIAL_NOT_BCRYPT");
+      } else if (activeAcc.length === 1) {
+        credential = { hash: activeAcc[0].passwordHash, name: activeAcc[0].name || target, source: "accounting" };
+      }
     }
   }
   if (activeAdminsBefore < 1) blockers.push("NO_ACTIVE_ADMINISTRATOR_BEFORE");
 
   if (!existing) {
-    actions.push("CREATE_CANONICAL_DEPT_USER_REUSING_ACC_USER_BCRYPT");
+    actions.push(credential?.source === "employee"
+      ? "CREATE_CANONICAL_DEPT_USER_REUSING_EMPLOYEE_BCRYPT"
+      : "CREATE_CANONICAL_DEPT_USER_REUSING_ACC_USER_BCRYPT");
   } else {
     if (!existing.isAdmin) actions.push("SET_IS_ADMIN_TRUE");
     if (existing.isActive === false) actions.push("REACTIVATE_CANONICAL");
@@ -115,13 +143,15 @@ async function planMigration(m, { targetEmail = TARGET_EMAIL, duplicateEmail = D
       targetAccUsers: accUsers.length,
       targetActiveAccUsers: activeAcc.length,
       targetAccountingOwner: activeAcc.filter((a) => a.role === "owner").length,
+      targetEmployees: employees.length,
+      targetActiveEmployees: activeEmployees.length,
       targetDeptUserExists: existing ? 1 : 0,
       duplicateDeptUserExists: dup ? 1 : 0,
       activeAdminsBefore,
       activeAdminsAfter,
       recordsToDelete: 0,
     },
-    _internal: { home, credential: activeAcc[0] || null, existing, dup, canonicalId, target, duplicate },
+    _internal: { home, credential, existing, dup, canonicalId, target, duplicate },
   };
 }
 
@@ -132,12 +162,13 @@ async function applyMigration(m, plan, { session = null, now = new Date() } = {}
   const opts = session ? { session } : {};
   let canonicalId = existing?._id || null;
 
-  if (plan.actions.includes("CREATE_CANONICAL_DEPT_USER_REUSING_ACC_USER_BCRYPT")) {
+  if (plan.actions.some((a) => a === "CREATE_CANONICAL_DEPT_USER_REUSING_ACC_USER_BCRYPT"
+      || a === "CREATE_CANONICAL_DEPT_USER_REUSING_EMPLOYEE_BCRYPT")) {
     // Raw collection insert: no model hook may touch or re-hash the credential.
     const res = await m.DeptUser.collection.insertOne({
       email: target,
       name: credential.name || target,
-      passwordHash: credential.passwordHash, // opaque bcrypt string, copied as-is
+      passwordHash: credential.hash, // opaque bcrypt string, copied as-is
       departmentId: home._id,
       isAdmin: true,
       isActive: true,
@@ -258,6 +289,7 @@ async function main(argv = process.argv.slice(2)) {
       DeptUser: require("../../models/Access/DeptUser"),
       AccessDepartment: require("../../models/Access/AccessDepartment"),
       Acc_User: require("../../models/Accountant_model/Acc_OrgModels").Acc_User,
+      Employee: require("../../models/Employee"),
     };
     const step = deactivate ? "deactivate-transitional" : "canonical-admin";
     const plan = deactivate ? await planDeactivation(m) : await planMigration(m);

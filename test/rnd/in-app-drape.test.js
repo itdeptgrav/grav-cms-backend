@@ -301,6 +301,36 @@ describe("the job is the server's, whoever does the arithmetic", () => {
     expect(out.render.resultPublicationId).toBe("");
   });
 
+  test("a confirmed as-imported sewing line saves without being relabelled", async () => {
+    const w = await world();
+    const { job } = await simulating(w);
+    const out = await renders.recordRenderOutcome(w.ctx, {
+      jobRef: job.jobRef, status: "completed",
+      drape: { ...drapeFor(), sewingLineSource: "as-imported", seamAllowanceMm: 0 },
+      actor: w.actor,
+    });
+    expect(out.render.drape.sewingLineSource).toBe("as-imported");
+    const read = await renders.readDrape(w.ctx, { jobRef: job.jobRef });
+    expect(read.sewingLineSource).toBe("as-imported");
+  });
+
+  test("a folded preview remains visible but cannot be recorded as a fitting", async () => {
+    const w = await world();
+    const { job } = await simulating(w);
+    const geometry = { ok: false, findings: [{ code: "SEAM_PLEATED", message: "Right armhole folded." }] };
+    const surface = { ok: true, findings: [] };
+    const out = await renders.recordRenderOutcome(w.ctx, {
+      jobRef: job.jobRef, status: "completed",
+      drape: { ...drapeFor(), geometry, surface }, actor: w.actor,
+    });
+    expect(out.render.drape.outcome).toBe("partial");
+    expect(out.render.drape.geometry).toEqual(geometry);
+    expect(out.render.drape.withheld.map(({ finding }) => finding)).toContain("armhole");
+    const read = await renders.readDrape(w.ctx, { jobRef: job.jobRef });
+    expect(read.outcome).toBe("partial");
+    expect(read.geometry.findings[0].code).toBe("SEAM_PLEATED");
+  });
+
   test("the job list does not carry the geometry; reading the drape does", async () => {
     const w = await world();
     const { job } = await simulating(w);

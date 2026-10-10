@@ -215,6 +215,53 @@ describe("canonical HR semantic metrics", () => {
       .toMatchObject({ id: "payroll.gross_earnings", source: "posted_payroll_item", temporal: "month_required" });
     expect(metricForRequest("compensation.configured_gross_monthly", {}))
       .toMatchObject({ id: "compensation.configured_gross_monthly", source: "employee_master", temporal: "current" });
+    expect(metricForRequest("compensation.configured_salary_summary", {}))
+      .toMatchObject({ id: "compensation.configured_salary_summary", source: "employee_master", temporal: "current" });
+    expect(metricForRequest("compensation.configured_salary_summary", { month: 9, year: 2026 }))
+      .toMatchObject({ id: "payroll.salary_summary", source: "posted_payroll_item", temporal: "month_required" });
+    expect(metricForRequest("compensation.configured_salary_summary", { year: 2026 }))
+      .toMatchObject({ id: "payroll.annual_salary_summary", source: "posted_payroll_item", temporal: "year_required" });
+  });
+
+  test("generic salary is a typed summary concept rather than a guessed payslip tool", async () => {
+    const { metricFromText } = require("../../services/hrSemanticMetrics");
+    const tool = registry.getTool("hr_person_metric");
+    expect(metricFromText("what is Umung's salary?"))
+      .toMatchObject({ id: "compensation.configured_salary_summary", valueType: "configured_salary_summary" });
+    await expect(tool.claim({ message: "what is Umung's salary?", history: [] })).resolves.toEqual({
+      employeeName: "what is Umung's ?",
+      metric: "compensation.configured_salary_summary",
+    });
+    await expect(tool.claim({ message: "what was Umung's salary in September 2026?", history: [] })).resolves.toEqual({
+      employeeName: "what was Umung's in September 2026?",
+      metric: "compensation.configured_salary_summary",
+      month: 9,
+      year: 2026,
+    });
+    await expect(tool.claim({ message: "what was Umung's salary in 2026?", history: [] })).resolves.toEqual({
+      employeeName: "what was Umung's in 2026?",
+      metric: "compensation.configured_salary_summary",
+      year: 2026,
+    });
+  });
+
+  test("renders current, monthly and annual salary summaries deterministically", () => {
+    const { metric, renderMetricAnswer } = require("../../services/hrSemanticMetrics");
+    expect(renderMetricAnswer({
+      definition: metric("compensation.configured_salary_summary"),
+      employee: "UMUNG ARORA",
+      source: { salary: { gross: 21363, basic: 12000, hra: 4000, totalDeduction: 1711, netSalary: 19652, employerCost: 22630 } },
+    })).toBe("UMUNG ARORA's current configured monthly salary: gross ₹21,363, basic ₹12,000, HRA ₹4,000, total deductions ₹1,711, net salary ₹19,652, employer cost/CTC ₹22,630.");
+    expect(renderMetricAnswer({
+      definition: metric("payroll.salary_summary"),
+      employee: "UMUNG ARORA",
+      source: { period: "09/2026", earnings: { gross: 21000, basic: 12000 }, deductions: { total: 1700 }, netPay: 19300, payableDays: 30, status: "approved" },
+    })).toBe("UMUNG ARORA's posted payroll for 09/2026: gross ₹21,000, basic ₹12,000, total deductions ₹1,700, net pay ₹19,300, payable days 30, status approved.");
+    expect(renderMetricAnswer({
+      definition: metric("payroll.annual_salary_summary"),
+      employee: "UMUNG ARORA",
+      source: { year: 2026, totalGross: 210000, totalNetPay: 193000, monthsPaid: 10 },
+    })).toBe("UMUNG ARORA's posted payroll summary for 2026: gross ₹2,10,000, net pay ₹1,93,000, 10 payroll months.");
   });
 
   test("catalogue aliases separate the person from standard HR terminology", () => {

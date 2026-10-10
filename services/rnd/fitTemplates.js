@@ -210,7 +210,8 @@ const UNMODELLED = Object.freeze([
   },
   {
     whenRole: ["placket.top", "placket.under", "placket.front"],
-    sentence: "Placket layer thickness, buttons and buttonholes are not modelled.",
+    sentence: "Placket layer thickness and the physical button/buttonhole hardware are not modelled. "
+      + "For a confirmed buttoned front, only the stated fastening points are held together.",
   },
   {
     whenSeamType: ["flat-felled"],

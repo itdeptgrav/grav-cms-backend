@@ -194,6 +194,7 @@ async function world() {
     asReader: { token: reader.token, company: co._id },
     asOutsider: { token: outsider.token, company: co._id },
     importUrl: `/api/cms/rnd/patterns/styles/${style._id}/revisions/import`,
+    nativeUrl: `/api/cms/rnd/patterns/styles/${style._id}/revisions/native`,
     reconcileUrl: `/api/cms/rnd/patterns/styles/${style._id}/revisions/reconcile`,
     listUrl: `/api/cms/rnd/patterns/styles/${style._id}/revisions`,
   };
@@ -205,6 +206,31 @@ const importDxf = (w, who = w.as, { bytes = cloDxf(), name = "tshirt-pattern.dxf
   form.append("patterns", new Blob([bytes], { type: "application/dxf" }), name);
   return call(w.importUrl, { ...who, method: "POST", form });
 };
+
+describe("creating a pattern directly in R&D", () => {
+  test("creates one empty native draft and returns it on retry", async () => {
+    const w = await world();
+    const body = { name: "Woven shirt", idempotencyKey: `native-route-${w.n}` };
+    const first = await call(w.nativeUrl, { ...w.as, method: "POST", body });
+    const second = await call(w.nativeUrl, { ...w.as, method: "POST", body });
+    expect(first.status).toBe(201);
+    expect(second.status).toBe(200);
+    expect(first.body.revision.id).toBe(second.body.revision.id);
+    expect(first.body.revision.origin.kind).toBe("native-authoring");
+    expect(first.body.revision.editorDocument.pieces).toEqual([]);
+    expect(first.body.revision.readiness.ready).toBe(false);
+    expect(await PatternRevision.countDocuments({ styleId: w.style._id })).toBe(1);
+  });
+
+  test("a viewer cannot create a native pattern", async () => {
+    const w = await world();
+    const result = await call(w.nativeUrl, {
+      ...w.asReader, method: "POST", body: { name: "Shirt", idempotencyKey: `native-viewer-${w.n}` },
+    });
+    expect(result.status).toBeGreaterThanOrEqual(400);
+    expect(await PatternRevision.countDocuments({ styleId: w.style._id })).toBe(0);
+  });
+});
 
 /* ═══ 1 · IMPORTING A DXF CREATES THE REVISION ═════════════════════════════ */
 

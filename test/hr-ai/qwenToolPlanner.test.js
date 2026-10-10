@@ -5,8 +5,10 @@ process.env.TEST_WITHOUT_MONGO = "1";
 const {
   planToolQuestion,
   validateArguments,
+  removeOptionalPlaceholders,
   groundEntityArguments,
   recentContext,
+  prepareArgumentContract,
   STATUS,
   CONTROL,
 } = require("../../services/ai/qwenToolPlanner");
@@ -31,7 +33,7 @@ const tools = [
   },
 ];
 
-test("Qwen sees only user language, safe capability descriptions and validated prior plan", async () => {
+test("a complete request does not expose stale validated plan state to Qwen", async () => {
   const calls = [];
   const ask = jest.fn(async (request) => {
     calls.push(request);
@@ -63,7 +65,7 @@ test("Qwen sees only user language, safe capability descriptions and validated p
   });
   const modelInput = JSON.stringify(calls);
   expect(modelInput).toContain("Whole-day attendance");
-  expect(modelInput).toContain("grav.assistant.plan/1");
+  expect(modelInput).not.toContain("grav.assistant.plan/1");
   expect(modelInput).not.toContain("sensitive answer text");
   expect(modelInput).not.toMatch(/mongodb|connection string|credential/i);
 });
@@ -98,6 +100,22 @@ test("arguments fail closed on missing required, extra or invalid fields", () =>
   expect(validateArguments({ date: "2026-09-26", database: "employees" }, schema)).toBeNull();
 });
 
+test("model placeholders are removed only from optional fields that do not allow them", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      metric: { type: "string", enum: ["__none__", "status"] },
+      from: { type: "string", pattern: "^\\d{4}-\\d{2}-\\d{2}$" },
+      query: { type: "string" },
+    },
+    required: ["metric"],
+  };
+  expect(removeOptionalPlaceholders(
+    { metric: "__none__", from: "__none__", query: null },
+    schema,
+  )).toEqual({ metric: "__none__" });
+});
+
 test("invented entity filters are removed before any data read", () => {
   const schema = {
     type: "object",
@@ -113,6 +131,76 @@ test("invented entity filters are removed before any data read", () => {
     "show everyone in HR",
     {},
   )).toEqual({ department: "Human Resources", limit: 10 });
+});
+
+test("an invented generic business subject is removed before any data read", () => {
+  const schema = {
+    type: "object",
+    properties: { metric: { type: "string" }, subject: { type: "string" } },
+    required: ["metric"],
+  };
+  expect(groundEntityArguments(
+    { metric: "sp.purchase_order.status", subject: "PO-FAKE-99" },
+    schema,
+    "show the purchase order status",
+    {},
+  )).toEqual({ metric: "sp.purchase_order.status" });
+  expect(groundEntityArguments(
+    { metric: "sp.purchase_order.status", subject: "PO-2026-0042" },
+    schema,
+    "show status for PO-2026-0042",
+    {},
+  )).toEqual({ metric: "sp.purchase_order.status", subject: "PO-2026-0042" });
+});
+
+test("required collection filter slots may be cleared for server reconciliation", () => {
+  const schema = {
+    type: "object",
+    properties: {
+      filterValue: { type: "string" },
+      filterValue2: { type: "string" },
+      metric: { type: "string" },
+    },
+    required: ["filterValue", "filterValue2", "metric"],
+  };
+  expect(groundEntityArguments(
+    { filterValue: "invented", filterValue2: "Acme Textiles", metric: "purchase order" },
+    schema,
+    "purchase orders from Acme Textiles",
+    {},
+  )).toEqual({ filterValue2: "Acme Textiles", metric: "purchase order" });
+});
+
+test("one malformed structured frame is retried once, then planning continues", async () => {
+  const malformed = Object.assign(new Error("empty model frame"), { code: "OLLAMA_MALFORMED_RESPONSE" });
+  const ask = jest.fn()
+    .mockRejectedValueOnce(malformed)
+    .mockResolvedValueOnce({ model: "qwen-test", data: { choice: "hr_holidays", clarification: null } });
+  const result = await planToolQuestion({ question: "next company holiday", tools }, { chatJson: ask });
+  expect(result).toMatchObject({ status: STATUS.OK, tool: "hr_holidays", arguments: {} });
+  expect(ask).toHaveBeenCalledTimes(2);
+});
+
+test("semantic field options are ranked by the question and sent with human labels", () => {
+  const prepared = prepareArgumentContract({
+    type: "object",
+    properties: {
+      metric: {
+        type: "string",
+        enum: ["receipt.number", "putaway.from", "putaway.to"],
+        "x-semanticOptions": {
+          "receipt.number": { label: "receipt number", aliases: ["GRN number"] },
+          "putaway.from": { label: "from location code", aliases: ["source location"] },
+          "putaway.to": { label: "to location name", aliases: ["destination location"] },
+        },
+      },
+    },
+    required: ["metric"],
+    additionalProperties: false,
+  }, "which destination location was the receipt put away into?");
+  expect(prepared.schema.properties.metric.enum[0]).toBe("putaway.to");
+  expect(prepared.meanings.metric["putaway.to"].label).toBe("to location name");
+  expect(prepared.schema.properties.metric["x-semanticOptions"]).toBeUndefined();
 });
 
 test("an optional date is removed when the user asked for no period", () => {
@@ -186,7 +274,7 @@ test("the route contract treats a relationship of a named person as a person-rec
   expect(calls[0].system).toContain("parent");
 });
 
-test("recent context contains user words and validated state, never assistant prose", () => {
+test("an elliptical follow-up contains user words and validated state, never assistant prose", () => {
   const context = recentContext([
     { role: "user", content: "who was absent yesterday" },
     {
@@ -195,8 +283,24 @@ test("recent context contains user words and validated state, never assistant pr
       toolsUsed: ["hr_daily_attendance"],
       contextState: { schema: "grav.assistant.plan/1", tool: "hr_daily_attendance", arguments: { date: "2026-09-25" } },
     },
-  ]);
+  ], "what about today?");
   expect(context.previousUserMessages).toEqual(["who was absent yesterday"]);
   expect(context.previousPlan.tool).toBe("hr_daily_attendance");
   expect(JSON.stringify(context)).not.toContain("Asha was absent");
+});
+
+test("a complete new question clears previous subject, period and tool state", () => {
+  const context = recentContext([
+    { role: "user", content: "show Umung attendance for September 2026" },
+    {
+      role: "assistant",
+      content: "18 days",
+      contextState: {
+        schema: "grav.assistant.plan/2",
+        tool: "hr_attendance_records",
+        arguments: { employeeName: "Umung", month: 9, year: 2026 },
+      },
+    },
+  ], "what is Umung's salary?");
+  expect(context).toEqual({ previousUserMessages: [], previousPlan: null });
 });

@@ -50,9 +50,10 @@ api() { curl -sf -b "$COOKIE" -H 'Content-Type: application/json' "$@"; }
 # REAL Accounting data now, not the synthetic dataset. The mart lives in schema
 # `reporting` and is built and filled entirely from the backend:
 #
-#   npm run reporting:migrate -- --apply
-#   npm run reporting:roles   -- --apply
-#   npm run reporting:sync    -- --full
+#   npm run reporting:setup -- --apply
+#
+# (roles → migrate → roles again → sync → verify; see the pilot README for why
+# the roles step runs twice)
 #
 # The connection user is `metabase_reader`, whose SELECT-only grant is proved
 # by `npm run reporting:verify-roles` rather than asserted here.

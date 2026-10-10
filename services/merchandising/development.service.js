@@ -41,6 +41,7 @@ const {
 } = require("../../models/CMS_Models/Merchandising/MerchandisingEvent");
 const { stockItemBom } = require("../sampleStyleEmail.service");
 const catalogue = require("./materialCatalogue.service");
+const briefProjection = require("./buyerBrief.projection");
 const { fail } = require("../storePurchase/errors");
 
 const str = (v) => String(v ?? "").trim();
@@ -541,8 +542,6 @@ async function getFile(ctx, { fileId } = {}) {
       state: str(request.state),
       requirementSummary: str(request.requirementSummary),
       requestedCategories: (request.requestedCategories || []).map(str),
-      referenceImages: (request.referenceImages || [])
-        .map((i) => ({ url: str(i.url), caption: str(i.caption) })),
       requiredByDate: request.requiredByDate || null,
       /* Sales owns this commercial fact. Merchandising receives it only as a
          visible material-selection constraint and has no write for it. */
@@ -559,7 +558,26 @@ async function getFile(ctx, { fileId } = {}) {
       styleRef: str(request.styleRef),
       buyerDisplayLabel: str(request.buyerDisplayLabel),
       stockItemId: request.stockItemId ? str(request.stockItemId) : null,
+      sampleStyleId: request.sampleStyleId ? str(request.sampleStyleId) : null,
+      /* ── REFERENCES, WITH THEIR PROVENANCE ──────────────────────────
+         `referenceType` and `storageRef` were dropped here, so a brief could
+         not tell an artwork from a packaging shot and nothing recorded which
+         Sales version supplied an image. Projected through the brief's own
+         reader so this and `buyerBrief` can never describe one differently. */
+      referenceImages: (request.referenceImages || [])
+        .map((i) => briefProjection.imageView(i, {
+          requestRef: str(request.requestRef), versionNo: request.versionNo ?? null,
+        }))
+        .filter((i) => i.url),
     } : null,
+
+    /* ── THE WHOLE BUYER BRIEF, RESOLVED ON THE SERVER ──────────────────
+       One read-only projection of the CURRENT Sales request version: every
+       controlled key already turned into the words a merchandiser reads,
+       every absence already a sentence, and the grouping already decided.
+       The Summary and Sales brief tabs choose which groups to show; neither
+       decides what a fact means. Null when the file has no request. */
+    buyerBrief: briefProjection.buyerBrief(request),
     receipt: receiptView(receipt, request),
     currentBom: bomView(current),
     approvedBom: bomView(boms.find((b) => b.state === BOM_STATE.APPROVED) || null),

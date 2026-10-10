@@ -557,9 +557,16 @@ const patternPieceSchema = new mongoose.Schema({
   sewLine: { type: [point2dSchema], default: undefined },
   internalLines: {
     type: [new mongoose.Schema({
+      /* Native 2D authoring records what this line means. Imported DXF lines
+         have no such claim until a person classifies them. */
+      lineId: { type: String, trim: true, default: "" },
       points: { type: [point2dSchema], default: [] },
       closed: { type: Boolean, default: false },
       length: { type: Number, default: null },
+      operation: { type: String, enum: ["", "dart", "pleat", "fold", "topstitch", "placket", "pocket-attachment", "decoration", "reference-only"], default: "" },
+      confirmed: { type: Boolean, default: false },
+      note: { type: String, trim: true, default: "", maxlength: 400 },
+      provenance: { type: String, enum: ["", "imported", "authored", "derived"], default: "" },
     }, { _id: false })],
     default: [],
   },

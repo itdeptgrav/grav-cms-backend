@@ -51,7 +51,7 @@ const positive = (v) => { const n = num(v); return n !== null && n > 0 ? n : nul
  * decides which number is trusted" ask for different care.
  */
 const STEP_KEYS = Object.freeze([
-  "template", "size", "body", "fabric", "roles", "grain", "sewingLine", "seams", "boundary",
+  "template", "size", "body", "fabric", "roles", "placement", "grain", "sewingLine", "seams", "closure", "boundary",
 ]);
 
 const STEP_LABELS = Object.freeze({
@@ -60,9 +60,11 @@ const STEP_LABELS = Object.freeze({
   body: "The body it is draped on",
   fabric: "The cloth, and who measured it",
   roles: "What each piece is",
+  placement: "Where each panel starts on the body",
   grain: "Which way the grain runs on each piece",
   sewingLine: "Where the seams actually sew",
   seams: "Which edge is sewn to which",
+  closure: "Whether the shirt front is open or buttoned",
   boundary: "Which perimeter is finished rather than sewn",
 });
 
@@ -130,14 +132,28 @@ const WITHHELD_ON_CUT_BOUNDARY = Object.freeze([
   "sleeveLength", "garmentLength",
 ]);
 
-function resolveSewingLine(patternSet, inputs, simulatedPlans) {
+function resolveSewingLine(patternSet, inputs, simulatedPlans, opts = {}) {
   const pieces = patternSet?.pieces || [];
   const byRef = new Map(pieces.map((p) => [str(p.pieceRef), p]));
   const refs = simulatedPlans.map((p) => str(p.pieceRef));
+  const meaning = str(inputs?.sewingLine?.lineMeaning);
+
+  /* An authored outline has a stated meaning. Do not infer a cut line from a
+     leftover allowance or choose a published line while the operator said the
+     outline itself is the stitch line. The persisted source name predates native
+     authoring; origin on the revision distinguishes drawn from imported. */
+  if (opts.nativeAuthoring && meaning === "sewing_line") {
+    return {
+      source: "as-imported", authoritative: true, allowanceMm: null,
+      message: "The patternmaker confirmed that these authored outlines are sewing lines.",
+      withheld: [],
+    };
+  }
 
   /* 1 · published, if the file publishes one for every simulated piece. */
   const published = refs.filter((ref) => (byRef.get(ref)?.sewLine || []).length >= 3);
-  if (refs.length && published.length === refs.length) {
+  if (refs.length && published.length === refs.length
+    && (!opts.nativeAuthoring || meaning === "both")) {
     return {
       source: "published",
       authoritative: true,
@@ -154,7 +170,8 @@ function resolveSewingLine(patternSet, inputs, simulatedPlans) {
     const plan = simulatedPlans.find((p) => str(p.pieceRef) === ref);
     return !positive(plan?.seamAllowanceMm) && garmentAllowance === null;
   });
-  if (!missingAllowance.length && refs.length) {
+  if (!missingAllowance.length && refs.length
+    && (!opts.nativeAuthoring || meaning === "cut_line")) {
     return {
       source: "derived",
       authoritative: true,
@@ -567,6 +584,34 @@ function assess(patternSet, inputs = {}, opts = {}) {
   const withheld = [];
   const notes = [];
 
+  /* Native authoring has no DXF to fall back to. A construction mark cannot be
+     silently discarded by the solver: the patternmaker must account for it,
+     and only an explicitly confirmed reference-only line may be ignored. */
+  if (opts.nativeAuthoring) {
+    if (!opts.editorDocument) {
+      failures.push(fail("R_NATIVE_DOCUMENT", "roles",
+        "This native pattern has no saved construction document to review."));
+    } else {
+      for (const piece of opts.editorDocument.pieces || []) {
+        for (const [index, line] of (piece.internalLines || []).entries()) {
+          const label = `${str(piece.name) || str(piece.pieceRef) || "A piece"}, internal path ${index + 1}`;
+          const operation = str(line.operation);
+          if (!operation || !line.confirmed || (operation === "reference-only" && !str(line.note))) {
+            failures.push(fail("R_NATIVE_PATH_UNREVIEWED", "roles",
+              `${label} needs its operation confirmed; a reference-only path also needs a reason.`,
+              { pieceRef: str(piece.pieceRef), lineId: str(line.lineId) }));
+          } else if (operation !== "reference-only") {
+            failures.push(fail("R_NATIVE_PATH_UNSUPPORTED", "roles",
+              `${label} is marked ${operation}, but this drape engine cannot perform that operation yet. It will not be silently omitted.`,
+              { pieceRef: str(piece.pieceRef), lineId: str(line.lineId), operation }));
+          } else {
+            notes.push(`${label} is reference-only and is not simulated: ${str(line.note)}`);
+          }
+        }
+      }
+    }
+  }
+
   const parsed = (patternSet?.pieces || []);
   const usable = parsed.filter((p) => (p.outline || []).length >= 3);
 
@@ -637,6 +682,18 @@ function assess(patternSet, inputs = {}, opts = {}) {
       + "declared lengths and its built mesh agree, which a pattern drawn at the wrong scale "
       + "throughout also satisfies. Check one length against a measured sample to rule that out."));
   }
+  if (opts.nativeAuthoring && !inputs?.avatarConfirmed?.at) {
+    failures.push(fail("R_NATIVE_AVATAR_UNCONFIRMED", "body",
+      "Review and confirm the exact avatar and measurements for this native pattern before draping."));
+  }
+  if (opts.nativeAuthoring && !["a-pose", "standing-neutral"].includes(str(inputs?.avatar?.poseRef))) {
+    failures.push(fail("R_NATIVE_AVATAR_POSE", "body",
+      "Choose whether this avatar is standing with arms down or in an A-pose before placing and draping the panels."));
+  }
+  if (opts.nativeAuthoring && !inputs?.fabricConfirmed?.at) {
+    failures.push(fail("R_NATIVE_FABRIC_UNCONFIRMED", "fabric",
+      "Review and confirm the exact fabric profile, including its source and stretch values, before draping."));
+  }
 
   /* ── ROLES, QUANTITIES, SYMMETRY, PAIRING ──────────────────────────── */
   const plans = Array.isArray(inputs?.pieces) ? inputs.pieces : [];
@@ -646,6 +703,111 @@ function assess(patternSet, inputs = {}, opts = {}) {
     return planByRef.get(ref) || { pieceRef: ref };
   });
   const simulatedPlans = allPlans.filter((plan) => templates.simulates(plan));
+
+  /* The current mesh reader emits exactly ONE cloth mesh per stored outline.
+     Cut-count metadata does not instantiate another sleeve or unfold a half
+     front. Refuse before a plausible-looking but incomplete garment is made. */
+  for (const plan of simulatedPlans) {
+    const symmetry = str(plan.symmetry);
+    const quantity = num(plan.cutQuantity);
+    if ((symmetry && symmetry !== "single") || (quantity !== null && quantity !== 1)) {
+      failures.push(fail("R_INSTANCE_UNSUPPORTED", "roles",
+        `${str(plan.pieceRef)} asks for ${symmetry || `cut quantity ${quantity}`}, but this 3D engine currently makes one mesh per outline. Draw and map every physical panel separately before draping; it will not invent or silently omit a mirrored half.`,
+        { pieceRef: str(plan.pieceRef), symmetry, cutQuantity: quantity }));
+    }
+  }
+
+  /* A native pattern has no CLO arrangement to inherit. These slots are the
+     shirt template's actual placement vocabulary, not decorative labels. The
+     solver consumes the selected arm/wrist/chest side and layer. */
+  if (opts.nativeAuthoring) {
+    const slotsFor = (role) => {
+      if (role === "body.front") return ["front", "front-left", "front-right"];
+      if (role === "body.back") return ["back"];
+      if (role === "sleeve") return ["left-arm", "right-arm"];
+      if (role === "cuff" || role === "cuff.band") return ["left-wrist", "right-wrist"];
+      if (role.startsWith("collar.") || role === "neck.band" || role === "neck.facing") return ["neck"];
+      if (role.startsWith("placket.")) return ["center-front", "center-front-left", "center-front-right"];
+      if (role === "pocket.patch") return ["left-chest", "right-chest"];
+      if (role === "panel.upper-back") return ["upper-back"];
+      return [];
+    };
+    for (const plan of simulatedPlans) {
+      const slot = str(plan.placementSlot);
+      const layer = str(plan.placementLayer);
+      const allowed = slotsFor(str(plan.role));
+      if (!allowed.includes(slot) || !["base", "outer"].includes(layer)) {
+        failures.push(fail("R_NATIVE_PLACEMENT", "placement",
+          `${str(plan.pieceRef)} needs a starting body location and layer compatible with its role.`,
+          { pieceRef: str(plan.pieceRef), allowedSlots: allowed }));
+      } else if (!Array.isArray(plan.placementOffsetMm)
+        || plan.placementOffsetMm.length !== 3
+        || !plan.placementOffsetMm.every((n) => Number.isFinite(n) && Math.abs(n) <= 500)
+        || !Number.isFinite(plan.placementYawDeg)
+        || Math.abs(plan.placementYawDeg) > 180) {
+        failures.push(fail("R_NATIVE_PLACEMENT_TRANSFORM", "placement",
+          `${str(plan.pieceRef)} needs a finite 3D starting offset and rotation. Preview the arrangement on the avatar before confirming it.`,
+          { pieceRef: str(plan.pieceRef) }));
+      } else if (!plan.placementConfirmed?.at) {
+        failures.push(fail("R_NATIVE_PLACEMENT_UNCONFIRMED", "placement",
+          `${str(plan.pieceRef)} has a proposed location but nobody has confirmed it on this pattern revision.`,
+          { pieceRef: str(plan.pieceRef), placementSlot: slot }));
+      }
+    }
+    for (const role of ["sleeve", "cuff", "cuff.band"]) {
+      const sameRole = simulatedPlans.filter((p) => str(p.role) === role);
+      const slots = sameRole.map((p) => str(p.placementSlot)).filter(Boolean);
+      if (sameRole.length > 1 && new Set(slots).size !== slots.length) {
+        failures.push(fail("R_NATIVE_PLACEMENT_DUPLICATE", "placement",
+          `Multiple ${role} pieces start on the same side of the body. Choose their left/right placements explicitly.`));
+      }
+    }
+    const fronts = simulatedPlans.filter((p) => str(p.role) === "body.front");
+    const frontSlots = fronts.map((p) => str(p.placementSlot)).sort();
+    if (fronts.length === 1 && frontSlots[0] !== "front") {
+      failures.push(fail("R_NATIVE_FRONT_LAYOUT", "placement",
+        "A single full front must start at the centre front. A split opening needs two separate left/right front panels."));
+    } else if (fronts.length === 2
+      && JSON.stringify(frontSlots) !== JSON.stringify(["front-left", "front-right"])) {
+      failures.push(fail("R_NATIVE_FRONT_LAYOUT", "placement",
+        "Two shirt fronts must be assigned to front-left and front-right, one each, so they do not start on top of each other."));
+    } else if (fronts.length > 2) {
+      failures.push(fail("R_NATIVE_FRONT_LAYOUT", "placement",
+        "This shirt template can place one full front or two left/right front panels, not more."));
+    }
+    if (str(inputs.template) === "woven-shirt" && fronts.length === 2) {
+      const closure = inputs.frontClosure || {};
+      if (!["open", "buttoned"].includes(str(closure.state)) || !closure.confirmed?.at) {
+        failures.push(fail("R_NATIVE_FRONT_CLOSURE", "closure",
+          "Choose and confirm whether the two shirt fronts are worn open or buttoned; the drape cannot decide for you."));
+      } else if (closure.state === "buttoned") {
+        const left = simulatedPlans.find((p) => str(p.pieceRef) === str(closure.leftPlacketRef));
+        const right = simulatedPlans.find((p) => str(p.pieceRef) === str(closure.rightPlacketRef));
+        const stations = closure.stationsFromTopMm || [];
+        const validStations = Array.isArray(stations) && stations.length >= 2
+          && stations.every((value, index) => Number.isFinite(value) && value > 0
+            && (index === 0 || value > stations[index - 1]));
+        if (!left || !right || left === right
+          || str(left.role) !== "placket.front" || str(right.role) !== "placket.front"
+          || str(left.placementSlot) !== "center-front-left"
+          || str(right.placementSlot) !== "center-front-right" || !validStations) {
+          failures.push(fail("R_NATIVE_BUTTON_STATIONS", "closure",
+            "A buttoned shirt needs the left/right plackets and at least two ordered button distances from their tops."));
+        } else {
+          const heights = [left, right].map((plan) => {
+            const piece = usable.find((p) => str(p.pieceRef) === str(plan.pieceRef));
+            const ys = (piece?.outline || []).map((_, i) => pointAt(piece.outline, i)?.y)
+              .filter(Number.isFinite);
+            return ys.length ? Math.max(...ys) - Math.min(...ys) : 0;
+          });
+          if (stations.some((value) => value >= Math.min(...heights))) {
+            failures.push(fail("R_NATIVE_BUTTON_STATIONS", "closure",
+              "A button position lies beyond the shorter placket. Check its distance below the top."));
+          }
+        }
+      }
+    }
+  }
 
   const unassigned = allPlans.filter((plan) => !str(plan.role));
   const rolesPresent = new Set(allPlans.map((plan) => str(plan.role)).filter(Boolean));
@@ -777,8 +939,8 @@ function assess(patternSet, inputs = {}, opts = {}) {
       if (symmetry === "cut-on-fold") {
         warnings.push(warn("W6", "roles",
           `"${str(plan.role) || str(plan.pieceRef)}" is cut on the fold, so the drawing holds `
-          + "half of it and assembly reflects it with no seam at the fold. Our exports publish "
-          + "no mirror line, so this was stated by a person.",
+          + "half of it. This engine cannot unfold it yet and refuses a drape rather than "
+          + "showing half a garment as though it were complete.",
           { pieceRef: str(plan.pieceRef) }));
       }
       if (str(plan.pairedWith) && !planByRef.has(str(plan.pairedWith))) {
@@ -841,12 +1003,22 @@ function assess(patternSet, inputs = {}, opts = {}) {
   withheld.push(...fabricCheck.withheld);
 
   /* ── SEWING LINE ───────────────────────────────────────────────────── */
-  const sewingLine = resolveSewingLine(patternSet, inputs, simulatedPlans);
+  const sewingLine = resolveSewingLine(patternSet, inputs, simulatedPlans, opts);
+  if (opts.nativeAuthoring && !inputs?.sewingLine?.confirmed?.at) {
+    failures.push(fail("R_NATIVE_SEWING_UNCONFIRMED", "sewingLine",
+      "Confirm whether the authored boundaries are cut lines, sewing lines, or both before draping."));
+  }
   if (sewingLine.source === "derived") {
     warnings.push(warn("W1", "sewingLine", sewingLine.message));
   } else if (sewingLine.source === "cut-boundary") {
-    warnings.push(warn("W2", "sewingLine", sewingLine.message));
-    withheld.push(...sewingLine.withheld);
+    if (opts.nativeAuthoring) {
+      failures.push(fail("R_NATIVE_SEWING_LINE", "sewingLine",
+        "This in-app pattern has no sewing line for every simulated panel and no confirmed seam allowance to derive one. State the cut/sew construction before draping; the cut boundary will not be treated as the stitch line.",
+        { pieceRefs: sewingLine.missingAllowanceFor }));
+    } else {
+      warnings.push(warn("W2", "sewingLine", sewingLine.message));
+      withheld.push(...sewingLine.withheld);
+    }
   }
 
   /* ── SEAMS ─────────────────────────────────────────────────────────── */
@@ -945,6 +1117,9 @@ function assess(patternSet, inputs = {}, opts = {}) {
         + (fabricCheck.grade ? ` · ${fabricCheck.grade}` : "")
       : "",
     roles: `${allPlans.length - unassigned.length} of ${allPlans.length} pieces`,
+    placement: opts.nativeAuthoring
+      ? `${simulatedPlans.filter((p) => p.placementConfirmed?.at).length} of ${simulatedPlans.length} panels`
+      : "template-estimated",
     grain: `${simulatedPlans.length - grainless.length} of ${simulatedPlans.length} pieces`,
     sewingLine: sewingLine.source,
     seams: `${seamCheck.seamCount} mapped`,
@@ -975,6 +1150,7 @@ function assess(patternSet, inputs = {}, opts = {}) {
   const outcome = failures.length ? "refused" : (withheldByFinding.length ? "partial" : "fitting");
 
   return {
+    nativeAuthoring: Boolean(opts.nativeAuthoring),
     /* The one boolean every surface branches on. */
     ready: failures.length === 0,
     outcome,

@@ -1,0 +1,65 @@
+# Proposed reset: CLO-like shirt construction workflow
+
+**Status: proposed, 5 October 2026.** This is not a claim that GRAV matches CLO or that the generated shirt is usable. The failed `shirt2` four-view trial and source audit are recorded in `rnd-clo-shirt-calibration.md`.
+
+## Decision to revisit
+
+`docs/decisions/rnd-fit-simulation.md` selected the browser XPBD solver as the right foundation. That was an architectural hypothesis, not a visual validation. The current shirt fails even after six native front attachments were added. Keep the 2D pattern as the immutable source of truth, but reopen the solver decision if a *complete* construction graph and verified avatar still cannot produce an acceptable shirt. Do not silently replace the solver or claim CLO equivalence.
+
+## Copy the workflow, not the proprietary implementation
+
+CLO's public workflow separates pattern geometry and sewing, arrangement around an avatar, fabric physical properties, simulation, particle distance, and visual materials. Reproduce those observable stages and their controls inside GRAV. We do not have CLO's internal solver or a general DXF-to-perfect-shirt algorithm.
+
+## One reference shirt: required input contract
+
+1. **Pattern:** units, piece outlines, notches/grain, true cutouts versus marks, sewing line versus cut line, seam allowance and size. No automatic hole inference from a closed line.
+2. **Construction:** every native structural path classified as boundary join, interior attachment, same-piece fold/closure, or trim/decorative. Confirm both owners, path, direction, station order and any ease. A source pair cannot be silently omitted from the completeness report.
+3. **Avatar and arrangement:** register `avatar2.fbx` to the project garment in millimetres, then arrange panels around that same body with user-reviewable orientation and clearance. Do not use measurement-derived capsules as proof of reference fit.
+4. **Fabric:** read the project's recorded physical properties and identify what can or cannot be translated to the GRAV solver; never label a guessed preset equivalent to CLO sateen. Keep surface colour/normal maps separate from cloth mechanics.
+5. **Solve and refine:** show coarse assembly and sewing before high-resolution drape. Measure seam residual, fabric strain, self/body intersections, collar and sleeve opening geometry. Refinement can improve detail only after the coarse construction is correct.
+6. **Appearance:** bind verified pattern-space UV/material ownership. Compare geometry in a neutral material first, then fabric appearance. A texture cannot conceal a collapsed seam.
+
+## Hard pass/fail sequence
+
+- **Gate A — construction completeness:** classify all 38 native pairs in `shirt2`; resolve the four same-piece sleeve paths and four trim/piping paths, or justify why a pair is non-structural. Preserve the exact source paths and decisions.
+- **Gate B — body and placement:** use the supplied avatar mesh and inspect front/back/both sides *before* solving. Refuse severe interpenetration or an unregistered scale/pose.
+- **Gate C — visual shirt:** render fixed-camera front, back, left, right, collar, placket, shoulder and cuff views from flat `shirt2.dxf`; compare to the paired CLO GLB. Numeric checks cannot override a visibly broken result.
+- **Gate D — generalization:** freeze parameters; repeat on an independently changed shirt DXF/project/GLB. A pass on `shirt2` alone is not “all shirts.”
+
+If Gate A and B pass but Gate C remains visibly bad, stop local compliance/iteration tuning and evaluate a different cloth/assembly solver or a licensed integration using the same input and visual benchmark. No approval route should show this preview as production-fit evidence until Gate D passes.
+
+The current code still has a hard avatar gap: `components/rnd/fit/run.js` constructs `new Body(built.body)`, and `fit/solver/bodyCollision.js` implements a capsule body. The separate avatar module can generate/view a triangle mesh, but its collision contract is also a capsule proxy; it does not feed the supplied `avatar2.fbx` surface into this solver. Gate B is therefore not met merely because an avatar is visible in the UI.
+
+## Immediate next experiment
+
+Map the two long same-piece sleeve closure pairs (native pairs 28 and 29, about 474/483 mm on their two paths) and the two short cuff-end joins (24 and 25) without guessing which edges to join. Render the same fixed views. The missing sleeve paths are a plausible contributor to the collapsed openings, not yet a proven sole cause. If the openings improve but collar/chest remain wrong, separate those construction and avatar failures rather than tuning one global fabric value.
+
+### Diagnostic result
+
+A scratch-only trial added pairs 24, 25, 28 and 29 to the previous 24 outer joins and six interior attachments. All four native pairs had direct endpoint evidence (<1 mm); the assembler accepted 28 boundary seams plus the six interior attachment pairs. The numeric `SLEEVE_OPENING_COLLAPSED` finding disappeared and the worst compressed edge improved from 24% to 29% of its cut length. **The fixed four-view visual still fails:** one upper-sleeve/shoulder gap becomes more obvious, a cuff visibly splits, the collar remains jagged and the chest retains sharp diagonal pull. Seam-pleat findings also increased. Therefore the additional joins are not a completed fix; their precise mid-edge path sampling and placement/solver interaction require review before any merge or UI exposure. The generated scratch OBJ is `/tmp/shirt2-self-join-trial.obj`; its four-view diagnostic is `shirt2-self-join-trial.json` in the local audit viewer. Neither is an approved model.
+
+### Body and arrangement mismatch measured on 5 October
+
+The source comparison now has a stronger upstream explanation than a fabric-constant mismatch. The scratch drape above used an **arbitrary** 1000 mm chest, 460 mm shoulder, 1780 mm height and 610 mm arm length, converted to a circular-torso, capsule-arm body; these are not the measurements or surface from `avatar2.fbx`. Applying the paired GLB's 70 named bone transforms to that FBX gives a posed body approximately 302 mm left / 292 mm right of centre. The source CLO sleeve meshes end around 302 mm on either side. The same-piece-join scratch drape instead extends its sleeves to x = -401 and +427 mm, with its cuffs at x = -406 and +439 mm. This roughly 100–140 mm lateral disagreement is visible in geometry before any material/shading comparison and cannot be fixed by a texture.
+
+The vertical discrepancy is also large: CLO's two front panels bottom at y = 964–967 mm, the back at 958 mm, and the collar stand spans 1579–1670 mm. The scratch front panels bottom at y = 890–915 mm, the back at 890 mm, and the collar spans 1558–1620 mm. The trial hem is therefore 43–77 mm low; the collar top is 50 mm low. Compare each part rather than one whole-model bounding box, since the glTF also contains sleeves and trim. The scratch solve still reports `partial`, eight seam-pleat findings, a serrated collar, four hem notches and 23 edges below 70% of cut length. Improved closure metrics are not evidence of a usable shirt.
+
+At y ≈ 1450 mm, the posed FBX's central body vertices (|x| ≤ 180 mm) span approximately z = -139…+91 mm. The scratch capsule torso for chest 1000 mm has a circular cross-section centred at z = 0 with radius ≈159 mm near that height, putting its forward surface about 68 mm ahead of the FBX's forward surface. This is a coarse comparison—FBXLoader truncated vertices with more than four skinning weights, and the GLB-to-FBX registration has not been independently validated—but the magnitude rules out treating the capsule as the paired avatar. Source shirt front surfaces reach z ≈+157 mm; the scratch front surfaces reach ≈+199 mm. Its back limit (-161 mm) is close to the source back (-155 mm), so the mismatch is asymmetric rather than a uniform scale change.
+
+**Next Gate B experiment:** verify the native project's avatar identity/pose and registration, then arrange the same 2D panels against the paired body (or an explicitly measured collision proxy fitted to its torso and arms). Capture fixed front/back/side *pre-solve* views and a piece-bound comparison, then run the unchanged construction graph. Only if the assembled shirt matches source placement should fabric and solver tuning resume. Do not insert these scratch measurements as production size defaults.
+
+### Avatar-surface collision control: failed, 5 October
+
+The FBX registration is now supported by a stronger comparison, though not yet proven from the native `.avt` identity: all 70 named GLB bones matched the supplied FBX skeleton. On the posed FBX triangle surface, sampled CLO source front panels and sleeve panels have roughly 3.4–3.5 mm fifth-percentile clearance and 5–7 mm median clearance; almost none of their samples lie more than 2 mm inside the avatar. That is consistent with the GLB and FBX belonging to the same CLO pose, and is much stronger than a matching filename. The source collar itself crosses the avatar surface in many samples, so do not generalize the contact claim to every piece or use nearest-triangle sign as a production fit measurement.
+
+A scratch-only A/B replaced the capsule with that posed triangle avatar **without changing** the 28 boundary seams, six interior attachments, fabric preset, mesh or stage plan. This is not in the app. It completed its scheduled Draft stages in about 68.5 seconds but ended moving 2.84 mm/frame against the plan's 0.05 mm/frame settle threshold. Its sleeves still reach x ≈ -347/+402 mm (source ≈ -302/+298 mm), and its hem remains low; one cuff dropped below y = 840 mm (source cuff ≈920–924 mm). A fixed four-view visual shows the collar/upper shoulder visibly broken, a severe converging front fold and an uneven hem. It is **rejected**. Source reference and failed trial are available in the local viewer as `shirt2-clo-reference.json` and `shirt2-avatar-triangle-trial.json`; the trial OBJ is `/tmp/shirt2-avatar-triangle-trial.obj`. The original supplied GLB, DXF, FBX and ZPRJ were not modified.
+
+This control rules out the *capsule alone* as the sufficient explanation. It does not rule out body effects: the garment is initially arranged by the capsule-oriented shirt template, so replacing collision only after placement is not a fully registered CLO-like assembly. The next test must inspect and correct **pre-solve piece transforms** against the source avatar and GLB before changing material compliance. The unchanged stage plan and seam mapping may also be independently wrong; do not infer solver fidelity from this control. In particular, the original generated drape sampled against the FBX had 237/601 back vertices and 84/311 left-sleeve vertices more than 2 mm inside the avatar, whereas the paired CLO reference had 14/496 back and 0/496 corresponding sampled left-sleeve vertices. Those counts are from different meshes and are directional diagnostics, not one-to-one vertex error scores.
+
+### Pre-solve placement fault isolated
+
+The untouched construction graph, measured **before the first solver step**, makes the primary placement problem explicit. `shirt.place()` centres every `body.front` mesh at one identical origin. For `shirt2`, both `Body_Front` and `Body_Front_2` therefore begin over the same x range, about -114…+114 mm, although the paired CLO GLB has one at +14…+220 mm and the other at -222…-8 mm. The two pocket pieces also begin on exactly the same x range, about -122…-4 mm, whereas the CLO reference places one at +44…+155 mm and the other at -153…-42 mm. The sleeve cuffs begin at x ≈ ±367…477 mm, while the reference cuffs occupy approximately ±215…304 mm. These are input assembly differences, not fold or shading differences. No physical solver can be evaluated fairly while distinct panels begin superimposed and cuffs are placed beyond the reference arms.
+
+The DXF happens to draw its two front pieces with opposite winding and on opposite sides of its sheet centre. That is evidence useful for *this file*, not a universal handedness rule: CAD marker positions can be rearranged independently of garment left/right. For a general shirt workflow, carry a verified front-panel side and pocket owner (either supplied by construction metadata or confirmed in a 3D arrangement UI); if ambiguous, require confirmation rather than silently choosing a side. Use that to generate distinct, editable piece transforms, record their source/provenance with the revision, and check their pre-solve clearance against the selected body. Sleeve and cuff locations must derive from the selected avatar's actual arm axis, not the current capsule formula's fixed arm-out fractions. Then rerun the unchanged sew/settle control and compare fixed views.
+
+Sources: [CLO arrangement properties](https://support.clo3d.com/hc/en-us/articles/115002101968-Arrangement-Property-Setting), [CLO simulation](https://support.clo3d.com/hc/en-us/articles/53856382869657-Simulation), [CLO particle distance](https://support.clo3d.com/hc/en-us/articles/115012227227-Particle-Distance).

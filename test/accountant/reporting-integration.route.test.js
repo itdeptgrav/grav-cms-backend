@@ -906,8 +906,14 @@ describeOrSkip("Custom Reports against the live pilot", () => {
 
 
   /* ── Slice B4: the response says how much of the report it is showing ─────
-     The audit's own case, against the mart it came from. */
-  test("THE 333-LEDGER CASE: VISIBLE + OMITTED = THE MART, FOR EVERY SERIES", async () => {
+     The audit's own case, against the mart it came from.
+
+     Named for the PROPERTY, not for a ledger count. It used to be "THE
+     333-LEDGER CASE", and 333 is a fact about what the books held on one
+     afternoon — the mart holds 236 today. A test whose name goes stale when
+     an accountant posts a voucher invites its assertions to go stale too,
+     which is exactly what happened below. */
+  test("TRUNCATED PREVIEW: VISIBLE + OMITTED = THE MART, FOR EVERY SERIES", async () => {
     if (skipIfDown()) return;
     const body = {
       name: "Every ledger", companyIds: [GRAV],
@@ -944,16 +950,42 @@ describeOrSkip("Custom Reports against the live pilot", () => {
       expect(visible + omitted).toBeCloseTo(complete[i], 2);
     });
 
-    /* The finding the audit reported, now measured rather than inferred: the
-       hundred rows on screen are a minority of the money. */
-    const visibleDebit = data.reduce((n, row) => n + Number(row.cells[0].value ?? 0), 0);
-    expect(visibleDebit / Number(mart.d)).toBeLessThan(0.25);
+    /* ── WHAT THIS USED TO ASSERT, AND WHY IT WAS WRONG ───────────────────
+       `visibleDebit / mart.d < 0.25` — "the hundred rows on screen are a
+       minority of the money". True of the books the day it was written (333
+       ledgers, a long tail) and false of the books today (236 ledgers, where
+       the first hundred hold 48%). Nothing in the engine changed; an
+       accountant posted vouchers. A red suite that means "the data moved" is
+       a suite people learn to ignore, and it would have gone red again at the
+       next threshold too — so it is not replaced with a different percentage.
 
-    // A signed amount stays signed: the omitted tail is not an absolute value.
+       What IS durable is the arithmetic the omitted bucket exists to make
+       honest, and it is asserted per series rather than in aggregate. */
+
+    // The count on screen is the count returned, not the count that exists.
+    expect(r.body.previewRowCount).toBe(data.length);
+    expect(r.body.groupCount).toBeGreaterThan(r.body.previewRowCount);
+    expect(r.body.omitted.rows).toBe(r.body.groupCount - r.body.previewRowCount);
+
+    r.body.leafColumns.forEach((leaf, i) => {
+      const visible = data.reduce((n, row) => n + Number(row.cells[i].value ?? 0), 0);
+      const omitted = r.body.omitted.values[leaf.id];
+
+      /* The omitted figure is the mart's own remainder, to the paisa — not a
+         sampled estimate, and not a proportion of anything. */
+      expect(omitted).toBeCloseTo(complete[i] - visible, 2);
+    });
+
+    /* A signed amount stays signed: the omitted tail is not an absolute value.
+       These books balance, so the signed total is zero and the tail is exactly
+       the negation of what is on screen — which is a stronger statement than
+       any magnitude threshold, and it holds however the ledgers are
+       distributed. */
     const signedLeaf = r.body.leafColumns[2];
     const visibleSigned = data.reduce((n, row) => n + Number(row.cells[2].value ?? 0), 0);
-    expect(r.body.omitted.values[signedLeaf.id]).toBeCloseTo(-visibleSigned, 2);
-    expect(Math.abs(r.body.omitted.values[signedLeaf.id])).toBeGreaterThan(0);
+    expect(r.body.omitted.values[signedLeaf.id]).toBeCloseTo(Number(mart.s) - visibleSigned, 2);
+    expect(Math.sign(r.body.omitted.values[signedLeaf.id]))
+      .toBe(Math.sign(Number(mart.s) - visibleSigned));
   }, 120_000);
 
   test("ASCENDING AND DESCENDING OMIT DIFFERENT TAILS AND RECONCILE ALIKE", async () => {
@@ -1140,4 +1172,107 @@ describeOrSkip("Custom Reports against the live pilot", () => {
       }
     }
   }, 90_000);
+
+  /* ── Voucher Number across the top, against the real books ────────────────
+     The catalogue used to forbid this outright. These are the properties that
+     had to hold before it could be permitted — asserted against the mart, not
+     against a fixture, because the thing at risk is what the DATA does to a
+     text identifier: `00531` surviving as characters, and `2` sorting before
+     `10`. */
+  describe("Voucher Number across the top", () => {
+    const ACROSS = (over = {}) => ({
+      name: "Vouchers across", companyIds: [GRAV],
+      rows: [{ field: "ledger.name", heading: "Ledger Name" }],
+      columns: [{ field: "voucher.number", heading: "Voucher Number" }],
+      values: [{ field: "amount.debit", heading: "Total Debit", calculation: "total" }],
+      filters: [{ field: "voucher.number", operation: "starts_with", value: "0053" }],
+      comparisons: [], sort: [], limit: 100,
+      showRowTotals: false, showColumnTotals: false, showGrandTotal: false,
+      ...over,
+    });
+
+    test("A FILTERED REPORT RUNS, AND KEEPS THE LEADING ZERO", async () => {
+      if (skipIfDown()) return;
+      const r = await call("/preview", { method: "POST", body: ACROSS() });
+      expect(r.status).toBe(200);
+
+      const headings = r.body.columnLevels[0].headers.map((h) => h.label);
+      expect(headings.length).toBeGreaterThan(0);
+
+      /* The property the whole `text_exact` apparatus exists for. A voucher
+         number that became a number would arrive as 531, and no assertion
+         about "a number" would notice. */
+      for (const h of headings) {
+        expect(typeof h).toBe("string");
+        expect(h).toMatch(/^0053/);
+      }
+      expect(headings).toContain("00531");
+    });
+
+    test("THE HEADINGS ARE IN NATURAL ORDER", async () => {
+      if (skipIfDown()) return;
+      const r = await call("/preview", { method: "POST", body: ACROSS({
+        filters: [{ field: "voucher.number", operation: "starts_with", value: "0" }],
+      }) });
+      if (r.status !== 200) return;              // too wide today; the bound has its own test
+
+      const headings = r.body.columnLevels[0].headers.map((h) => h.label);
+      const sorted = [...headings].sort((a, b) =>
+        String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: "base" }));
+      expect(headings).toEqual(sorted);
+    });
+
+    test("PREVIEW AND WORKBOOK AGREE ON THE HEADINGS AND THE FIGURES", async () => {
+      if (skipIfDown()) return;
+      const body = ACROSS();
+      const preview = await call("/preview", { method: "POST", body });
+      expect(preview.status).toBe(200);
+
+      const raw = await call("/export/xlsx", { method: "POST", body, raw: true });
+      expect(raw.status).toBe(200);
+
+      const ExcelJS = require("exceljs");
+      const wb = new ExcelJS.Workbook();
+      await wb.xlsx.load(Buffer.from(await raw.arrayBuffer()));
+      const ws = wb.worksheets[0];
+
+      const inFile = [];
+      for (let i = 2; i <= ws.rowCount; i += 1) {
+        const row = ws.getRow(i);
+        inFile.push(row.values.slice(1).map((v) => (v && v.result !== undefined ? v.result : v)));
+      }
+
+      /* The workbook is the flat aggregation — one row per ledger × voucher —
+         so the comparison is of CONTENT, not of shape: every voucher number
+         the preview shows as a heading appears in the file, as text. */
+      const headings = preview.body.columnLevels[0].headers.map((h) => String(h.label));
+      const textsInFile = new Set(inFile.flat().map((v) => String(v)));
+      for (const h of headings) expect(textsInFile.has(h)).toBe(true);
+
+      // And the figures reconcile: the same total, reached two ways.
+      const previewTotal = preview.body.rows
+        .filter((x) => (x.kind || "data") === "data")
+        .reduce((n, row) => n + row.cells.reduce((m, c) => m + Number(c.value ?? 0), 0), 0);
+      const fileTotal = inFile
+        .flat()
+        .filter((v) => typeof v === "number")
+        .reduce((n, v) => n + v, 0);
+      expect(fileTotal).toBeCloseTo(previewTotal, 2);
+    }, 120_000);
+
+    test("EVERY VOUCHER ACROSS THE TOP IS REFUSED, WITH THE STABLE CODE", async () => {
+      if (skipIfDown()) return;
+      const r = await call("/preview", { method: "POST", body: ACROSS({ filters: [] }) });
+
+      expect(r.status).toBe(422);
+      expect(r.body.code).toBe("REPORTING_TOO_MANY_HEADINGS");
+      expect(r.body.field).toBe("Voucher Number");
+      expect(r.body.maximum).toBe(50);
+      expect(r.body.exact).toBe(false);
+      expect(r.body.reason).toMatch(/Filter Voucher Number more narrowly/);
+
+      // And the refusal is small: the report it refused was never built.
+      expect(JSON.stringify(r.body).length).toBeLessThan(1000);
+    });
+  });
 });

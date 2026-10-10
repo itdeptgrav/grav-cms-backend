@@ -88,6 +88,307 @@ const signature = (doc) => JSON.stringify((doc.pieces || []).map((p) => [
   p.allowance, p.sewingLine,
 ]));
 
+describe("native pattern creation without a DXF", () => {
+  test("an editor-authored multi-piece pattern reaches drape readiness without a source DXF", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Native shirt pilot", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    const doc = (await documentOf(w, root.id)).editorDocument;
+    /* This is a synthetic editor document, not the imported CLO test DXF. It
+       exercises the same save/projection path as drawn outlines, using a small
+       five-panel construction whose seam runs are already reviewed. */
+    const drawn = tee.patternSet({ withNeckBand: true });
+    doc.pieces = drawn.pieces.map((piece) => ({
+      pieceId: piece.pieceRef.toLowerCase(), pieceRef: piece.pieceRef,
+      name: piece.name, closed: true,
+      points: piece.outline.map((point, index) => ({
+        pointId: `${piece.pieceRef}-${index}`, x: point.x, y: point.y, kind: "corner",
+      })),
+      grainline: {
+        fromX: piece.grainline.from.x, fromY: piece.grainline.from.y,
+        toX: piece.grainline.to.x, toY: piece.grainline.to.y,
+      },
+      allowance: { widthMm: 10, source: "stated" },
+      notches: [], internalLines: [],
+      provenance: { geometry: "authored", note: "Synthetic native-path regression" },
+    }));
+    const child = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: root.id, document: doc, name: "Five drawn panels", actor: w.actor,
+    })).revision;
+    const settings = tee.simulationInputs({ withNeckBand: true });
+    settings.template = "woven-shirt";
+    settings.avatar.poseRef = "a-pose";
+    settings.avatarConfirmed = true;
+    settings.fabricConfirmed = true;
+    settings.sewingLine = { lineMeaning: "cut_line", source: "derived", allowanceMm: 10,
+      origin: "user-confirmation", confirmed: true };
+    const slots = {
+      "PC-FRONT": "front", "PC-BACK": "back", "PC-SLV-L": "left-arm",
+      "PC-SLV-R": "right-arm", "PC-BAND": "neck",
+    };
+    settings.pieces = settings.pieces.map((plan) => ({
+      ...plan, placementSlot: slots[plan.pieceRef], placementLayer: "base",
+      placementOffsetMm: [0, 0, 0], placementYawDeg: 0,
+      placementConfirmed: true,
+    }));
+    await patterns.setSimulationInputs(w.ctx, {
+      revisionId: child.id, actor: w.actor, inputs: settings,
+    });
+    const saved = await documentOf(w, child.id);
+    const untouchedRoot = await documentOf(w, root.id);
+    expect(saved.origin.rootKind).toBe("native-authoring");
+    expect(saved.sourceDxf.sha256).toBe("");
+    expect(saved.patternSet.pieces).toHaveLength(5);
+    expect(saved.readiness.ready).toBe(true);
+    expect(saved.simulationInputs.pieces.map((p) => p.placementSlot)).toEqual([
+      "front", "back", "left-arm", "right-arm", "neck",
+    ]);
+    expect(untouchedRoot.patternSet.pieces).toEqual([]);
+  });
+
+  test("native placement is confirmed per piece and expires after a changed arrangement", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    const doc = (await documentOf(w, root.id)).editorDocument;
+    doc.pieces.push({ pieceId: "front", pieceRef: "", name: "Front", closed: true,
+      points: [
+        { pointId: "a", x: 0, y: 0, kind: "corner" },
+        { pointId: "b", x: 200, y: 0, kind: "corner" },
+        { pointId: "c", x: 200, y: 300, kind: "corner" },
+        { pointId: "d", x: 0, y: 300, kind: "corner" },
+      ], notches: [], internalLines: [], provenance: { geometry: "authored", note: "" } });
+    const child = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: root.id, document: doc, name: "Front panel", actor: w.actor,
+    })).revision;
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      pieces: [{ pieceRef: "PP-FRONT", role: "body.front", roleConfirmed: true,
+        placementSlot: "front", placementLayer: "base",
+        placementOffsetMm: [0, 0, 0], placementYawDeg: 0,
+        placementConfirmed: true }],
+    } });
+    let read = await documentOf(w, child.id);
+    expect(read.simulationInputs.pieces[0].placementConfirmed).toMatchObject({
+      by: expect.objectContaining({ name: w.actor.name }),
+    });
+    expect(read.readiness.failures.map((f) => f.code)).not.toContain("R_NATIVE_PLACEMENT_UNCONFIRMED");
+
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      pieces: [{ ...read.simulationInputs.pieces[0], placementLayer: "outer" }],
+    } });
+    read = await documentOf(w, child.id);
+    expect(read.simulationInputs.pieces[0].placementConfirmed).toBeNull();
+    expect(read.readiness.failures.map((f) => f.code)).toContain("R_NATIVE_PLACEMENT_UNCONFIRMED");
+
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      pieces: [{ ...read.simulationInputs.pieces[0], placementConfirmed: true }],
+    } });
+    read = await documentOf(w, child.id);
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      pieces: [{ ...read.simulationInputs.pieces[0], placementOffsetMm: [20, 0, 0] }],
+    } });
+    read = await documentOf(w, child.id);
+    expect(read.simulationInputs.pieces[0].placementConfirmed).toBeNull();
+
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      pieces: [{ ...read.simulationInputs.pieces[0], placementConfirmed: true }],
+    } });
+    read = await documentOf(w, child.id);
+    await patterns.setSimulationInputs(w.ctx, { revisionId: child.id, actor: w.actor, inputs: {
+      avatar: { name: "New body", poseRef: "a-pose", measurements: { chestMm: 1000 } },
+    } });
+    read = await documentOf(w, child.id);
+    expect(read.simulationInputs.pieces[0].placementConfirmed).toBeNull();
+  });
+
+  test("body and fabric review stamps are attributable and expire when their values change", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    await patterns.setSimulationInputs(w.ctx, { revisionId: root.id, actor: w.actor, inputs: {
+      avatar: { name: "Body M", measurements: { chestMm: 1000 } },
+      avatarConfirmed: true,
+      fabrics: [{ profileId: "cotton", name: "Cotton", behaviour: "woven", weightGsm: 120,
+        grade: "measured", source: "mill test", stretchWarpPercent: 2, stretchWeftPercent: 3 }],
+      fabricConfirmed: true,
+    } });
+    let read = await documentOf(w, root.id);
+    expect(read.simulationInputs.avatarConfirmed).toMatchObject({ by: expect.objectContaining({ name: w.actor.name }) });
+    expect(read.simulationInputs.fabricConfirmed).toMatchObject({ by: expect.objectContaining({ name: w.actor.name }) });
+    expect(read.readiness.failures.map((f) => f.code)).not.toContain("R_NATIVE_AVATAR_UNCONFIRMED");
+    expect(read.readiness.failures.map((f) => f.code)).not.toContain("R_NATIVE_FABRIC_UNCONFIRMED");
+
+    await patterns.setSimulationInputs(w.ctx, { revisionId: root.id, actor: w.actor, inputs: {
+      avatar: { name: "Body M", measurements: { chestMm: 1040 } },
+      avatarConfirmed: read.simulationInputs.avatarConfirmed,
+    } });
+    read = await documentOf(w, root.id);
+    expect(read.simulationInputs.avatarConfirmed).toBeNull();
+    expect(read.simulationInputs.fabricConfirmed).not.toBeNull();
+    expect(read.readiness.failures.map((f) => f.code)).toContain("R_NATIVE_AVATAR_UNCONFIRMED");
+
+    await patterns.setSimulationInputs(w.ctx, { revisionId: root.id, actor: w.actor, inputs: {
+      fabrics: [{ profileId: "cotton", name: "Cotton", behaviour: "woven", weightGsm: 130,
+        grade: "measured", source: "mill test", stretchWarpPercent: 2, stretchWeftPercent: 3 }],
+      fabricConfirmed: read.simulationInputs.fabricConfirmed,
+    } });
+    read = await documentOf(w, root.id);
+    expect(read.simulationInputs.fabricConfirmed).toBeNull();
+    expect(read.readiness.failures.map((f) => f.code)).toContain("R_NATIVE_FABRIC_UNCONFIRMED");
+  });
+
+  test("a buttoned-front decision persists and its confirmation expires when stations change", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    await patterns.setSimulationInputs(w.ctx, { revisionId: root.id, actor: w.actor, inputs: {
+      frontClosure: { state: "buttoned", leftPlacketRef: "left", rightPlacketRef: "right",
+        stationsFromTopMm: [100, 220], confirmed: true },
+    } });
+    let read = await documentOf(w, root.id);
+    expect(read.simulationInputs.frontClosure.stationsFromTopMm).toEqual([100, 220]);
+    expect(read.simulationInputs.frontClosure.confirmed).toMatchObject({
+      by: expect.objectContaining({ name: w.actor.name }),
+    });
+    await patterns.setSimulationInputs(w.ctx, { revisionId: root.id, actor: w.actor, inputs: {
+      frontClosure: { ...read.simulationInputs.frontClosure,
+        stationsFromTopMm: [100, 225] },
+    } });
+    read = await documentOf(w, root.id);
+    expect(read.simulationInputs.frontClosure.confirmed).toBeNull();
+    expect(read.simulationInputs.frontClosure.stationsFromTopMm).toEqual([100, 225]);
+  });
+
+  test("a named empty root opens in the editor but is not render-ready", async () => {
+    const w = await world();
+    const created = await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    });
+    const read = await documentOf(w, created.revision.id);
+    expect(created.idempotent).toBe(false);
+    expect(read.origin).toEqual({ kind: "native-authoring", rootKind: "native-authoring", parentRevisionRef: "" });
+    expect(read.state).toBe("draft");
+    expect(read.sourceDxf.sha256).toBe("");
+    expect(read.patternSet.unit).toBe("mm");
+    expect(read.patternSet.pieces).toEqual([]);
+    expect(read.editorDocumentOrigin).toBe("stored");
+    expect(read.editorDocument.pieces).toEqual([]);
+    expect(read.readiness.ready).toBe(false);
+  });
+
+  test("retrying creation cannot produce a second root", async () => {
+    const w = await world();
+    const key = `native-${++seq}`;
+    const first = await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: key, actor: w.actor,
+    });
+    const retry = await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: key, actor: w.actor,
+    });
+    expect(retry.idempotent).toBe(true);
+    expect(retry.revision.id).toBe(first.revision.id);
+    expect(await PatternRevision.countDocuments({ companyId: w.co._id, styleId: w.style._id })).toBe(1);
+    await refuses(() => patterns.createNativeRevision(w.ctx, {
+      styleId: w.other._id, name: "Different style", idempotencyKey: key, actor: w.actor,
+    }), "REVISION_CONFLICT");
+  });
+
+  test("a drawn child saves without inventing an imported source", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    const doc = (await documentOf(w, root.id)).editorDocument;
+    doc.pieces.push({
+      pieceId: "p1", pieceRef: "", name: "Front", closed: true,
+      points: [
+        { pointId: "v1", x: 0, y: 0, kind: "corner", edge: "" },
+        { pointId: "v2", x: 200, y: 0, kind: "corner", edge: "" },
+        { pointId: "v3", x: 200, y: 300, kind: "corner", edge: "" },
+        { pointId: "v4", x: 0, y: 300, kind: "corner", edge: "" },
+      ],
+      notches: [], internalLines: [], provenance: { geometry: "authored", note: "" },
+    });
+    const child = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: root.id, document: doc, name: "First drafted piece", actor: w.actor,
+    })).revision;
+    const saved = await documentOf(w, child.id);
+    expect(saved.origin).toEqual({ kind: "edit", rootKind: "native-authoring", parentRevisionRef: root.revisionRef });
+    expect(saved.sourceDxf.sha256).toBe("");
+    expect(saved.patternSet.pieces).toHaveLength(1);
+    expect(saved.editorDocument.pieces[0].provenance.geometry).toBe("authored");
+    expect((await documentOf(w, root.id)).editorDocument.pieces).toEqual([]);
+  });
+
+  test("internal operations persist but cannot be silently omitted from a native drape", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    const doc = (await documentOf(w, root.id)).editorDocument;
+    doc.pieces.push({
+      pieceId: "front", pieceRef: "", name: "Front", closed: true,
+      points: [
+        { pointId: "a", x: 0, y: 0, kind: "corner", edge: "" },
+        { pointId: "b", x: 200, y: 0, kind: "corner", edge: "" },
+        { pointId: "c", x: 200, y: 300, kind: "corner", edge: "" },
+        { pointId: "d", x: 0, y: 300, kind: "corner", edge: "" },
+      ],
+      notches: [], provenance: { geometry: "authored", note: "" },
+      internalLines: [{ lineId: "placket", points: [{ x: 90, y: 0 }, { x: 90, y: 300 }],
+        closed: false, operation: "placket", confirmed: true, note: "front opening", provenance: "authored" }],
+    });
+    const saved = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: root.id, document: doc, name: "Placket drafted", actor: w.actor,
+    })).revision;
+    const read = await documentOf(w, saved.id);
+    expect(read.editorDocument.pieces[0].internalLines[0]).toMatchObject({
+      lineId: "placket", operation: "placket", confirmed: true, note: "front opening",
+    });
+    expect(read.patternSet.pieces[0].internalLines[0]).toMatchObject({
+      lineId: "placket", operation: "placket", confirmed: true, note: "front opening",
+      provenance: "authored",
+    });
+    expect(read.readiness.ready).toBe(false);
+    expect(read.readiness.failures).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "R_NATIVE_PATH_UNSUPPORTED", lineId: "placket" }),
+    ]));
+  });
+
+  test("editing an outline clears an inherited boundary-finish confirmation but keeps its role", async () => {
+    const w = await world();
+    const root = (await patterns.createNativeRevision(w.ctx, {
+      styleId: w.style._id, name: "Woven shirt", idempotencyKey: `native-${++seq}`, actor: w.actor,
+    })).revision;
+    const doc = (await documentOf(w, root.id)).editorDocument;
+    doc.pieces.push({ pieceId: "front", pieceRef: "", name: "Front", closed: true,
+      points: [
+        { pointId: "a", x: 0, y: 0, kind: "corner", edge: "" },
+        { pointId: "b", x: 200, y: 0, kind: "corner", edge: "" },
+        { pointId: "c", x: 200, y: 300, kind: "corner", edge: "" },
+        { pointId: "d", x: 0, y: 300, kind: "corner", edge: "" },
+      ], notches: [], internalLines: [], provenance: { geometry: "authored", note: "" } });
+    const first = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: root.id, document: doc, name: "Draft front", actor: w.actor,
+    })).revision;
+    await PatternRevision.updateOne({ _id: first.id }, { $set: { "simulationInputs.pieces": [{
+      pieceRef: "PP-FRONT", role: "body.front", boundaryConfirmed: { by: w.actor, at: new Date() },
+    }] } });
+    const edited = (await documentOf(w, first.id)).editorDocument;
+    edited.pieces[0].points[0].x = 5;
+    const child = (await patterns.saveEditorRevision(w.ctx, {
+      revisionId: first.id, document: edited, name: "Reshaped front", actor: w.actor,
+    })).revision;
+    const plan = (await documentOf(w, child.id)).simulationInputs.pieces[0];
+    expect(plan.role).toBe("body.front");
+    expect(plan.boundaryConfirmed).toBeNull();
+  });
+});
+
 /* ═══ 1 · THE ROUND TRIP ══════════════════════════════════════════════════ */
 
 describe("an imported pattern, opened and saved unchanged", () => {

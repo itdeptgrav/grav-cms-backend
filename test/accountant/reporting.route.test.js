@@ -31,6 +31,15 @@ let server, origin, logSpy;
 let engineCalls = [];
 let engineBehaviour = "ok";
 
+/** How many distinct headings the fake data holds, for the heading budget. */
+let headingProbeRows = 3;
+
+/* The engine now receives more than one kind of call per request: the heading
+   budget's bounded probe runs before the preview. These assertions are about
+   what the PREVIEW was given, so they say so rather than trusting an index. */
+const previewCall = () => engineCalls.find((c) => c.kind === "preview");
+const probeCalls = () => engineCalls.filter((c) => c.kind === "query");
+
 function fakeEngine() {
   const { ReportingError, CODES } = require("../../services/reporting/metabaseEngine");
   const maybeThrow = () => {
@@ -48,6 +57,35 @@ function fakeEngine() {
   };
   return {
     isConfigured: () => true,
+
+    /* ── THE HEADING BUDGET'S TWO SEAMS ────────────────────────────────────
+       A layout with anything across the top is now counted before it is run
+       (services/reporting/headingBudget.js), which needs the view resolved
+       and one bounded query. The real engine has both; so must the fake, or
+       every preview in this file answers 503 for a reason that has nothing to
+       do with what it is testing.
+
+       `headingProbeRows` is how a test says "this report would be that wide".
+       It defaults to a small, permitted number. */
+    async resolveView() {
+      return {
+        databaseId: 2,
+        tableId: 200,
+        fieldIds: Object.fromEntries(
+          [...require("../../services/reporting/fieldCatalogue").allColumns(),
+           "organization_id", "company_id"].map((c, i) => [c, 1000 + i]),
+        ),
+      };
+    },
+    async runQuery(payload) {
+      engineCalls.push({ kind: "query", payload });
+      maybeThrow();
+      /* One row per heading the test says the data holds, capped by the
+         query's own limit exactly as Metabase would cap it. */
+      const limit = payload?.query?.limit ?? headingProbeRows;
+      return Array.from({ length: Math.min(headingProbeRows, limit) }, (_, i) => [`H${i}`, 1]);
+    },
+
     async runPreview(args) {
       engineCalls.push({ kind: "preview", ...args });
       maybeThrow();
@@ -107,7 +145,7 @@ afterAll(async () => {
   await new Promise((r) => server.close(r));
 });
 
-beforeEach(() => { engineCalls = []; engineBehaviour = "ok"; });
+beforeEach(() => { engineCalls = []; engineBehaviour = "ok"; headingProbeRows = 3; });
 
 async function call(path, { method = "GET", body, bearer, raw = false } = {}) {
   const res = await fetch(`${origin}/api/accountant/reporting${path}`, {
@@ -193,7 +231,7 @@ describe("multi-company scope", () => {
     const s = await scenario("owner", 2);
     const r = await call("/preview", { method: "POST", bearer: s.bearer, body: LAYOUT(s.ids) });
     expect(r.status).toBe(200);
-    expect(engineCalls[0].companyIds).toEqual(s.ids);
+    expect(previewCall().companyIds).toEqual(s.ids);
   });
 
   test("ONE FORBIDDEN COMPANY REFUSES THE WHOLE REQUEST", async () => {
@@ -224,7 +262,7 @@ describe("multi-company scope", () => {
       method: "POST", bearer: s.bearer, body: LAYOUT([s.companyId, s.companyId, s.companyId]),
     });
     expect(dupes.status).toBe(200);
-    expect(engineCalls[0].companyIds).toEqual([s.companyId]);
+    expect(previewCall().companyIds).toEqual([s.companyId]);
 
     const many = Array.from({ length: 11 }, () => new mongoose.Types.ObjectId().toString());
     const tooMany = await call("/preview", { method: "POST", bearer: s.bearer, body: LAYOUT(many) });
@@ -241,8 +279,8 @@ describe("multi-company scope", () => {
   test("THE ENGINE RECEIVES THE SESSION'S ORGANISATION, never the body's", async () => {
     const s = await scenario();
     await call("/preview", { method: "POST", bearer: s.bearer, body: LAYOUT([s.companyId]) });
-    expect(engineCalls[0].organizationId).toBe(String(s.org._id));
-    expect(engineCalls[0].companyIds).toEqual([s.companyId]);
+    expect(previewCall().organizationId).toBe(String(s.org._id));
+    expect(previewCall().companyIds).toEqual([s.companyId]);
   });
 });
 
@@ -373,7 +411,7 @@ describe("POST /preview", () => {
   test("the preview limit is capped server-side at 100", async () => {
     const s = await scenario();
     await call("/preview", { method: "POST", bearer: s.bearer, body: LAYOUT([s.companyId], { limit: 99999 }) });
-    expect(engineCalls[0].layout.limit).toBe(100);
+    expect(previewCall().layout.limit).toBe(100);
   });
 
   test("A CRAFTED SQL / MBQL / RAW-COLUMN PAYLOAD IS REFUSED", async () => {
@@ -648,5 +686,126 @@ describe("no engine credential escapes", () => {
       expect(text).not.toContain("metabase.internal");
       expect(text.toLowerCase()).not.toContain("x-api-key");
     }
+  });
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════ */
+
+describe("Voucher Number across the top", () => {
+  const MAX = require("../../services/reporting/headingBudget").HEADING_BUDGET.maxHeadings;
+
+  /** Voucher numbers across the top, ledgers down the left, debit in the cells. */
+  const VOUCHERS_ACROSS = (companyIds, over = {}) => LAYOUT(companyIds, {
+    rows: [{ field: "ledger.name", heading: "Ledger Name" }],
+    columns: [{ field: "voucher.number", heading: "Voucher Number" }],
+    values: [{ field: "amount.debit", heading: "Total Debit", calculation: "total" }],
+    /* A real way to narrow it: every voucher whose number starts "00".
+       `is` takes one value, so a set comes from `starts_with` or a date range —
+       which is exactly the "filtered to a manageable set" case. */
+    filters: [{ field: "voucher.number", operation: "starts_with", value: "00" }],
+    ...over,
+  });
+
+  test("A FILTERED REPORT IS ACCEPTED", async () => {
+    const s = await scenario();
+    headingProbeRows = 3;
+    const r = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]) });
+    expect(r.status).toBe(200);
+    expect(previewCall()).toBeTruthy();
+  });
+
+  test("EXACTLY AT THE MAXIMUM IS ACCEPTED", async () => {
+    const s = await scenario();
+    headingProbeRows = MAX;
+    const r = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]) });
+    expect(r.status).toBe(200);
+  });
+
+  test("ONE OVER IT IS REFUSED WITH THE STABLE CODE AND ITS METADATA", async () => {
+    const s = await scenario();
+    headingProbeRows = MAX + 1;
+    const r = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]) });
+
+    expect(r.status).toBe(422);
+    expect(r.body.code).toBe("REPORTING_TOO_MANY_HEADINGS");
+    expect(r.body.field).toBe("Voucher Number");
+    expect(r.body.maximum).toBe(MAX);
+    expect(r.body.exact).toBe(false);
+    expect(r.body.reason).toMatch(/Filter Voucher Number more narrowly/);
+    expect(r.body.reason).toMatch(/down the left/);
+  });
+
+  test("A REFUSED REPORT NEVER RUNS, AND NEVER RETURNS A BIG BODY", async () => {
+    const s = await scenario();
+    headingProbeRows = 9000;
+    const raw = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]), raw: true });
+    const text = await raw.text();
+
+    expect(raw.status).toBe(422);
+    /* The point of refusing: the preview is never executed, so the enormous
+       response the bound exists to prevent is never built. */
+    expect(previewCall()).toBeUndefined();
+    expect(Buffer.byteLength(text)).toBeLessThan(2_000);
+  });
+
+  test("THE REFUSAL LEAKS NO ENGINE DETAIL", async () => {
+    const s = await scenario();
+    headingProbeRows = MAX + 1;
+    const r = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]) });
+    const wire = JSON.stringify(r.body);
+    for (const leak of ["voucher_number", "source-table", "breakout", "database",
+                        "v_general_ledger", "mb_", "api_key"]) {
+      expect(wire).not.toContain(leak);
+    }
+  });
+
+  test("UNOWNED AND MIXED-COMPANY REQUESTS ARE 403 BEFORE ANY COUNTING QUERY", async () => {
+    const s = await scenario("owner", 2);
+    const outsider = await makeCompany();          // a company this org does not own
+    headingProbeRows = 9000;                       // would be refused if it got that far
+
+    for (const ids of [[String(outsider._id)], [s.companyId, String(outsider._id)]]) {
+      engineCalls = [];
+      const r = await call("/preview", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS(ids) });
+
+      expect(r.status).toBe(403);
+      expect(r.body.code).toBe("REPORTING_FORBIDDEN");
+      /* The scope guard runs first, so nothing was asked of the engine at all —
+         not the preview, and not the heading probe. An unowned company is not
+         told how many vouchers it has. */
+      expect(engineCalls).toHaveLength(0);
+      expect(probeCalls()).toHaveLength(0);
+    }
+  });
+
+  test("THE EXPORT APPLIES THE SAME BOUND", async () => {
+    const s = await scenario();
+    headingProbeRows = MAX + 1;
+    const r = await call("/export/xlsx", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]) });
+
+    expect(r.status).toBe(422);
+    expect(r.body.code).toBe("REPORTING_TOO_MANY_HEADINGS");
+    /* The same metadata as the preview: a layout refused on screen must not be
+       downloadable instead, and must say why in the same words. */
+    expect(r.body.field).toBe("Voucher Number");
+    expect(r.body.maximum).toBe(MAX);
+  });
+
+  test("and the export runs when the report is within it", async () => {
+    const s = await scenario();
+    headingProbeRows = MAX;
+    const r = await call("/export/xlsx", { method: "POST", bearer: s.bearer, body: VOUCHERS_ACROSS([s.companyId]), raw: true });
+    expect(r.status).toBe(200);
+  });
+
+  test("A SAVED REPORT MAY HOLD THIS LAYOUT", async () => {
+    /* Saving validates the SHAPE; how wide it will be depends on the data the
+       day it is run, so the bound belongs to running it, not to storing it. */
+    const s = await scenario();
+    const r = await call("/custom-reports", {
+      method: "POST", bearer: s.bearer,
+      body: { ...VOUCHERS_ACROSS([s.companyId]), name: "Vouchers across" },
+    });
+    expect(r.status).toBe(201);
   });
 });

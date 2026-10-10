@@ -40,6 +40,7 @@ const models = require("../../../services/rnd/garmentModel.service");
 const patterns = require("../../../services/rnd/patternRevision.service");
 const renders = require("../../../services/rnd/garmentRender.service");
 const avatars = require("../../../services/rnd/avatar.service");
+const referenceGarments = require("../../../services/rnd/referenceGarment.service");
 
 const router = express.Router();
 router.use(EmployeeAuthMiddleware);
@@ -526,6 +527,19 @@ router.get("/patterns/styles/:styleId/revisions", requireCompany, canRead,
     return res.json({ success: true, ...out });
   }));
 
+/* A native, empty 2D draft. It is intentionally not renderable until the
+   patternmaker draws pieces and saves a completed child revision. */
+router.post("/patterns/styles/:styleId/revisions/native", requireCompany, canAnnotate,
+  handle(async (req, res) => {
+    const out = await patterns.createNativeRevision(ctx(req), {
+      styleId: req.params.styleId,
+      name: req.body?.name,
+      idempotencyKey: req.body?.idempotencyKey,
+      actor: actor(req),
+    });
+    return res.status(out.idempotent ? 200 : 201).json({ success: true, ...out });
+  }));
+
 /**
  * IMPORT A DXF AS THE STYLE'S PATTERN REVISION.
  *
@@ -585,6 +599,29 @@ router.get("/patterns/revisions/:revisionId", requireCompany, canRead,
   handle(async (req, res) => {
     const out = await patterns.readRevision(ctx(req), { revisionId: req.params.revisionId });
     return res.json({ success: true, ...out });
+  }));
+
+/* A CLO-GLB-guided proportional size PREVIEW, never a fit or a publication.
+   The private source bytes are read from one model of the same style, paired
+   against its own parsed DXF, and only the derived bytes are sent back. A
+   reshaped or separately graded revision is refused rather than disguised as
+   a correctly simulated drape. Nothing is written to either source record. */
+router.get("/patterns/revisions/:revisionId/reference-preview", requireCompany, canRead,
+  handle(async (req, res) => {
+    const out = await referenceGarments.referencePreviewForRevision(ctx(req), {
+      revisionId: req.params.revisionId,
+      publicationId: req.query.publicationId,
+    });
+    res.setHeader("Content-Type", "model/gltf-binary");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Cache-Control", "private, no-store");
+    res.setHeader("Content-Disposition", 'attachment; filename="reference-size-preview.glb"');
+    res.setHeader("X-GRAV-Preview-Kind", "proportional-reference-only");
+    res.setHeader("X-GRAV-Reference-Scale", out.scale.toFixed(6));
+    res.setHeader("X-GRAV-Fit-Verified", "false");
+    res.setHeader("Access-Control-Expose-Headers",
+      "X-GRAV-Preview-Kind, X-GRAV-Reference-Scale, X-GRAV-Fit-Verified");
+    return res.end(out.glb);
   }));
 
 /* Every edit mints the next revision — see the service. There is deliberately

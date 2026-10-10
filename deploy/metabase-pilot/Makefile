@@ -22,10 +22,15 @@ down:                    ## stop, keep data
 
 reset:                   ## stop and DESTROY all pilot data
 	docker compose down -v
-	@echo "The reporting database is now EMPTY. Rebuild it from grav-cms-backend:"
-	@echo "    npm run reporting:migrate -- --apply"
-	@echo "    npm run reporting:roles   -- --apply"
-	@echo "    npm run reporting:sync    -- --full"
+	@echo "The reporting database is now EMPTY. Rebuild it from grav-cms-backend"
+	@echo "with ONE command, which runs the five steps in the only order that"
+	@echo "works on a fresh database (roles, migrate, roles again, sync, verify):"
+	@echo ""
+	@echo "    npm run reporting:setup -- --apply"
+	@echo ""
+	@echo "Why roles twice: V003 grants to metabase_reader, which the roles step"
+	@echo "creates; and the roles step grants on views the migrations create."
+	@echo "See deploy/metabase-pilot/README.md."
 
 verify:                  ## prove read-only + dataset integrity
 	./verify.sh

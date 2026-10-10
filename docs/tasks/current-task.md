@@ -1,4 +1,173 @@
-# ACTIVE TASK — CMS DEVELOPMENT QWEN RUNTIME (2 Oct 2026)
+# ACTIVE TASK — AI INTERVIEW LAB MVP (10 Oct 2026)
+
+The candidate-facing question voice now uses Bodhan's hosted Indic-Speak API. The browser never receives the key or controls the upstream model; it can select only the server allowlisted Kavya/Amit voices for Hindi and English, or Itishree/Akash for Odia. The backend requests the provider's 24 kHz WAV, bounds synthesis time, validates RIFF output, and keeps a small process-local replay cache. A model-restricted key is configured as `BODHAN_API_KEY` in the ignored backend `.env`; live English and Odia synthesis both returned valid mono 24 kHz PCM WAV audio on 10 Oct 2026.
+
+English questions use Indic-Speak language `en`. Conversational Hinglish and Odia modes use the existing private Qwen 3 32B API to create a bounded natural spoken copy. Indic-Speak receives `hi` for Hinglish and `or` for Odia. This never changes the authored English question or the text used for evaluation. GRAV Speech remains the sole STT path.
+
+The prototype remains release-blocked. This approval does not cover release to employees, candidates, customers, or the public; employment, consent, privacy, vendor-terms, and AI-governance review is required first. Durable scope: `docs/product/ai-interview-lab.md` and `docs/decisions/ai-interview-evidence-boundary.md`.
+
+The question speaker uses a persistent, visible browser audio player, attempts playback automatically, and leaves a manual Play control available if Chrome blocks autoplay. The UI exposes `Preparing voice` / `Speaking` states. Changing voice or language clears the previous generated clip.
+
+The live turn controller now distinguishes substantive answers from repeat, clarification, skip, and unusable responses. A deterministic server guard recognises common English and Hinglish repeat phrases immediately, without Qwen latency or cost; ambiguous intent falls through to Qwen. Repeat requests replay the active question without scoring, and clarification requests receive a neutral rephrasing. Qwen may ask an evidence-focused follow-up only for a material rubric gap, ambiguity, or contradiction, with a hard server cap of two per base question. The final report is recomputed from raw completed turns, normalises all criterion IDs and point bounds on the server, and contains no hire/reject recommendation.
+
+The browser now defaults to hands-free turn-taking: after speech begins, about 1.7 seconds of silence stops the answer recording and submits it to GRAV Speech automatically. HR can disable this and retain explicit Stop and Transcribe controls. Ending the room never auto-submits a partial recording.
+
+The interview now starts as a conversation rather than with a technical question. Qwen writes a short welcome, thanks the candidate for joining, and asks for a brief introduction; that first answer is acknowledged but excluded from scoring and the report. For every later substantive answer, Qwen writes a neutral acknowledgement and decides whether to ask a bounded evidence-focused follow-up or advance to the next planned question. Repeat requests are still handled immediately and replayed without scoring.
+
+Qwen may include a small allowlist of delivery cues. Indic-Speak maps warmth/professional, explanatory and excitement cues to provider-supported request styles and joins short, standard or long pauses into the returned PCM WAV. Delivery cues affect presentation only; they do not alter the raw GRAV Speech transcript or the evidence score.
+
+The `/api/hr/ai-interview-lab` POSTs are exempt from the generic HR record-change approval queue because they do not persist or mutate an HR record. The HR authorization contract remains authoritative and still requires `recruitment.manage` for voice, transcription, follow-up generation, and scoring.
+
+GRAV Speech uses the ignored `.env` URL and shared secret through `services/ai/gravSpeechClient.js`; HR does not own another STT endpoint. The 10 Oct outage was a worker crash caused by SQLite WAL mode on RunPod's FUSE/geesefs-mounted `/workspace` volume. The job store now defaults to SQLite `DELETE` journal mode (with an explicit validated override), the corrupt queue was archived, and the restarted worker passed database integrity, readiness and a real CMS-adapter utterance test. The raw result was `welcome to your interview please explain how you would verify inventory existence and valuation` from `bodhan-ai/indic-transcribe-flex` in 1.491 seconds. The HR health indicator reports actual readiness, distinguishes warm-up, and client calls fail with a typed 504 instead of hanging indefinitely.
+
+---
+
+# ACTIVE TASK — CENTRALIZED GRAV SPEECH API (10 Oct 2026)
+
+The product owner approved centralising the validated multilingual speech
+models so every GRAV application consumes one private API instead of installing
+its own model copy or connecting to a GPU pod.
+
+Durable decision and implementation slice:
+
+- `docs/decisions/central-grav-speech-service.md`
+- `docs/tasks/grav-speech-api-foundation.md`
+- `docs/tasks/grav-stt-temporary-tester.md` (diagnostic evidence only)
+
+The central boundary serves asynchronous recorded calls/meetings and a separate
+reserved low-latency utterance path. Browsers never call it directly. Source
+applications retain authorization and transcript ownership; the speech service
+centralises inference only. The accepted runtime is
+`bodhan-ai/indic-transcribe-flex`, with optional
+`nvidia/diar_sortformer_4spk-v1` for recorded multi-speaker audio. No LLM or
+manual cleanup changes the machine transcript.
+
+GS-01 proves the API with GRAV Voice and CoWork before Store or other apps are
+added. The GPU pod is replaceable compute: durable job state, model identity
+and application-owned results must survive it.
+
+---
+
+# ACTIVE TASK — GRAV VOICE RECORDED CALL BRIDGE (8 Oct 2026)
+
+The product owner approved a recorded business-call system in which customers
+call one GRAV number, employees receive the bridged call on their existing Jio
+corporate phones, and outbound calls are initiated from GRAV CMS. Both journeys
+are recorded by a licensed telephony provider and reconciled into the existing
+CRM `CallEvent` history.
+
+Durable product and architecture boundaries:
+
+- `docs/product/grav-voice-call-bridge.md`
+- `docs/decisions/grav-voice-call-bridge-provider-boundary.md`
+
+The provider-free foundation is complete and the product owner explicitly
+requested a real-call test. The active implementation slice is now CB-02:
+
+- `docs/tasks/grav-voice-cb-01-provider-neutral-foundation.md`
+- `docs/tasks/grav-voice-cb-02-real-call-mvp.md`
+- `docs/handoff/grav-voice-cb-01-prompt.md`
+- `docs/audits/grav-voice-existing-call-foundation-2026-10-08.md`
+
+CB-02 adds the live Exotel adapter, company-owned call records, provider-truth
+refresh/callback reconciliation, authenticated recording proxy and a separate
+GRAV Voice CMS app. Its typed-number dialler is a time-boxed commissioning
+surface: server-flagged and administrator-only. Exotel activation, credentials,
+KYC/verified-user eligibility and a pilot number remain external gates before
+the first real call can be placed.
+
+Direct iPhone Phone-app calls remain outside the recording guarantee. No task
+may claim that Apple Configurator disables or redirects the Phone app.
+
+**8 Oct browser-call update.** The accepted browser path is now LiveKit media
+plus an Exotel outbound SIP trunk: CMS browser → private LiveKit room → Exotel
+SIP → customer PSTN. The CMS/server implementation is capability-gated and the
+working callback path remains available. An authenticated Exotel v2 trunk-list
+probe returned `Exotel API Version v2 not supported`, so a real browser-to-PSTN
+call is externally blocked until Exotel enables Dynamic SIP Trunking and a
+LiveKit outbound trunk ID is configured. The control must remain visibly
+unavailable rather than silently falling back. LiveKit Egress or an explicitly
+verified Exotel trunk-recording path is still required before browser calls may
+be presented as recorded.
+
+**8 Oct parallel-provider update.** Exotel must remain live and is not being
+replaced. Knowlarity is added beside it as an explicit provider switch. The
+Knowlarity option remains disabled for calling until account activation and
+the account-specific Click2Call, call-detail and recording APIs are supplied
+and verified. Provider choice is persisted on each `CallEvent`; refresh and
+recording retrieval use that stored provider rather than a global default.
+
+**8 Oct self-service browser-provider update.** Plivo CX provided a working
+self-service India signup, KYC, number-rental and outbound SIP-trunk path. The
+KYC-approved number `+918065395337` and Plivo termination domain were connected
+to the existing GRAV LiveKit project as outbound trunk `ST_B4w69aME82ne`, with
+India destination pinning. The browser path now exposes Exotel, Plivo and
+Telnyx as explicit parallel choices; Plivo is the configured MVP choice while
+the other browser providers remain capability-gated. Callback calling remains
+Exotel/Knowlarity and is unchanged. Audio-only LiveKit room-composite Egress is
+wired into the browser-call lifecycle, writes a mixed MP3 into GRAV-controlled
+GCP/Firebase storage, and is streamed only through the authenticated
+company-scoped route.
+
+**8 Oct connected-recording correction.** The first real Plivo browser-call
+test proved that starting Egress before the PSTN dial records ringback and
+silence before the customer answers. That behaviour is not accepted. The next
+implementation slice must wait for authoritative LiveKit SIP state `active`
+(`IN_PROGRESS`) before starting Egress. It must not create a recording for an
+unanswered, rejected, failed or cancelled-before-answer call. Once connected,
+the call row must set `received=true`, set its connected timestamp, start
+recording exactly once, and stop/finalize that recording on hang-up. The UI may
+show `Recording processing` only after recording has actually started. Tests
+must pin answered, unanswered, dial-failure, duplicate-dial and hang-up races.
+The approved recording announcement remains a release gate.
+
+**8 Oct application-launcher integration.** GRAV Voice is a first-class CMS
+application on `/onboarding` and in the signed-in application switcher. It is
+not represented by a fabricated department grant: both surfaces call the
+authenticated `/api/cms/voice/access` endpoint and show the direct `/voice`
+tile only when that endpoint grants access. The tile uses the shared Voice
+identity and phone icon, and `/voice` resolves as the active application in the
+CMS shell. A focused regression test pins the access gate, launcher, switcher,
+icon and route contract.
+
+**8 Oct remote-hang-up correction.** A customer ending a browser call removes
+the LiveKit SIP participant before GRAV performs its own cleanup. That absence
+is now treated as a successful idempotent hang-up and as the authoritative
+terminal signal during call refresh. The call is finalized, connected duration
+is saved, Egress is stopped, and the CMS polls an active call briefly as a
+fallback for missed realtime participant-disconnect events. Recents must not
+remain `On call` after the far end has disconnected.
+
+**8 Oct contacts and conference slice.** GRAV Voice owns a minimal,
+company-scoped phone directory that is intentionally separate from CRM. No CRM
+contact is read, created or modified in this slice. A user can start a call
+from the Voice phonebook or, after the first customer answers, add another
+Voice contact or valid number into the SAME private LiveKit room. The running
+room-composite recording therefore captures the employee and every connected
+conference member without starting a second recording. One guest leaving does
+not end the call; the call ends automatically only after every PSTN participant
+has left, or immediately when the employee presses End. Conference membership
+is stored on the existing company-owned `CallEvent`; no second call-history
+collection is introduced.
+
+**8 Oct one-line end-user app (supersedes the parallel-provider updates).**
+The product owner asked for GRAV Voice to stop being a developer console and
+become one end-user calling app. There is now exactly one way to call: the
+browser line (LiveKit room + one SIP outbound trunk, today Plivo's). The
+Exotel and Knowlarity callback adapters, the provider registry, the Exotel
+webhook, `POST /calls`, and the Exotel/Telnyx browser options are removed —
+this reverses "Exotel must remain live". Server config now reads
+`GRAV_VOICE_SIP_OUTBOUND_TRUNK_ID` / `GRAV_VOICE_CALLER_ID`, falling back to
+the existing `LIVEKIT_PLIVO_SIP_OUTBOUND_TRUNK_ID` / `PLIVO_CALLER_ID`. Recents
+show only the caller's own calls; busy / no-answer dial failures are recorded
+as `CUSTOMER_BUSY` / `CUSTOMER_NO_ANSWER`. The calling permission gate
+(`GRAV_VOICE_ALLOW_TEST_DIALLER=1` + administrator) is **unchanged** and is the
+owner's decision to widen. Historical Exotel `CallEvent` rows stay in Mongo
+(the `provider` enum is untouched) but are no longer listed or playable.
+
+---
+
+# ACTIVE TASK — STORE ASSISTANT RELEASE GATE (3 Oct 2026)
 
 The user requested that the existing CMS assistant use `qwen3:32b` from the
 development RunPod after a direct comparison with `qwen3:8b`. The runtime is private: Ollama is
@@ -12,9 +181,161 @@ and one live structured model request to succeed through the tunnel.
 
 **State: live in CMS development.** Verified `qwen3:32b` / `Q4_K_M` by digest,
 100% GPU residency on the A40, structured requests through the private tunnel,
-68/68 focused assistant tests, a clean catalogue audit, and a healthy restarted
+71/71 focused assistant tests, a clean 77-concept catalogue audit (65 HR and
+12 Accounting), and a healthy restarted
 backend with its database and socket connected. The 8B files remain available
 for rollback but that model is not resident in GPU memory.
+
+**CMS-wide correctness migration is active, not complete.** The coverage
+manifest accounts for 32 application areas / 374 route files: 4 fully
+catalogued, 2 partial, 19 pending and 7 explicitly excluded
+infrastructure/security surfaces. The new
+`audit:assistant-cms-coverage` command reports this gap deterministically so a
+working HR example cannot be mistaken for complete CMS coverage.
+
+**3 Oct supplier-constraint correction.** The real CMS question “any po of
+gaurav enterprise?” exposed a fail-open collection-query defect: `qwen3:32b`
+selected PO-number filters, server reconciliation removed those ungrounded
+slots, and the adapter then counted every purchase order. Collection identity
+constraints are now independently recovered from tenant-authorised recorded
+identity values across every schema-declared Store & Purchase entity. Only
+punctuation and conservative singular/plural normalisation are allowed; edit-
+distance guessing is not. A unique recorded value becomes a server-owned exact
+filter, tied values require clarification, and an unresolved relational phrase
+fails closed instead of executing an unfiltered query. The exact bad 32B plan,
+an unknown-supplier case, ambiguity, and more than 100 generated identity-field
+cases are regression-covered. The broader routing, API, catalogue and link
+checkpoint passes 9 suites / 97 tests. The same checkpoint now generates
+addressability checks for all 2,438 exposed fields and natural-language value
+checks for all 1,088 non-empty schema enum values across 53 entities. It caught
+and corrected two additional generic defects: the word “for” inside a real
+field label was being mistaken for a filter boundary, and enum values could
+masquerade as field names. Explicitly named filter fields and canonical enum or
+formatted numeric values are now derived from the schema and override a wrong
+Qwen slot. “Give me top five latest requests” is also locked to the unified
+Store Request Desk candidate and excluded from Accounting; the live 32B plan
+selects list/all/all/newest/5. This hardens the deterministic contract;
+it does not create or claim a literal 100% natural-language guarantee.
+
+Date ranges now follow the same server-owned contract. An explicitly named
+catalogued date overrides Qwen's proposed date slot; an entity with one date
+uses that date; an entity with several dates and no proven basis asks for
+clarification rather than guessing. Lifecycle-date wording is declared
+separately from ordinary field aliases so `recorded` may identify the goods-
+receipt business date without colliding with the valid `RECORDED` status. The
+live `qwen3:32b` six-question routing gate now passes, including “list goods
+receipts recorded in September 2026”.
+
+Pending coverage is also fail-closed at runtime: business vocabulary for a
+pending application returns a deterministic “not catalogued” response and is
+never sent to Qwen as an invitation to invent CMS data. A known catalogued
+domain without an authorised compatible tool returns a deterministic permission
+refusal.
+
+Store is now the third fully catalogued application. Its 13 reachable model
+sources are closed (9 contracted collections and 4 explicit embedded-schema
+exclusions). The Store catalogue has 181 concepts: 154 individually
+addressable source fields plus typed list, directory, numbering, verification,
+requirement, shortfall and issuance queries. Purchase-order, worker-order,
+manufacturing-order and request facts resolve only after exact entity identity;
+repeated words such as `status` cannot cross record types. Deterministic
+adapters calculate live-stock shortfalls and issuance progress. Worker
+bank/UPI/IFSC/cheque identifiers, attachment URLs and internal joins remain
+excluded. Known wording resolves without Qwen; an unseen paraphrase may ask
+Qwen to select a canonical Store concept ID, but never a database field. The
+server then independently proves that the named record is the same entity type
+as the selected concept before executing it.
+
+Latest semantic checkpoint: the audit covers 2,820 concepts: 65 HR, 12
+Accounting, 29 Sales customer-master, 28 Store supplier-master, 2,438 generated
+Store & Purchase concepts, 23 Inventory raw-item-master, 4 physical-location,
+20 Planner, 20 Configurations and 181 Store. Seventy-one audited field contracts
+classify 3,788 in-scope persisted paths: 2,748 exposed through typed concepts
+and 1,040 explicitly excluded. The generated source
+inventory recursively follows local route dependencies and currently finds 287
+reachable Mongo model files, 60 Firestore collection names, 30 unresolved
+dynamic collection references and 2 external data adapters. Forty-three Mongo
+models are contracted today; this
+explicitly prevents the existing safe slices from being presented as complete
+CMS coverage. The focused cross-application regression is green: 15 suites / 126
+tests, including Store database-backed identity, privacy and shortfall checks.
+A read-only development-database probe also resolved existing purchase-order,
+worker-work-order and order-request status questions to three distinct concepts
+and reproduced each stored status through the deterministic renderer. A
+separate synthetic live `qwen3:32b` probe mapped the unseen phrase “how far
+along is purchase order PO-TEST-42?” to `store.purchase_order.status`. Real CMS
+identifiers were deliberately not sent to the external model probe.
+Live read-only
+development checks resolve `expenses for this yr` to
+`financials.expenses` and return only that value, resolve gross profit
+separately, reserve the complete packet for an explicit P&L request, refuse an
+inventory question at the coverage boundary, and refuse an HR email question
+at the permission boundary. A database-backed Store reader also resolves a real
+supplier's email through the tenant filter and suppresses its phone and GSTIN.
+An exact raw-item quantity is rendered deterministically without floating-point
+residue. Planner is the first fully catalogued application: both schemas are
+covered, all reads are owner-scoped, and an isolated-database test proves one
+owner cannot see another owner's records. The development database currently
+contains no Planner tasks, so the live check truthfully returns zero rather
+than seeding or inventing data.
+Configurations is now fully catalogued across measurement categories,
+measurement templates and Requests settings. Its StockItem dependency is
+explicitly excluded as mutation-only, and an assistant read never creates the
+singleton settings row or substitutes a default when the row is absent.
+The backend is healthy on port 5050 with its database connected.
+
+The raw-item routing collision found on `1 Way Metal MCB Board` is fixed at the
+central boundary. Authorised exact record identities now take precedence over
+generic application words inside those identities; Qwen then selects only the
+closed inventory concept when wording is not already a catalogue claim. The
+canonical request `stock of 1 Way Metal MCB Board` resolves to
+`item.physical_quantity`, while a genuine `Board overview` request still fails
+closed as an uncatalogued application. Central routing, permissions, inventory
+and catalogue regressions pass 45/45, and both catalogue audits remain clean.
+
+The Store & Purchase completion programme now has an explicit whole-app gate.
+The product surface is composite: its routes reach both `StorePurchase` and
+shared `Inventory` sources, so both application catalogues must reach zero
+unexplained business-data sources before the Store assistant may be called
+complete. The first closed operational family is physical location: exact
+material identity now routes to typed warehouse/rack/shelf/bin positions,
+location count, located quantity and unallocated quantity. The deterministic
+adapter reads `LocationBalance` and `Warehouse` under the existing tenant and
+`sp.read` boundaries; Qwen selects only one of four semantic concepts and
+never sees database fields or records. A validated inventory subject is kept
+in bounded conversation state so a follow-up such as “which rack?” cannot lose
+the material or silently become stock status. Store & Purchase now has zero
+unexplained sources: its source ledger discovers 55 Mongo model files, 34 are
+covered by typed field contracts and 21 are explicitly excluded access,
+security or schema-helper dependencies. Its one Firestore reference and
+Firebase adapter are infrastructure-only and have explicit exclusions. The
+schema generator exposes 2,438 safe concepts across 53 business entity types.
+Qwen sees a question-ranked, human-readable semantic shortlist for the chosen
+entity; the server retains tenant scope, exact identity resolution, field
+projection and deterministic rendering. A live multi-entity `qwen3:32b` matrix
+now passes 5/5 schema-driven collection/receiving cases and 6/6 legacy Store
+collection cases. The Store-focused regression is green at 16 suites / 79
+tests, the read-only development-data audit passes 53/53 generated entity
+collections and 6/6 legacy collection paths, and the real CMS chat returns the
+operations queue summary, inventory valuation, purchase exceptions, stock-count
+aggregation, service-order listing and expected-June-receiving result. The
+frontend audit covers 154 endpoints across 21 Store product surfaces: 17 are
+catalogued and four are explicitly excluded non-assistant or separately owned
+surfaces, with no partial/unclassified surfaces or missing tools. Aggregate wording is
+separated from exact-record lookup before model selection; generic plural entity
+labels, singleton recognition boundaries and history-identity restrictions
+prevent the routing collisions found during live testing. Store & Purchase is
+therefore catalogued at application level for these closed read/query classes,
+while the CMS-wide programme remains incomplete and no literal 100% natural-
+language guarantee is claimed.
+
+Sales remains `pending` at application level because its customer-master slice
+is not complete coverage of every Sales route. The separate Store route and the
+larger Store & Purchase receiving/procurement application are both catalogued.
+Sales correctly refuses globally unowned customer rows in this multi-company
+environment. Store currently inherits the Store tenant service's documented
+temporary legacy read-through until supplier ownership is backfilled; the
+assistant does not create a parallel scope rule.
 
 ---
 
@@ -22,6 +343,15 @@ for rollback but that model is not resident in GPU memory.
 
 The active implementation scope is the **first in-app 2D→3D fit slice** for
 R&D. Decision record: `docs/decisions/rnd-fit-simulation.md`.
+
+**Direction update, 6 Oct 2026:** native in-app 2D pattern creation is the
+primary entry point; DXF import is optional. The existing slice's imported
+pattern adapter remains valid but is not the final user workflow. Before
+claiming a usable woven-shirt feature, implement a native root revision,
+production access to the 2D editor, complete construction-path confirmation,
+and saved-revision-to-drape validation as specified in
+`docs/decisions/rnd-native-pattern-authoring.md`. Treat this as sequential
+follow-on scope, not as proof that the current drape is visually acceptable.
 
 The product direction is fixed and is not re-litigated by this slice:
 
@@ -220,9 +550,13 @@ every CMS application.
 
 - Added one compiled semantic-catalogue runtime for business domains, entities,
   scalar metrics, aliases and tool compatibility.
-- Migrated HR to 10 domains, 5 entities, 55 scalar metrics and 89 aliases;
+- Migrated HR to 10 domains, 5 entities and 65 scalar metrics/concepts;
   exact reads validate the named employee before execution and cannot be
   selected through a model-invented metric enum.
+- Migrated Accounting financials to 12 canonical concepts. The server resolves
+  the requested concept and renders the exact value; Qwen can no longer select
+  `expenses` versus `profit`, and the full summary is returned only when the
+  user explicitly asks for it.
 - Registered all current HR and Accounting assistant tools against the same
   semantic contract and added a release-blocking catalogue audit.
 - Added entity-first precedence: a unique real employee, department or ledger
@@ -239,7 +573,8 @@ every CMS application.
 
 ## Evidence
 
-- Catalogue preflight: 27 registered tools, HR and Accounting audits clean.
+- Catalogue preflight: 27 registered tools, 65 HR concepts and 12 Accounting
+  concepts; both audits clean.
 - Pure routing/catalogue suite: 83/83 passing.
 - Route reviewer: 5/5 passing.
 - Database route and HR-permission parity: 24/24 passing.
@@ -5691,6 +6026,16 @@ execution and audit event. The model has no raw MongoDB access.
   the larger model is an improvement, not a replacement for typed catalogues
   and validators. The focused regression suite remains green at 68/68 and the
   catalogue audit remains clean at 27 tools / 62 HR metrics.
+- Replaced the ambiguous named-employee `salary` route with a catalogue-owned
+  business concept. No period now returns the current configured monthly salary
+  summary; a named month compiles to its posted payroll summary; a year-only
+  request compiles to annual payroll totals. A complete new question clears
+  prior subject/period/tool state before model planning, and plan-v2 traces now
+  record the resolved concept, source, temporal grain, response shape and
+  fields. The real development record for `what is umung's salary?` resolves to
+  `compensation.configured_salary_summary` from `employee_master` and renders
+  the authorised configured breakdown deterministically. Focused tests pass
+  71/71; the catalogue audit is clean at 65 HR concepts.
 - A fresh-history live matrix selected deterministic sources for attendance,
   work email, CTC, father and blood group. `arpita's attendance` returned the
   authorised 30-day tally through `hr_employee` in 1.186 seconds, without model
@@ -5705,5 +6050,50 @@ execution and audit event. The model has no raw MongoDB access.
   remained on the deterministic work-email metric.
 
 Durable architecture: `docs/decisions/qwen-typed-cms-assistant.md`.
+
+## Assistant record navigation
+
+- Assistant answers may now carry structured `meta.links` alongside the reply.
+  Links are built by the authorised server tool from the same record that
+  produced the answer; Qwen never writes or selects a URL.
+- Links are same-origin, deduplicated, bounded and revalidated before delivery
+  and again before conversation-history persistence.
+- Both the full `/grav-ai` workspace and the global assistant overlay render
+  the links and restore them with conversation history.
+- Store record reads, Store collection results, receiving-register results,
+  inventory items and locations, suppliers, Request Desk lists and purchase
+  exception lists now contribute links when the CMS has a real destination.
+- Expected purchased arrivals link to the purchase order's Receive page. They
+  do not link to a GRN page because a GRN does not exist until receipt.
+- Partial or ambiguous inventory names now return up to eight permission-scoped
+  prompt choices. Matching uses complete identifying words from the question
+  after schema-owned metric vocabulary is removed; it does not use edit-distance
+  guessing. Selecting a choice immediately submits a canonical question for
+  that exact item and requested metric and renders the verified final answer;
+  it does not place intermediary text in the composer. Choices are
+  server-built, text-only, bounded, revalidated before delivery and persistence,
+  and separate from record-navigation links; Qwen creates neither the candidate
+  nor the follow-up prompt.
+
+Verification: a real CMS overlay turn for `stock of macbook?` returned an Apple
+MacBook Air choice. Selecting it immediately submitted the exact resolved stock
+question while the composer remained blank, then returned the deterministic
+stock answer plus the ordinary record link. Both assistant UIs pass targeted
+ESLint, and the prompt-choice,
+record-link and inventory contract suites pass 18/18; the database-backed
+suggestion suite passes 2/2.
+
+- Stock answers now reconcile the item-master total against the sum recorded at
+  physical locations. When those sources disagree, GRAV reports both values and
+  explicitly marks the records as conflicting instead of silently choosing a
+  false answer. The live MacBook check exposed `0 Pcs` in the item master versus
+  `130 Pcs` across physical locations and returned that reconciliation warning.
+  The focused prompt-choice, record-link, inventory and suggestion suites pass
+  20/20.
+
+Verification: the broader assistant-navigation, Store, receiving and central
+assistant regression passes 73/73 across 11 suites; the Next.js
+compiler completed successfully before the repository's pre-existing
+`/marketing/campaigns/plans` prerender failure.
 
 ---

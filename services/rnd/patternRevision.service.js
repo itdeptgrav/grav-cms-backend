@@ -29,6 +29,7 @@ const {
   PatternRevision, REVISION_STATE, EDIT_KIND,
   ANCHOR_KIND, SYMMETRY, PIECE_LAYER, SEAM_ALIGNMENT, FABRIC_BEHAVIOUR, FABRIC_GRADE,
 } = require("../../models/CMS_Models/RnD/PatternRevision");
+const { PATTERN_CLASSIFICATION } = require("../../models/CMS_Models/RnD/GarmentModel");
 const templates = require("./fitTemplates");
 const { styleForCompany } = require("../companyContext/rndScope.service");
 const { checkInputs, adapterStatus } = require("./simulationAdapter.service");
@@ -74,6 +75,7 @@ function revisionView(row, { geometry = false } = {}) {
     state: row.state,
     origin: {
       kind: row.origin?.kind,
+      rootKind: str(row.origin?.rootKind) || (row.origin?.kind === "native-authoring" ? "native-authoring" : ""),
       parentRevisionRef: str(row.origin?.parentRevisionRef),
     },
     sourceDxf: {
@@ -107,6 +109,8 @@ function revisionView(row, { geometry = false } = {}) {
     readiness: checkInputs(row.patternSet, row.simulationInputs, {
       revisionRef: row.revisionRef,
       mappingConfirmedAgainstRef: row.mappingConfirmedAgainstRef,
+      nativeAuthoring: row.origin?.rootKind === "native-authoring" || row.origin?.kind === "native-authoring",
+      editorDocument: row.editorDocument,
     }),
     mappingConfirmedAgainstRef: str(row.mappingConfirmedAgainstRef),
     /* ── THE WORDS THE SCREEN MAY OFFER ────────────────────────────────
@@ -204,6 +208,72 @@ async function readRevision(ctx, { revisionId } = {}) {
   assertContext(ctx);
   const row = await revisionForCompany(ctx, revisionId, { lean: true });
   return { revision: revisionView(row, { geometry: true }) };
+}
+
+/* A blank, native root is an editable draft, not a renderable garment. It has
+ * no source file and never claims to be a DXF import. Saving the drawn pattern
+ * mints its first child through the existing editor-save contract. */
+async function createNativeRevision(ctx, {
+  styleId, name, idempotencyKey, actor = null,
+} = {}) {
+  assertContext(ctx);
+  const style = await styleForCompany(ctx.companyId, styleId);
+  const title = clean(name, 200);
+  if (!title) throw fail("VALIDATION", "Name the pattern before creating it.", { field: "name" });
+  const key = clean(idempotencyKey, 120);
+  if (!key) throw fail("VALIDATION", "A creation key is required so a retry cannot make two patterns.",
+    { field: "idempotencyKey" });
+
+  const existing = await PatternRevision.findOne(byCompany(ctx, { idempotencyKey: key })).lean();
+  if (existing) {
+    if (String(existing.styleId) !== String(style._id) || existing.origin?.kind !== "native-authoring") {
+      throw fail("REVISION_CONFLICT", "That creation key already belongs to another pattern.");
+    }
+    return { revision: revisionView(existing, { geometry: true }), idempotent: true };
+  }
+
+  const last = await PatternRevision.findOne(byCompany(ctx, { styleId: style._id }))
+    .sort({ revisionNumber: -1 }).select("revisionNumber").lean();
+  const who = actorOf(actor);
+  const now = new Date();
+  const payload = {
+    companyId: ctx.companyId,
+    styleId: style._id,
+    revisionRef: mintRef("PR"),
+    revisionNumber: (last?.revisionNumber || 0) + 1,
+    name: title,
+    state: REVISION_STATE.DRAFT,
+    origin: { kind: "native-authoring", rootKind: "native-authoring", parentRevisionRef: "" },
+    sourceDxf: { driveFileId: "", name: "", sha256: "", bytes: 0, importedInRevisionRef: "" },
+    patternSet: {
+      patternSetRef: mintRef("PS"), classification: PATTERN_CLASSIFICATION.APPAREL,
+      unit: "mm", unitSource: "pattern-editor", unitDeclared: "mm", unitInMm: 1,
+      pieces: [], grading: { graded: false, sizes: [], sizeCount: 0 },
+      stats: { pieces: 0, namedPieces: 0, piecesWithOutline: 0, notches: 0,
+        internalLines: 0, grainlines: 0, vertices: 0 },
+    },
+    editorDocument: {
+      schemaVersion: editorDoc.EDITOR_SCHEMA_VERSION, unit: "mm",
+      sourceUnit: "mm", sourceUnitInMm: 1,
+      pieces: [], seams: [], measurements: [],
+    },
+    idempotencyKey: key,
+    author: who,
+    events: [{ kind: "created", note: "Created in the 2D pattern editor.", by: who, at: now }],
+  };
+  let created;
+  try {
+    created = await PatternRevision.create(payload);
+  } catch (err) {
+    if (err?.code !== 11000) throw err;
+    const retry = await PatternRevision.findOne(byCompany(ctx, { idempotencyKey: key })).lean();
+    if (retry && String(retry.styleId) === String(style._id)
+      && retry.origin?.kind === "native-authoring") {
+      return { revision: revisionView(retry, { geometry: true }), idempotent: true };
+    }
+    throw fail("REVISION_CONFLICT", "This pattern was created concurrently. Reload its revisions.");
+  }
+  return { revision: revisionView(created, { geometry: true }), idempotent: false };
 }
 
 /* ═══ IMPORTING ═══════════════════════════════════════════════════════════ */
@@ -646,7 +716,7 @@ async function editRevision(ctx, { revisionId, operations = [], name, expectedRe
     revisionNumber: (last?.revisionNumber || 0) + 1,
     name: clean(name, 200) || parent.name,
     state: REVISION_STATE.DRAFT,
-    origin: { kind: "edit", parentRevisionRef: parent.revisionRef },
+    origin: { kind: "edit", rootKind: parent.origin?.rootKind || (parent.origin?.kind === "native-authoring" ? "native-authoring" : "dxf-import"), parentRevisionRef: parent.revisionRef },
     /* The file travels with the line. Revision 7's DXF is revision 1's DXF,
        and it says so. */
     sourceDxf: parent.sourceDxf,
@@ -741,7 +811,7 @@ async function saveEditorRevision(ctx, {
     revisionNumber: (last?.revisionNumber || 0) + 1,
     name: title,
     state: REVISION_STATE.DRAFT,
-    origin: { kind: "edit", parentRevisionRef: parent.revisionRef },
+    origin: { kind: "edit", rootKind: parent.origin?.rootKind || (parent.origin?.kind === "native-authoring" ? "native-authoring" : "dxf-import"), parentRevisionRef: parent.revisionRef },
     /* The file travels with the line: revision 7's DXF is revision 1's DXF. */
     sourceDxf: parent.sourceDxf,
     patternSet,
@@ -816,6 +886,28 @@ async function saveEditorRevision(ctx, {
 function simulationInputsFromEditor(document, parent, who = null, at = new Date()) {
   const inputs = JSON.parse(JSON.stringify(parent.simulationInputs || {}));
   const seams = Array.isArray(document.seams) ? document.seams : [];
+
+  /* Boundary finish was confirmed on a particular outline. A child revision
+     may carry roles, body and fabric forward, but cannot carry this statement
+     across a changed cut edge. Compare stable editor piece ids rather than
+     names, which a patternmaker is free to change without changing cloth. */
+  const previousDoc = editorDoc.editorDocumentFor(parent).document;
+  const previousPieces = new Map((previousDoc?.pieces || []).map((p) => [str(p.pieceId), p]));
+  const boundaryShape = (p) => JSON.stringify([
+    Boolean(p.closed), (p.points || []).map((v) => [str(v.pointId), v.x, v.y, str(v.kind), str(v.edge), v.allowanceMm ?? null]),
+  ]);
+  const changedRefs = new Set();
+  for (const piece of document.pieces || []) {
+    const prior = previousPieces.get(str(piece.pieceId));
+    if (prior && boundaryShape(prior) === boundaryShape(piece)) continue;
+    changedRefs.add(str(piece.pieceRef) || `PP-${str(piece.pieceId).toUpperCase()}`);
+  }
+  inputs.pieces = (inputs.pieces || []).map((plan) => changedRefs.has(str(plan.pieceRef))
+    ? { ...plan, boundaryConfirmed: null, placementConfirmed: null } : plan);
+  if (inputs.frontClosure && (changedRefs.has(str(inputs.frontClosure.leftPlacketRef))
+    || changedRefs.has(str(inputs.frontClosure.rightPlacketRef)))) {
+    inputs.frontClosure.confirmed = null;
+  }
 
   /* ── CONFIRMED MEANS A PERSON STATED THE ALIGNMENT AND TICKED IT ────── */
   const everyOneConfirmed = seams.length > 0
@@ -954,7 +1046,12 @@ function patternSetFromEditor(document, parentPatternSet) {
         at: { x: n.x, y: n.y }, form: n.form || "point", depth: n.depthMm,
       })),
       internalLines: (p.internalLines || []).map((l) => ({
+        lineId: str(l.lineId),
         points: l.points || [], closed: Boolean(l.closed),
+        operation: str(l.operation),
+        confirmed: Boolean(l.confirmed),
+        note: str(l.note),
+        provenance: str(l.provenance),
       })),
       sewLine: p.sewingLine?.points?.length ? p.sewingLine.points : undefined,
       seamAllowance: p.allowance?.widthMm
@@ -970,7 +1067,7 @@ function patternSetFromEditor(document, parentPatternSet) {
 
   return {
     patternSetRef: str(parentPatternSet?.patternSetRef) || `PS-${Date.now().toString(36).toUpperCase()}`,
-    classification: str(parentPatternSet?.classification) || "apparel-pattern",
+    classification: str(parentPatternSet?.classification) || PATTERN_CLASSIFICATION.APPAREL,
     manifest: parentPatternSet?.manifest || {},
     unit: "mm",
     unitSource: "pattern-editor",
@@ -1179,6 +1276,27 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
     return { by: who, at };
   };
 
+  /* A placement confirmed on one body or seam topology is not confirmed on
+     another. A sleeve can move to the opposite arm when its seam partner
+     changes even though its slot and numeric offset stayed identical. */
+  const bodyKey = (value) => JSON.stringify({
+    poseRef: str(value?.poseRef),
+    measurements: Object.fromEntries(Object.entries(value?.measurements || {}).sort()),
+    avatarRef: value?.avatarRef ? {
+      avatarId: str(value.avatarRef.avatarId),
+      revision: Number(value.avatarRef.revision),
+      contentSha256: str(value.avatarRef.contentSha256),
+    } : null,
+  });
+  const seamKey = (value) => JSON.stringify((value || []).map((seam) => ({
+    seamId: str(seam.seamId), sideA: seam.sideA, sideB: seam.sideB,
+    alignment: str(seam.alignment),
+  })));
+  const arrangementContextChanged = Boolean(inputs.avatar
+    && bodyKey(inputs.avatar) !== bodyKey(held.avatar))
+    || Boolean(Array.isArray(inputs.seams)
+      && seamKey(inputs.seams) !== seamKey(held.seams));
+
   const pieces = Array.isArray(inputs.pieces)
     ? inputs.pieces.map((piece) => {
       const before = (held.pieces || []).find((p) => str(p.pieceRef) === str(piece.pieceRef));
@@ -1188,9 +1306,21 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
         roleConfirmed: stamp(piece.roleConfirmed, before?.roleConfirmed),
         grainConfirmed: stamp(piece.grainConfirmed, before?.grainConfirmed),
         boundaryConfirmed: stamp(piece.boundaryConfirmed, before?.boundaryConfirmed),
+        placementConfirmed: piece.placementConfirmed === true
+          ? stamp(true, null)
+          : (!arrangementContextChanged && before && str(before.role) === str(piece.role)
+            && str(before.placementSlot) === str(piece.placementSlot)
+            && str(before.placementLayer) === str(piece.placementLayer)
+            && JSON.stringify(before.placementOffsetMm || null)
+              === JSON.stringify(piece.placementOffsetMm || null)
+            && (before.placementYawDeg ?? null) === (piece.placementYawDeg ?? null)
+            && before.placementConfirmed?.at ? before.placementConfirmed : null),
       };
     })
-    : (held.pieces || []);
+    : (held.pieces || []).map((piece) => arrangementContextChanged
+      ? { ...(typeof piece.toObject === "function" ? piece.toObject() : piece),
+        placementConfirmed: null }
+      : piece);
 
   const seams = Array.isArray(inputs.seams)
     ? inputs.seams.map((seam) => {
@@ -1223,14 +1353,53 @@ async function setSimulationInputs(ctx, { revisionId, inputs = {}, expectedRevis
     avatar = { ...inputs.avatar, avatarRef: null };
   }
 
+  /* Confirmation belongs to the VALUES, not just the step. A copied stamp in
+     a form payload must not confirm a different body or fabric. Only the
+     literal `true` is a new user decision; otherwise preserve an old stamp
+     only while the underlying values are unchanged. */
+  const canonical = (value) => {
+    if (value && typeof value.toObject === "function") return canonical(value.toObject());
+    if (Array.isArray(value)) return value.map(canonical);
+    if (value && typeof value === "object" && !(value instanceof Date)) {
+      return Object.fromEntries(Object.keys(value).sort()
+        .filter((key) => key !== "_id" && key !== "__v")
+        .map((key) => [key, canonical(value[key])]));
+    }
+    return value;
+  };
+  const unchanged = (before, after) => JSON.stringify(canonical(before)) === JSON.stringify(canonical(after));
+  const fabrics = Array.isArray(inputs.fabrics) ? inputs.fabrics : (held.fabrics || []);
+  const confirmValues = (incoming, existing, same) => incoming === true
+    ? { by: who, at }
+    : (same && existing?.at ? existing : null);
+  const closure = inputs.frontClosure !== undefined
+    ? inputs.frontClosure : (held.frontClosure || {});
+  const closureValues = (value) => ({
+    state: str(value?.state),
+    leftPlacketRef: str(value?.leftPlacketRef),
+    rightPlacketRef: str(value?.rightPlacketRef),
+    stationsFromTopMm: Array.isArray(value?.stationsFromTopMm)
+      ? value.stationsFromTopMm.map(Number) : [],
+  });
+  const confirmedClosure = {
+    ...closureValues(closure),
+    confirmed: confirmValues(inputs.frontClosure?.confirmed, held.frontClosure?.confirmed,
+      unchanged(closureValues(held.frontClosure), closureValues(closure))),
+  };
+
   row.simulationInputs = {
     template: inputs.template !== undefined ? clean(inputs.template, 40) : str(held.template),
     renderSize: inputs.renderSize !== undefined
       ? clean(inputs.renderSize, 40) : str(held.renderSize),
     avatar,
+    avatarConfirmed: confirmValues(inputs.avatarConfirmed, held.avatarConfirmed,
+      unchanged(held.avatar || {}, avatar)),
     pieces,
     seams,
-    fabrics: Array.isArray(inputs.fabrics) ? inputs.fabrics : (held.fabrics || []),
+    fabrics,
+    fabricConfirmed: confirmValues(inputs.fabricConfirmed, held.fabricConfirmed,
+      unchanged(held.fabrics || [], fabrics)),
+    frontClosure: confirmedClosure,
     seamAllowanceMm: inputs.seamAllowanceMm !== undefined
       ? (Number.isFinite(Number(inputs.seamAllowanceMm)) ? Number(inputs.seamAllowanceMm) : null)
       : (held.seamAllowanceMm ?? null),
@@ -1322,7 +1491,7 @@ async function approveRevision(ctx, { revisionId, note, expectedRevision, actor 
 }
 
 module.exports = {
-  saveEditorRevision,
+  createNativeRevision, saveEditorRevision,
   patternSetFromEditor,
   REVISION_STATE, EDIT_KIND, EDITORS,
   listRevisions, readRevision, importRevision, findImportedBySha,

@@ -36,6 +36,108 @@ const withheldFindings = (result) => result.withheld.map((w) => w.finding);
 /* ═══ THE ONE IMPLEMENTATION ══════════════════════════════════════════════ */
 
 describe("readiness is computed once and used by everything", () => {
+  test("native drafting requires an explicit avatar pose", () => {
+    const inputs = tee.simulationInputs();
+    const opts = { ...REV, nativeAuthoring: true, editorDocument: { pieces: [] } };
+    inputs.avatar.poseRef = "";
+    expect(codes(assess(tee.patternSet(), inputs, opts))).toContain("R_NATIVE_AVATAR_POSE");
+    inputs.avatar.poseRef = "a-pose";
+    expect(codes(assess(tee.patternSet(), inputs, opts))).not.toContain("R_NATIVE_AVATAR_POSE");
+    inputs.avatar.poseRef = "standing-neutral";
+    expect(codes(assess(tee.patternSet(), inputs, opts))).not.toContain("R_NATIVE_AVATAR_POSE");
+  });
+
+  test("native panel placement requires a bounded 3D transform as well as a location", () => {
+    const inputs = tee.simulationInputs();
+    const plan = inputs.pieces.find((piece) => piece.role === "body.front");
+    plan.placementSlot = "front";
+    plan.placementLayer = "base";
+    plan.placementConfirmed = tee.confirmed();
+    const opts = { ...REV, nativeAuthoring: true, editorDocument: { pieces: [] } };
+    expect(codes(assess(tee.patternSet(), inputs, opts))).toContain("R_NATIVE_PLACEMENT_TRANSFORM");
+    plan.placementOffsetMm = [0, 0, 0];
+    plan.placementYawDeg = 0;
+    expect(assess(tee.patternSet(), inputs, opts).failures.some((failure) =>
+      failure.code === "R_NATIVE_PLACEMENT_TRANSFORM"
+        && failure.pieceRef === plan.pieceRef)).toBe(false);
+    plan.placementOffsetMm = [501, 0, 0];
+    expect(codes(assess(tee.patternSet(), inputs, opts))).toContain("R_NATIVE_PLACEMENT_TRANSFORM");
+  });
+  test("native drafting refuses an unstated sewing line instead of using the cut edge", () => {
+    const pattern = tee.patternSet();
+    const inputs = tee.simulationInputs();
+    inputs.seamAllowanceMm = null;
+    for (const plan of inputs.pieces) plan.seamAllowanceMm = null;
+    const native = assess(pattern, inputs, {
+      ...REV, nativeAuthoring: true, editorDocument: { pieces: [] },
+    });
+    expect(native.ready).toBe(false);
+    expect(codes(native)).toContain("R_NATIVE_SEWING_LINE");
+    expect(native.sewingLine.source).toBe("cut-boundary");
+    const imported = assess(pattern, inputs);
+    expect(codes(imported)).not.toContain("R_NATIVE_SEWING_LINE");
+    expect(imported.warnings.map((w) => w.code)).toContain("W2");
+  });
+
+  test("native sewing-line meaning controls the geometry source and needs confirmation", () => {
+    const pattern = tee.patternSet();
+    const inputs = tee.simulationInputs();
+    const opts = { ...REV, nativeAuthoring: true, editorDocument: { pieces: [] } };
+    inputs.sewingLine = { lineMeaning: "sewing_line" };
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_SEWING_UNCONFIRMED");
+    inputs.sewingLine.confirmed = tee.confirmed();
+    expect(assess(pattern, inputs, opts).sewingLine.source).toBe("as-imported");
+    inputs.sewingLine = { lineMeaning: "cut_line", confirmed: tee.confirmed() };
+    expect(assess(pattern, inputs, opts).sewingLine.source).toBe("derived");
+    inputs.sewingLine.lineMeaning = "both";
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_SEWING_LINE");
+  });
+
+  test("two native woven-shirt fronts must occupy opposite sides of the opening", () => {
+    const pattern = tee.patternSet();
+    const inputs = tee.simulationInputs();
+    pattern.pieces.push({ ...clone(pattern.pieces[0]), pieceRef: "PC-FRONT-R", name: "Front right" });
+    const front = inputs.pieces.find((p) => p.role === "body.front");
+    inputs.pieces.push({ ...clone(front), pieceRef: "PC-FRONT-R",
+      placementSlot: "front", placementLayer: "base", placementConfirmed: tee.confirmed() });
+    front.placementSlot = "front";
+    front.placementLayer = "base";
+    front.placementConfirmed = tee.confirmed();
+    inputs.template = "woven-shirt";
+    const opts = { ...REV, nativeAuthoring: true, editorDocument: { pieces: [] } };
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_FRONT_LAYOUT");
+    front.placementSlot = "front-left";
+    inputs.pieces.at(-1).placementSlot = "front-right";
+    expect(codes(assess(pattern, inputs, opts))).not.toContain("R_NATIVE_FRONT_LAYOUT");
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_FRONT_CLOSURE");
+    inputs.frontClosure = { state: "open", confirmed: tee.confirmed() };
+    expect(codes(assess(pattern, inputs, opts))).not.toContain("R_NATIVE_FRONT_CLOSURE");
+    inputs.frontClosure = { state: "buttoned", confirmed: tee.confirmed(),
+      leftPlacketRef: "PC-PLACKET-L", rightPlacketRef: "PC-PLACKET-R",
+      stationsFromTopMm: [50, 100] };
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_BUTTON_STATIONS");
+    for (const [pieceRef, placementSlot] of [["PC-PLACKET-L", "center-front-left"],
+      ["PC-PLACKET-R", "center-front-right"]]) {
+      pattern.pieces.push({ ...clone(pattern.pieces[0]), pieceRef, name: pieceRef });
+      inputs.pieces.push({ ...clone(front), pieceRef, role: "placket.front", placementSlot });
+    }
+    expect(codes(assess(pattern, inputs, opts))).not.toContain("R_NATIVE_BUTTON_STATIONS");
+    inputs.frontClosure.stationsFromTopMm = [100, 50];
+    expect(codes(assess(pattern, inputs, opts))).toContain("R_NATIVE_BUTTON_STATIONS");
+  });
+
+  test("cut twice or cut on fold cannot pass as two meshes when only one exists", () => {
+    for (const symmetry of ["mirrored-pair", "identical-pair", "cut-on-fold"]) {
+      const inputs = tee.simulationInputs();
+      const sleeve = inputs.pieces.find((p) => p.role === "sleeve");
+      sleeve.symmetry = symmetry;
+      sleeve.cutQuantity = symmetry === "cut-on-fold" ? 1 : 2;
+      const result = assess(tee.patternSet(), inputs);
+      expect(codes(result)).toContain("R_INSTANCE_UNSUPPORTED");
+      expect(result.ready).toBe(false);
+    }
+  });
+
   test("the adapter's checkInputs IS the readiness assessment, not a second opinion", () => {
     /* The parity requirement. These two were separate once, and a reader pressing
        an enabled button and being refused learns to distrust the screen rather
@@ -54,7 +156,7 @@ describe("readiness is computed once and used by everything", () => {
   test("every step the setup flow shows is a step readiness decides", () => {
     const result = assess(tee.patternSet(), tee.simulationInputs());
     expect(result.steps.map((s) => s.key)).toEqual([
-      "template", "size", "body", "fabric", "roles", "grain", "sewingLine", "seams", "boundary",
+      "template", "size", "body", "fabric", "roles", "placement", "grain", "sewingLine", "seams", "closure", "boundary",
     ]);
     /* Each one says what it is for, in the words the screen shows. */
     for (const step of result.steps) {

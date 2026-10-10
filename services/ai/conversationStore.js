@@ -16,6 +16,8 @@
 
 const store = new Map(); // userId -> [{ role, content }]
 const MAX_TURNS = 24; // keep the last N messages (user+assistant), bounded prompt
+const { sanitizeAssistantLinks } = require("./assistantLinks");
+const { sanitizeAssistantChoices } = require("./assistantChoices");
 
 /** Return this user's conversation (a copy). */
 function getHistory(userId) {
@@ -34,6 +36,14 @@ function append(userId, turn) {
     stored.toolsUsed = turn.toolsUsed
       .filter((name) => typeof name === "string" && /^acc_[a-z_]+$/.test(name))
       .slice(0, 3);
+  }
+  if (turn.role === "assistant" && Array.isArray(turn.links)) {
+    const links = sanitizeAssistantLinks(turn.links);
+    if (links.length) stored.links = links;
+  }
+  if (turn.role === "assistant" && Array.isArray(turn.choices)) {
+    const choices = sanitizeAssistantChoices(turn.choices);
+    if (choices.length) stored.choices = choices;
   }
   if (turn.role === "assistant" && turn.contextState && typeof turn.contextState === "object") {
     const tool = turn.contextState.tool;

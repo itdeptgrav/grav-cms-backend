@@ -180,6 +180,28 @@ const piecePlanSchema = new mongoose.Schema({
   /* The other half, when left and right are drawn separately (§4.7 Form B). */
   pairedWith: { type: String, trim: true, default: "" },
   layer: { type: String, enum: [...Object.values(PIECE_LAYER), ""], default: "" },
+  /* Initial avatar arrangement is a construction decision, not a filename
+     heuristic. `placementLayer` only sets starting clearance; it does not
+     change the cut geometry or the material layer above. */
+  placementSlot: { type: String, enum: [
+    "front", "front-left", "front-right", "back", "left-arm", "right-arm", "neck",
+    "left-wrist", "right-wrist", "upper-back", "center-front",
+    "center-front-left", "center-front-right", "left-chest", "right-chest", "",
+  ], default: "" },
+  placementLayer: { type: String, enum: ["base", "outer", ""], default: "" },
+  /* A person's correction to the template's initial wrap, in avatar-space mm.
+     These move only the starting 3D mesh; the 2D cut and sewing lines remain
+     immutable. They must be inspected on the body before confirmation. */
+  placementOffsetMm: {
+    type: [Number], default: undefined,
+    validate: {
+      validator: (value) => value === undefined || (Array.isArray(value)
+        && value.length === 3 && value.every((n) => Number.isFinite(n) && Math.abs(n) <= 500)),
+      message: "Panel placement offset must contain three finite millimetre values within ±500.",
+    },
+  },
+  placementYawDeg: { type: Number, default: null, min: -180, max: 180 },
+  placementConfirmed: { type: confirmationSchema, default: null },
 
   /* ── GRAIN IS A VECTOR, NOT A LABEL ──────────────────────────────────
      In the piece's OWN local coordinates. Every piece on a marker carries a
@@ -452,9 +474,24 @@ const simulationInputsSchema = new mongoose.Schema({
   /* A graded pattern holds several sizes and a drape is of exactly one. */
   renderSize: { type: String, trim: true, default: "" },
   avatar: { type: avatarSchema, default: () => ({}) },
+  /* A person explicitly reviewed the selected body; the service clears this
+     stamp when its measurements, pose or immutable avatar reference change. */
+  avatarConfirmed: { type: confirmationSchema, default: null },
   pieces: { type: [piecePlanSchema], default: [] },
   seams: { type: [seamSchema], default: [] },
   fabrics: { type: [fabricProfileSchema], default: [] },
+  /* Likewise for the exact fabric profiles used by this drape. */
+  fabricConfirmed: { type: confirmationSchema, default: null },
+  /* A split woven front is either intentionally open or fastened at stated
+     stations. Buttons join the two plackets at points; they do not sew the
+     whole front opening shut. The confirmation is tied to these exact values. */
+  frontClosure: {
+    state: { type: String, enum: ["", "open", "buttoned"], default: "" },
+    leftPlacketRef: { type: String, trim: true, default: "" },
+    rightPlacketRef: { type: String, trim: true, default: "" },
+    stationsFromTopMm: [{ type: Number, min: 0, max: 2000 }],
+    confirmed: { type: confirmationSchema, default: null },
+  },
   /* Per garment, where it is not stated per piece or per run. Without a
      published sewing line and without this, no sewing line can be constructed
      and every dimensional finding is withheld (§4.12 step 4). */
@@ -650,6 +687,9 @@ const editorPieceSchema = new mongoose.Schema({
       lineId: { type: String, trim: true, default: "" },
       points: { type: [{ x: Number, y: Number }], default: [] },
       closed: { type: Boolean, default: false },
+      operation: { type: String, enum: ["", "dart", "pleat", "fold", "topstitch", "placket", "pocket-attachment", "decoration", "reference-only"], default: "" },
+      confirmed: { type: Boolean, default: false },
+      note: { type: String, trim: true, default: "", maxlength: 400 },
       provenance: { type: String, enum: ["imported", "authored", "derived"], default: "imported" },
     }, { _id: false })],
     default: [],
@@ -715,7 +755,8 @@ const patternRevisionSchema = new mongoose.Schema({
      approved" impossible to express — an edit of an approved revision is a
      new revision whose parent is the approved one. */
   origin: {
-    kind: { type: String, enum: ["dxf-import", "edit"], required: true },
+    kind: { type: String, enum: ["dxf-import", "native-authoring", "edit"], required: true },
+    rootKind: { type: String, enum: ["", "dxf-import", "native-authoring"], default: "" },
     parentRevisionRef: { type: String, trim: true, default: "" },
     /* ── WHERE A RECONCILED REVISION CAME FROM ─────────────────────────
        `dxf-import` is still the truth for these — the bytes are a DXF somebody
@@ -897,6 +938,10 @@ const renderJobSchema = new mongoose.Schema({
     seamClosure: { type: mongoose.Schema.Types.Mixed, default: [] },
     strain: { type: mongoose.Schema.Types.Mixed, default: null },
     fidelity: { type: mongoose.Schema.Types.Mixed, default: null },
+    /* Keep failed visual gates with the preview. A closed seam alone does not
+       prove the cloth is unfolded or the sleeve opening is usable. */
+    geometry: { type: mongoose.Schema.Types.Mixed, default: null },
+    surface: { type: mongoose.Schema.Types.Mixed, default: null },
     tightestClearanceMm: { type: Number, default: null },
     template: { type: mongoose.Schema.Types.Mixed, default: null },
     body: { type: mongoose.Schema.Types.Mixed, default: null },

@@ -1329,6 +1329,12 @@ const hrWrites = departmentWrites("hr", {
     "/backfill",
     "/day-range",
     "/notification-",
+    /* Stateless prototype inference: the HR capability contract above still
+       requires recruitment.manage, but there is no HR record mutation to put
+       through the department approval queue. Without this exemption the
+       VoiceStudio, Qwen and transcription POSTs are incorrectly rejected as
+       department writes before their router runs. */
+    "/api/hr/ai-interview-lab",
   ],
 });
 app.use("/api/hr", hrWrites);
@@ -1370,6 +1376,12 @@ app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_sect
 // service. Conversation is keyed by user, not route.
 const gravAssistantRoutes = require("./routes/ai/assistant");
 app.use("/api/ai", gravAssistantRoutes);
+
+/* The command palette's Store search. A SEPARATE door from the assistant
+   above, and deliberately so: this one cannot reach a language model, which
+   is the whole reason Cmd/Ctrl K can answer without one. */
+app.use("/api/ai", require("./routes/ai/storeCommandSearch"));
+app.use("/api/ai", require("./routes/ai/commandSearchMisses"));
 
 // PersonalCallRecorder Android app → call recording sync (metadata → Mongo, audio → Drive)
 app.use("/api/recordings", require("./routes/callRecordings"));
@@ -1716,6 +1728,10 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
+
+// GRAV Voice — calls placed from the browser over the one GRAV business line
+// (LiveKit room + SIP trunk), recorded once answered. The router owns its auth.
+app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
 
 // The sales roster — which employees are on sales duty, and the corporate
 // phone number that stands for each of them in the call log and the tracking
@@ -2599,6 +2615,9 @@ app.use("/api/hr/departments", hrDepartmentRoutes);
 const jobPostingsRouter = require("./routes/HrRoutes/JobPosting_Section");
 app.use("/api/hr/job-postings", jobPostingsRouter);
 
+const aiInterviewLabRouter = require("./routes/HrRoutes/AiInterviewLab");
+app.use("/api/hr/ai-interview-lab", aiInterviewLabRouter);
+
 const CandidatesRouter = require("./routes/HrRoutes/Candidates_section");
 app.use("/api/hr/candidates", CandidatesRouter);
 
@@ -2641,6 +2660,8 @@ app.use("/api/hr/sop", require("./routes/HrRoutes/hrSopRoutes"));
 // explicitly RELEASES a row — the employee half lives at
 // /api/employee/documents and never projects an unreleased row.
 app.use("/api/hr/documents", require("./routes/HrRoutes/EmployeeDocuments_section"));
+/* Cmd/Ctrl K for HR — behind hrContract like every /api/hr route; read-only. */
+app.use("/api/hr/command-search", require("./routes/HrRoutes/HrCommandSearch"));
 
 app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 
@@ -2966,6 +2987,8 @@ app.use(
 
 const searchRoute = require("./routes/Accountant_Routes/Acc_search");
 app.use("/api/accountant/search", searchRoute);
+// Cmd/Ctrl K for the books, on the shared palette (read-only; see the route header).
+app.use("/api/accountant/command-search", require("./routes/Accountant_Routes/Acc_commandSearch"));
 
 // ── Health probe (open in browser to verify mounting) ────────────────
 // http://localhost:5000/api/accountant/_health

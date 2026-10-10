@@ -109,6 +109,8 @@ function jobView(job, context = {}) {
         seamClosure: job.drape.seamClosure || [],
         strain: job.drape.strain || null,
         fidelity: job.drape.fidelity || null,
+        geometry: job.drape.geometry || null,
+        surface: job.drape.surface || null,
         tightestClearanceMm: job.drape.tightestClearanceMm ?? null,
         template: job.drape.template || null,
         frames: job.drape.frames ?? 0,
@@ -387,6 +389,8 @@ async function requestRender(ctx, { revisionId, actor = null } = {}) {
   const readiness = simulation.checkInputs(revision.patternSet, revision.simulationInputs, {
     revisionRef: revision.revisionRef,
     mappingConfirmedAgainstRef: revision.mappingConfirmedAgainstRef,
+    nativeAuthoring: revision.origin?.rootKind === "native-authoring" || revision.origin?.kind === "native-authoring",
+    editorDocument: revision.editorDocument,
   });
   if (!readiness.ready) {
     /* The failure's own sentence, not a list of step names. "Seam mapping is
@@ -569,16 +573,28 @@ function normaliseDrape(drape) {
       { field: "drape.geometryIdentity" });
   }
   const sewingLineSource = str(drape.sewingLineSource);
-  if (!["published", "derived", "cut-boundary"].includes(sewingLineSource)) {
+  if (!["published", "derived", "as-imported", "cut-boundary"].includes(sewingLineSource)) {
     throw fail("VALIDATION",
-      "That drape does not say whether it was sewn on a published sewing line, a derived one, or "
-      + "the cut boundary. Every dimensional finding depends on which, so it was not stored.",
+      "That drape does not say whether it was sewn on a published, derived, confirmed "
+      + "as-imported, or unconfirmed cut boundary. Every dimensional finding depends on which, "
+      + "so it was not stored.",
       { field: "drape.sewingLineSource" });
   }
   const authoritative = sewingLineSource !== "cut-boundary" && drape.authoritative !== false;
   const withheld = (Array.isArray(drape.withheld) ? drape.withheld : [])
     .filter((w) => str(w?.finding) && str(w?.why))
     .map((w) => ({ finding: str(w.finding), why: str(w.why) }));
+  const geometry = drape.geometry && typeof drape.geometry === "object"
+    ? drape.geometry : null;
+  const surface = drape.surface && typeof drape.surface === "object"
+    ? drape.surface : null;
+  if (geometry?.ok === false || surface?.ok === false) {
+    const why = "The generated cloth has a geometry or surface-quality finding. "
+      + "Treat this as a visual preview, not a dimensional fit result.";
+    for (const finding of ["chest", "waist", "hem", "bicep", "collar", "shoulder", "armhole"]) {
+      if (!withheld.some((entry) => entry.finding === finding)) withheld.push({ finding, why });
+    }
+  }
   if (!authoritative && !withheld.length) {
     throw fail("VALIDATION",
       "That drape was sewn on the cut boundary and withholds nothing. Every dimensional finding "
@@ -619,6 +635,8 @@ function normaliseDrape(drape) {
     seamClosure: Array.isArray(drape.seamClosure) ? drape.seamClosure : [],
     strain: drape.strain || null,
     fidelity: drape.fidelity || null,
+    geometry,
+    surface,
     tightestClearanceMm: Number.isFinite(drape.tightestClearanceMm) ? drape.tightestClearanceMm : null,
     template: drape.template || null,
     body: drape.body || null,
@@ -766,6 +784,9 @@ async function readDrape(ctx, { jobRef } = {}) {
     seamAllowanceMm: job.drape.seamAllowanceMm ?? null,
     authoritative: job.drape.authoritative !== false,
     withheld: job.drape.withheld || [],
+    outcome: str(job.drape.outcome) || "fitting",
+    geometry: job.drape.geometry || null,
+    surface: job.drape.surface || null,
     geometryIdentity: str(job.drape.geometryIdentity),
     /* Everything needed to rebuild the faces, from the revision the drape names.
        `inputs` is the job's frozen copy, not the revision's current settings:

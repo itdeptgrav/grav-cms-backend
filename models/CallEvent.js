@@ -1,6 +1,7 @@
 "use strict";
 const mongoose = require("mongoose");
 const { phoneKey } = require("../services/callRecordingMatch.service");
+const { CALL_STATES } = require("../services/telephony/callLifecycle");
 
 /**
  * ONE schema for every call the PersonalCallRecorder app sees — answered,
@@ -19,6 +20,18 @@ const { phoneKey } = require("../services/callRecordingMatch.service");
  */
 const callEventSchema = new mongoose.Schema(
   {
+    // Bridge calls are company-owned at creation. Historical handset-upload
+    // rows predate company scoping and remain null; only the bridge service is
+    // permitted to create provider-backed rows, and validation below refuses
+    // one without a company.
+    companyId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Acc_Company",
+      default: null,
+      immutable: true,
+      index: true,
+    },
+
     // ── Who / which call ──────────────────────────────────────────────────
     // `phoneNumber` is the OTHER party — the customer. It is NOT the phone
     // this call was made from; see `ownerPhone` below for that.
@@ -51,6 +64,7 @@ const callEventSchema = new mongoose.Schema(
     rejected: { type: Boolean, default: false },       // explicitly declined (callType === REJECTED)
     durationSec: { type: Number, default: 0 },
     startTime: { type: Number },                       // epoch millis (call-log date)
+    connectedAt: { type: Number, default: null },      // epoch millis; provider-confirmed answer time
     endTime: { type: Number, default: null },
 
     // ── Recording — only set when the call was answered AND actually
@@ -93,6 +107,78 @@ const callEventSchema = new mongoose.Schema(
     driveMimeType: { type: String, default: null },
     driveSize: { type: Number, default: 0 },
 
+    // ── GRAV Voice provider identity and lifecycle ───────────────────────
+    // These are optional for legacy PersonalCallRecorder rows. A provider ID
+    // is the stable correlation key; bridge calls never use phone+time
+    // proximity matching, which is retained only for the old device uploader.
+    provider: { type: String, enum: ["exotel", "knowlarity", "plivo", "telnyx", "fake"], default: null },
+    // One browser action, one call. The API reserves this identity before it
+    // talks to the provider, so a retry after a slow response cannot ring the
+    // employee twice.
+    providerRequestId: { type: String, default: null, trim: true },
+    providerCallId: { type: String, default: null, trim: true },
+    providerParentCallId: { type: String, default: null, trim: true },
+    providerStatus: { type: String, enum: CALL_STATES, default: null },
+    providerDirection: {
+      type: String,
+      enum: ["inbound", "outbound_bridge", "outbound_browser"],
+      default: null,
+    },
+    livekitRoomName: { type: String, default: null, trim: true },
+    livekitParticipantIdentity: { type: String, default: null, trim: true },
+    // Extra PSTN legs invited into the same LiveKit room. The first customer
+    // remains in `phoneNumber` / `livekitParticipantIdentity` for compatibility;
+    // every additional person is explicit so remote hang-up reconciliation can
+    // keep a conference alive while at least one customer is still present.
+    conferenceParticipants: [{
+      participantIdentity: { type: String, required: true, trim: true },
+      phoneNumber: { type: String, required: true, trim: true },
+      contactId: { type: mongoose.Schema.Types.ObjectId, ref: "VoiceContact", default: null },
+      contactName: { type: String, default: null, trim: true },
+      sipCallId: { type: String, default: null, trim: true },
+      status: {
+        type: String,
+        enum: ["CUSTOMER_RINGING", "IN_PROGRESS", "COMPLETED", "CUSTOMER_BUSY", "CUSTOMER_NO_ANSWER", "FAILED"],
+        default: "CUSTOMER_RINGING",
+      },
+      invitedAt: { type: Date, default: Date.now },
+      connectedAt: { type: Date, default: null },
+      endedAt: { type: Date, default: null },
+    }],
+    livekitEgressId: { type: String, default: null, trim: true },
+    recordingStorageKey: { type: String, default: null, trim: true },
+    recordingMimeType: { type: String, default: null, trim: true },
+    businessNumber: { type: String, default: null, trim: true },
+    providerRecordingUrl: { type: String, default: null, trim: true },
+    providerOccurredAt: { type: Date, default: null },
+    initiatedBy: {
+      userId: { type: String, default: null, trim: true },
+      employeeId: { type: String, default: null, trim: true },
+      email: { type: String, default: null, trim: true, lowercase: true },
+    },
+    salesPersonId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "SalesPerson",
+      default: null,
+    },
+    crmSource: {
+      kind: {
+        type: String,
+        enum: ["lead", "account", "contact", "inbound_match"],
+        default: null,
+      },
+      externalId: { type: String, default: null, trim: true },
+    },
+    recordingSync: {
+      status: {
+        type: String,
+        enum: ["pending", "available", "importing", "imported", "failed", "not_expected"],
+        default: null,
+      },
+      failureCode: { type: String, default: null, trim: true },
+      lastAttemptAt: { type: Date, default: null },
+    },
+
     source: { type: String, default: "personalcallrecorder" },
   },
   { timestamps: true, toJSON: { virtuals: true }, toObject: { virtuals: true } },
@@ -108,6 +194,13 @@ callEventSchema.pre("save", function (next) {
   next();
 });
 
+callEventSchema.pre("validate", function (next) {
+  if (this.provider && !this.companyId) {
+    this.invalidate("companyId", "Provider-backed calls require company ownership.");
+  }
+  next();
+});
+
 /** "if accept then the drive audio file" — the single field a UI needs to decide whether to show a player. */
 callEventSchema.virtual("hasRecording").get(function () {
   return Boolean(this.driveFileId);
@@ -118,5 +211,28 @@ callEventSchema.index({ startTime: -1 });
 callEventSchema.index({ callType: 1 });
 callEventSchema.index({ received: 1 });
 callEventSchema.index({ audioFileName: 1 });
+callEventSchema.index(
+  { companyId: 1, provider: 1, providerCallId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      companyId: { $type: "objectId" },
+      provider: { $type: "string" },
+      providerCallId: { $type: "string" },
+    },
+  },
+);
+callEventSchema.index({ companyId: 1, startTime: -1 });
+callEventSchema.index({ companyId: 1, "initiatedBy.employeeId": 1, startTime: -1 });
+callEventSchema.index(
+  { companyId: 1, providerRequestId: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      companyId: { $type: "objectId" },
+      providerRequestId: { $type: "string" },
+    },
+  },
+);
 
 module.exports = mongoose.model("CallEvent", callEventSchema);

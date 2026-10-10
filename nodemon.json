@@ -1,0 +1,26 @@
+{
+  "//": [
+    "Why this file exists.",
+    "",
+    "`test/accountant/reporting-mutation.test.js` proves the reporting guards by",
+    "writing mutated copies of a module next to the real one — they have to sit",
+    "there so the module's own relative requires resolve — and deleting them",
+    "again. nodemon saw those files appear and restarted the dev server mid-test,",
+    "which killed whatever request the live integration suite had in flight and",
+    "failed it with a 502. A different test failed each run, none of them the one",
+    "writing the files, so it read as live-engine flakiness for a long time.",
+    "",
+    "A test run must never restart the developer's server. Nothing here changes",
+    "what the server does; it changes what nodemon reacts to."
+  ],
+  "ignore": [
+    "**/__mutant_*.js",
+    "test/**",
+    "scratchpad/**",
+    "docs/**",
+    "coverage/**",
+    "*.log"
+  ],
+  "ext": "js,json",
+  "delay": "500"
+}

@@ -59,6 +59,11 @@ Thumbs.db
 # ===============================
 tmp/
 temp/
+.local-models/
+.local-results/
+.worktrees/
+__pycache__/
+*.pyc
 *.swp
 *.swo
 
@@ -112,3 +117,6 @@ cloudflared.tgz
 # 1 Oct 2026 (company-attach repairs, token minters, access surveys, a boot
 # profiler). They were written to answer one question each and are spent.
 scratchpad/
+
+# Generated demo sign-in passwords for the R&D 3D workspace seeder.
+.rnd-demo-credentials.local

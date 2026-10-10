@@ -1,0 +1,4 @@
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+# GPU image must additionally provide compatible CUDA PyTorch, torchaudio,
+# NVIDIA NeMo and the dependencies shipped with Indic-Transcribe Flex.
