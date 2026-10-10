@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:56.924Z",
+ "productRef": "PROD-BOT-E&MSUPTRO-999",
+ "stockItem": {
+  "_id": "6975a996cd0afcc274c2084e",
+  "reference": "PROD-BOT-E&MSUPTRO-999",
+  "name": "E&M Supervisor Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

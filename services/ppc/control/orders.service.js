@@ -117,6 +117,28 @@ function stageOf(pipeline, quantity) {
   };
 }
 
+/* ── THE DATE PPC WORKS TO (7 Oct 2026, owner) ─────────────────────────────
+   Sales assigns a deadline to each work order from the Order Book
+   (`WorkOrder.assignedDeadline`). That is PPC's target: the order must be
+   finished on or before the LATEST of those deadlines, so every target PPC
+   sets is checked against it. The customer's delivery date is used only when
+   Sales has set no work-order deadline at all — and the source is always
+   said, so a date is never mistaken for the other kind. */
+function targetDateOf(header, liveWorkOrders) {
+  const deadlines = (liveWorkOrders || []).map((w) => w.assignedDeadline).filter(Boolean).map((d) => new Date(d)).filter((d) => !Number.isNaN(d.getTime()));
+  const salesDeadline = deadlines.length ? new Date(Math.max(...deadlines.map((d) => d.getTime()))) : null;
+  const customerDeliveryDate = header.deliveryDate || null;
+  return {
+    ...header,
+    customerDeliveryDate,
+    salesDeadline,
+    woDeadlinesSet: deadlines.length,
+    woDeadlinesMissing: (liveWorkOrders || []).length - deadlines.length,
+    deliveryDate: salesDeadline || customerDeliveryDate,
+    deliveryDateSource: salesDeadline ? "sales_wo" : header.deliveryDateSource,
+  };
+}
+
 /** Delivery risk against today, and a projection from the recent pace. */
 function riskOf(header, produced, quantity, productionEvents, asOfDay = todayKey()) {
   const day = shift.istDayWindow(asOfDay);
@@ -208,10 +230,27 @@ async function snapshot(companyId, opts = {}) {
 
 async function snapshotUncached(companyId, { asOfDay = todayKey(), moIds = null, start = null, end = null } = {}) {
   const index = await ledger.woIndex(companyId, moIds ? { moIds } : {});
-  const ids = [...index.byMo.keys()];
-  const [headers, events, targets] = ids.length ? await Promise.all([
-    headersFor(ids), ledger.readEvents(index, { start, end }), PpcOrderTarget.find({ companyId, manufacturingOrderId: { $in: ids.map(oid) } }).lean(),
-  ]) : [new Map(), new Map(), []];
+  let ids = [...index.byMo.keys()];
+  let headers = ids.length ? await headersFor(ids) : new Map();
+  /* ── A SAMPLING RUN IS NOT A PPC ORDER (4 Oct 2026, owner) ─────────────
+     "This sampling order doesn't need to showcase in the PPC." A development
+     order R&D sent through IE is read on IE's own development page, so a
+     board-wide snapshot leaves it out — orders, work-order register, calendar,
+     targets, reports and overview all read this one function. A snapshot
+     asked for NAMED orders (`moIds`) keeps them, which is how IE's progress
+     read and a direct order detail still work. */
+  if (!moIds) {
+    const sampling = new Set([...headers.entries()].filter(([, h]) => h.orderOrigin === "sampling").map(([k]) => k));
+    if (sampling.size) {
+      for (const k of sampling) { headers.delete(k); index.byMo.delete(k); }
+      index.list = index.list.filter((w) => !sampling.has(w.moId));
+      for (const [k, w] of [...index.byId]) if (sampling.has(w.moId)) { index.byId.delete(k); index.byShort.delete(w.shortId); }
+      ids = [...index.byMo.keys()];
+    }
+  }
+  const [events, targets] = ids.length ? await Promise.all([
+    ledger.readEvents(index, { start, end }), PpcOrderTarget.find({ companyId, manufacturingOrderId: { $in: ids.map(oid) } }).lean(),
+  ]) : [new Map(), []];
   const eventsByMo = new Map();
   for (const [d, list] of events) for (const e of list) { const k = e.moId; if (!k) continue; if (!eventsByMo.has(k)) eventsByMo.set(k, new Map()); const m = eventsByMo.get(k); if (!m.has(d)) m.set(d, []); m.get(d).push(e); }
   return { companyId: String(companyId), asOfDay, index, headers, events, eventsByMo, targets, targetsByMo: groupBy(targets, (t) => String(t.manufacturingOrderId)) };
@@ -229,10 +268,13 @@ async function listOrders(companyId, filters = {}) {
     stages: [...new Set(rows.map((r) => r.currentStage).filter(Boolean))],
   };
   rows = applyFilters(rows, index, filters);
-  rows.sort((a, b) => {
-    const rank = { overdue: 0, at_risk: 1, due_soon: 2, on_track: 3, none: 4, closed: 5 };
-    return (rank[a.risk] - rank[b.risk]) || (new Date(b.lastActivityAt || 0) - new Date(a.lastActivityAt || 0)) || (new Date(b.orderDate) - new Date(a.orderDate));
-  });
+  /* NEWEST ORDER FIRST (7 Oct 2026, owner: "the new order need to show in
+     top … currently it's showing randomly"). It used to lead with risk, which
+     put a months-old overdue order above the one released this morning. The
+     order date decides; the risk chip and the Risk filter still carry the
+     urgency, and "Target vs Achievement" / the day board rank by it. */
+  rows.sort((a, b) => (new Date(b.orderDate || b.createdAt || 0) - new Date(a.orderDate || a.createdAt || 0))
+    || (new Date(b.lastActivityAt || 0) - new Date(a.lastActivityAt || 0)));
   const total = rows.length;
   const page = Math.max(1, Number(filters.page) || 1), limit = Math.min(500, Math.max(1, Number(filters.limit) || 50));
   return { rows: rows.slice((page - 1) * limit, page * limit), total, page, limit, asOfDay, facets };
@@ -245,9 +287,10 @@ function summariseOrders(snap) {
   const moIds = [...index.byMo.keys()];
   const rows = [];
   for (const moId of moIds) {
-    const h = headers.get(moId); if (!h) continue;
+    const h0 = headers.get(moId); if (!h0) continue;
     const wos = index.byMo.get(moId) || [];
     const live = wos.filter((w) => w.status !== "cancelled");
+    const h = targetDateOf(h0, live);
     const quantity = live.reduce((n, w) => n + w.quantity, 0) || h.itemsQuantity;
     const byDept = evByMo.get(moId) || new Map();
     const ts = byMoTargets.get(moId) || [];
@@ -308,13 +351,14 @@ function applyFilters(rows, index, f) {
 async function orderDetail(companyId, moId, asOfDay = todayKey()) {
   if (!isId(moId)) return null;
   const [headers, index] = await Promise.all([headersFor([moId]), ledger.woIndex(companyId, { moIds: [moId] })]);
-  const h = headers.get(String(moId));
-  if (!h) return null;
+  const h0 = headers.get(String(moId));
+  if (!h0) return null;
   const [events, targets, stds] = await Promise.all([
     ledger.readEvents(index), PpcOrderTarget.find({ companyId, manufacturingOrderId: oid(moId) }).sort({ assignedAt: -1 }).lean(), standards.standardsFor(companyId),
   ]);
   const wos = index.byMo.get(String(moId)) || [];
   const live = wos.filter((w) => w.status !== "cancelled");
+  const h = targetDateOf(h0, live);
   const quantity = live.reduce((n, w) => n + w.quantity, 0) || h.itemsQuantity;
   const pipeline = pipelineOf(quantity, events, targets, asOfDay);
   const stage = stageOf(pipeline, quantity);
@@ -430,7 +474,9 @@ async function listWorkOrders(companyId, filters = {}) {
     const prod = deps.find((x) => x.department === "production");
     return {
       ...w, packagingRecords: undefined, recorded: w.recorded,
-      moNumber: h.moNumber || "", poNumber: h.poNumber || "", customerName: h.customerName || w.customerName, orderType: h.orderType || "", deliveryDate: h.deliveryDate || null,
+      moNumber: h.moNumber || "", poNumber: h.poNumber || "", customerName: h.customerName || w.customerName, orderType: h.orderType || "",
+      /* this work order's own target: its Sales deadline, else the customer's date (7 Oct 2026) */
+      deliveryDate: w.assignedDeadline || h.deliveryDate || null, deliveryDateSource: w.assignedDeadline ? "sales_wo" : h.deliveryDateSource, customerDeliveryDate: h.deliveryDate || null,
       produced: prod.done, remaining: Math.max(0, w.quantity - prod.done), progressPct: prod.pct,
       currentStage: current?.department || null, currentStageLabel: current ? DEPARTMENT_META[current.department].label : "Not started",
       nextStage: next?.department || null, nextStageLabel: next ? DEPARTMENT_META[next.department].label : (w.quantity && core.every((x) => x.done >= w.quantity) ? "Complete" : "—"),

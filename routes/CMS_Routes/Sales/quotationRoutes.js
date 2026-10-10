@@ -1,5 +1,6 @@
 // routes/CMS_Routes/Sales/quotationRoutes.js
 
+const requestLineStyles = require("../../../services/sales/requestLineStyles");
 const express = require("express");
 /* No order leaves Sales without the customer's delivery deadline (26 Sep 2026). */
 const { requireDeliveryDeadline } = require("../../../services/sales/deliveryDeadlineGate");
@@ -37,6 +38,16 @@ function convertBetweenUnits(qty, fromUnit, toUnit, conversions = []) {
 const getGSTPercentage = (unitPrice) => {
   const price = parseFloat(unitPrice) || 0;
   return price < 2499 ? 5 : 18;
+};
+/* GST SET BY HAND (9 Oct 2026, owner): a line marked `gstManual` keeps the
+   rate the sales person set (0–100, "No GST" is 0); every other line takes
+   the slab for its price, as before. The mark is required — an older client
+   echoing a stale `gstPercentage` must not pin a rate across a slab change. */
+const lineGstPercentage = (item, unitPrice) => {
+  if (item && item.gstManual === true && item.gstPercentage != null && Number.isFinite(Number(item.gstPercentage))) {
+    return Math.min(100, Math.max(0, Number(item.gstPercentage)));
+  }
+  return getGSTPercentage(unitPrice);
 };
 
 // ─── QUOTATION ↔ REQUEST STATUS MACHINE ───────────────────────────────────────
@@ -1054,7 +1065,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       const submittedPrice = parseFloat(item.unitPrice) || 0;
       const basePrice = item.basePrice != null ? parseFloat(item.basePrice) || 0 : submittedPrice;
       const unitPrice = Math.max(submittedPrice, basePrice);
-      const gstPercentage = getGSTPercentage(unitPrice);
+      const gstPercentage = lineGstPercentage(item, unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
       const discountPercentage = parseFloat(item.discountPercentage) || 0;
@@ -1066,7 +1077,7 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
         /* `item` is the SERVER-RESOLVED row: the client's provenance was
            stripped and, for a sourced line, replaced from the approved
            version. */
-        ...item, unitPrice, basePrice, gstPercentage,
+        ...item, unitPrice, basePrice, gstPercentage, gstManual: item.gstManual === true,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -1130,6 +1141,10 @@ router.post("/requests/:requestId/quotation", async (req, res) => {
       shippingCharges: parseFloat(shippingCharges.toFixed(2)),
       grandTotal: parseFloat(grandTotal.toFixed(2)),
       quotationNumber, preparedBy: req.user.id,
+      /* who prepared it, in words, and when — a re-save keeps the first
+         preparer and moment (6 Oct 2026) */
+      preparedByName: existingQuotation?.preparedByName || req.user.name || req.user.email || "",
+      preparedAt: existingQuotation?.preparedAt || new Date(),
       status: resolvedStatus, updatedAt: new Date()
     };
 
@@ -1506,7 +1521,7 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
       let stockItem = null;
       if (item.stockItemId) stockItem = await StockItem.findById(item.stockItemId);
       const unitPrice = parseFloat(item.unitPrice) || 0;
-      const gstPercentage = getGSTPercentage(unitPrice);
+      const gstPercentage = lineGstPercentage(item, unitPrice);
       const quantity = parseFloat(item.quantity) || 0;
       const { priceBeforeGST, gstAmount, priceIncludingGST } = calculateItemTotals(quantity, unitPrice, gstPercentage);
       const discountPercentage = parseFloat(item.discountPercentage) || 0;
@@ -1515,7 +1530,7 @@ router.put("/requests/:requestId/quotation/:quotationId", async (req, res) => {
       const discountedGST = discountedBase * (gstPercentage / 100);
       const discountedTotal = discountedBase + discountedGST;
       return {
-        ...item, gstPercentage,
+        ...item, gstPercentage, gstManual: item.gstManual === true,
         priceBeforeGST: discountPercentage > 0 ? parseFloat(discountedBase.toFixed(2)) : priceBeforeGST,
         gstAmount: discountPercentage > 0 ? parseFloat(discountedGST.toFixed(2)) : gstAmount,
         priceIncludingGST: discountPercentage > 0 ? parseFloat(discountedTotal.toFixed(2)) : priceIncludingGST,
@@ -2065,7 +2080,7 @@ async function createWorkOrderForVariant(request, stockItem, variantData, quanti
   const workOrder = new WorkOrder({
     customerRequestId: request._id,
     salesLineLink: linkFor(line),
-    sampleStyleId,
+    ...(sampleStyleId ? { sampleStyleId } : {}),
     stockItemId: stockItem._id,
     stockItemName: stockItem.name,
     stockItemReference: stockItem.reference || "",
@@ -2912,8 +2927,24 @@ router.post("/requests/:requestId/quotation/send", async (req, res) => {
     syncRequestStatusFromQuotation(request, quotation); request.updatedAt = new Date();
     request.quotationNotifications.push({ type: 'customer_approval', message: 'Quotation sent to customer for approval', actionRequired: false, createdAt: new Date() });
     await request.save();
-    try { await CustomerEmailService.sendQuotationEmail(request, quotation, req.user); } catch (emailError) { console.error("Failed to send quotation email:", emailError); }
-    res.json({ success: true, message: "Quotation sent to customer successfully", request });
+    /* ── THE DOCUMENT RIDES ON THE MAIL (6 Oct 2026, owner) ─────────────
+       The browser builds the PDF from the figures it just saved and sends it
+       here as base64; the mail attaches it. Bounded so a bad client cannot
+       post an arbitrary blob through a mail route, and never fatal: a mail
+       that could not carry the PDF still goes, and the response says so. */
+    let attachment = null;
+    const att = req.body?.attachment;
+    if (att && typeof att.content === "string" && att.content.length > 0 && att.content.length <= 11 * 1024 * 1024) {
+      const name = String(att.name || "").replace(/[^\w.\- ]+/g, "").slice(0, 120) || `${quotation.quotationNumber || "document"}.pdf`;
+      attachment = { name: name.toLowerCase().endsWith(".pdf") ? name : `${name}.pdf`, content: att.content };
+    }
+    let mail = null;
+    try {
+      mail = await CustomerEmailService.sendQuotationEmail(request, quotation, req.user, {
+        docLabel: String(req.body?.docLabel || ""), attachment,
+      });
+    } catch (emailError) { console.error("Failed to send quotation email:", emailError); }
+    res.json({ success: true, message: "Quotation sent to customer successfully", request, mail: mail ? { sent: mail.success === true, attached: Boolean(mail.attached), messageId: mail.messageId || null, reason: mail.reason || mail.error || null } : { sent: false } });
   } catch (error) {
     console.error("Error sending quotation:", error);
     res.status(500).json({ success: false, message: "Server error while sending quotation" });
@@ -2963,6 +2994,15 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
      refused with the correction Sales must make. Nobody is moved silently and
      the commercial order is never changed here. Nothing is written when this
      throws. */
+  /* ── A LINE RAISED FROM THE PRODUCT LEARNS ITS STYLE NOW (7 Oct 2026) ──
+     Orders raised by the Sales order form before create-request filled the
+     link carry none; without this they are refused below as "names no
+     approved style". Filled from the product's settled style, never guessed
+     (services/sales/requestLineStyles.js); a line with no settled style is
+     still refused by the proof that follows. */
+  const linkedNow = await requestLineStyles.linkMissingLineStyles(request);
+  if (linkedNow.length) console.log(`[release] linked ${linkedNow.length} line(s) to their approved style on ${request.requestId}:`, linkedNow.map((l) => l.productName).join(", "));
+
   const effectiveItems = request.items;
   const lineMembers = isMeasurementOrder && measurement
     ? await salesLineLink.planMeasurementRelease(request)
@@ -3066,7 +3106,11 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
           productName: stockItem.name || item.stockItemName || "this product",
           reference: stockItem.reference || item.stockItemReference || "",
         });
-        continue;
+        /* 9 Oct 2026, owner: "don't restrict … for sent to production". The
+           work order is created with no operations unless
+           SALES_RELEASE_REQUIRE_ROUTE=1; the product is still named in the
+           answer so R&D can record its route afterwards. */
+        if (routeRequired()) continue;
       }
 
       let rawMaterials = [];
@@ -3104,7 +3148,9 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
         salesLineLink: linkFor(item),
         /* IE Chunk 1D: the exact line's style, proved in the pre-flight above
            and written as part of this order's original save. */
-        sampleStyleId: styleByProduct.get(String(item.stockItemId)),
+        /* Absent, not null, when the line proved none (9 Oct 2026): the
+           schema's rule is that an unknown style stays absent. */
+        ...(styleByProduct.get(String(item.stockItemId)) ? { sampleStyleId: styleByProduct.get(String(item.stockItemId)) } : {}),
         stockItemName: item.stockItemName, stockItemReference: item.stockItemReference,
         variantId: variantData._id.toString(), variantAttributes,
         quantity: variant.quantity, customerId: request.customerId,
@@ -3211,6 +3257,11 @@ async function createWorkOrdersAndProgress(request, userId, actingCompanyId = nu
  * R&D technical record, and a message that does not say so leaves somebody
  * clicking Approve again.
  */
+const routeRequired = () => process.env.SALES_RELEASE_REQUIRE_ROUTE === "1";
+/** The note a release carries when products went to production with no route (lenient mode). */
+const unroutedNote = (unroutedProducts) => (unroutedProducts.length
+  ? ` ${unroutedProducts.length} product${unroutedProducts.length === 1 ? " has" : "s have"} no operation route yet (${unroutedProducts.map((p) => p.productName).join(", ")}) — record the operations on the technical record in R&D so the floor can progress them.`
+  : "");
 const unroutedRefusal = (unroutedProducts) => ({
   success: false,
   code: "PRODUCTION_ROUTE_MISSING",
@@ -3321,7 +3372,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     /* ── A PRODUCT WITH NO ROUTE STOPS THE RELEASE ────────────────────
        Refused before `request.save()`, so nothing is recorded as released
        to production when part of it could not be. */
-    if (unroutedProducts.length) {
+    if (unroutedProducts.length && routeRequired()) {
       return res.status(409).json(unroutedRefusal(unroutedProducts));
     }
 
@@ -3331,6 +3382,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
       ? `Quotation approved and ${createdWorkOrders.length} work order(s) created`
       : "Quotation approved but no work orders were created";
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+    msg += unroutedNote(unroutedProducts);
 
     try {
       await CustomerEmailService.sendSalesApprovalEmail(request, quotation);
@@ -3341,6 +3393,7 @@ router.post("/requests/:requestId/quotation/sales-approve", async (req, res) => 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      unroutedProducts: unroutedProducts.length > 0 ? unroutedProducts : undefined,
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
@@ -3397,7 +3450,7 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
 
     /* Same refusal on this door: an internal order is still production, and
        a product with no route cannot be produced. Before `request.save()`. */
-    if (unroutedProducts.length) {
+    if (unroutedProducts.length && routeRequired()) {
       return res.status(409).json(unroutedRefusal(unroutedProducts));
     }
 
@@ -3413,10 +3466,12 @@ router.patch("/requests/:requestId/mark-internal-order", async (req, res) => {
 
     let msg = `Internal Order approved. ${createdWorkOrders.length} work order(s) sent to production`;
     if (createdProgressDocs.length > 0) msg += `. ${createdProgressDocs.length} employee tracking record(s) created.`;
+    msg += unroutedNote(unroutedProducts);
 
     res.json({
       success: true, message: msg, request, createdWorkOrders,
       skippedVariants: skippedVariants.length > 0 ? skippedVariants : undefined,
+      unroutedProducts: unroutedProducts.length > 0 ? unroutedProducts : undefined,
       employeeTrackingCreated: createdProgressDocs.length,
     });
   } catch (error) {
@@ -4344,7 +4399,9 @@ router.get("/requests/:requestId/po-breakdown", async (req, res) => {
   try {
     const { requestId } = req.params;
     const request = await CustomerRequest.findById(requestId)
-      .populate("items.stockItemId", "name genderCategory hsnCode reference")
+      /* + the pictures, so the quotation / PI PDF can print a thumbnail per
+         line (6 Oct 2026, owner). Additive: every field read before is kept. */
+      .populate("items.stockItemId", "name genderCategory hsnCode reference images variants._id variants.attributes variants.images variants.image")
       .lean();
     if (!request) return res.status(404).json({ success: false, message: "Request not found" });
     if (!request.quotations || request.quotations.length === 0) return res.status(400).json({ success: false, message: "No quotation found for this request" });

@@ -56,6 +56,24 @@ const Enquiry = () => model("Enquiry", "../../models/CMS_Models/Sales/Enquiry");
 /** Lane A: lifecycle does not decide ownership. Parentage does. */
 const OWNERSHIP_MODE = Object.freeze({ activeOnly: false });
 
+/* ── THE STYLE IS RECORDED WHEN KNOWN, NOT REQUIRED (9 Oct 2026, owner) ────
+   "Don't restrict this — on Proceed to Production don't check whether the
+   product is sample-approved." A line that names a style (or whose product
+   resolves to a settled one, `services/sales/requestLineStyles.js`) still
+   writes it on the work order; a line that names none, or several, no longer
+   refuses the release — its work order is created with NO style link, which
+   IE and PPC already read as "unproven" (they were written for the 95
+   historical orders that have none). The company of such a release is the
+   acting company, else the canonical one.
+
+   `SALES_RELEASE_REQUIRE_STYLE=1` restores the IE Chunk 1D refusals exactly
+   as they were; the linkage test sets it. */
+const styleRequired = () => process.env.SALES_RELEASE_REQUIRE_STYLE === "1";
+const lenient = (reason, details) => {
+  console.warn(`[workOrderStyleLink] no style link for this work order (${reason})`, details || "");
+  return null;
+};
+
 const CODES = Object.freeze({
   REQUIRED: "WORK_ORDER_STYLE_LINK_REQUIRED",
   AMBIGUOUS: "WORK_ORDER_STYLE_LINK_AMBIGUOUS",
@@ -82,6 +100,7 @@ function styleFromRequestLine(request, stockItemId, { label = "this product" } =
   const candidates = wanted ? items.filter((i) => str(i?.stockItemId) === wanted) : [];
 
   if (!candidates.length) {
+    if (!styleRequired()) return lenient("no request line for the product", { stockItemId: wanted });
     throw fail(CODES.REQUIRED,
       `This order cannot be released for production: no line on the customer request is for `
       + `${label}, so there is no approved style to make. Add the product to the order, or raise `
@@ -109,6 +128,7 @@ function styleFromRequestLine(request, stockItemId, { label = "this product" } =
     /* A line that names no style cannot be answered for by a sibling line —
        whatever it would have named is not knowable. With one silent line the
        fix is to link it; with several the order is ambiguous as well. */
+    if (!styleRequired()) return lenient("the request line names no style", { stockItemId: wanted, lines: candidates.length });
     if (candidates.length === 1) {
       throw fail(CODES.REQUIRED,
         `This order cannot be released for production: the customer-request line for ${label} `
@@ -123,6 +143,7 @@ function styleFromRequestLine(request, stockItemId, { label = "this product" } =
   }
 
   if (named.length > 1) {
+    if (!styleRequired()) return lenient("the request lines name different styles", { stockItemId: wanted, styles: named.length });
     throw fail(CODES.AMBIGUOUS,
       `This order cannot be released for production: ${label} appears on ${candidates.length} `
       + `customer-request lines naming ${named.length} different styles. Nothing stored says which `
@@ -312,7 +333,7 @@ async function styleOwnersFor(styleIds) {
   if (!wanted.length) return new Map();
   const styles = await SampleStyle()
     .find({ _id: { $in: wanted.map((id) => new mongoose.Types.ObjectId(id)) } })
-    .select("_id journeyId enquiryId isActive status").lean();
+    .select("_id companyId journeyId enquiryId isActive status").lean();
   const journeyIds = [...new Set(styles.map((x) => str(x.journeyId)).filter(isId))];
   const enquiryIds = [...new Set(styles.map((x) => str(x.enquiryId)).filter(isId))];
   const [journeys, enquiries] = await Promise.all([
@@ -382,6 +403,22 @@ function sendTypedError(res, err, fallbackMessage) {
 async function assertStylesUsable(styleIds, { expectedCompanyId = null } = {}) {
   const wanted = [...new Set((styleIds || []).map(str).filter(Boolean))];
   if (!wanted.length) {
+    if (!styleRequired()) {
+      /* No style to prove a company from: the acting company, else the
+         canonical (primary) company — the same fallback every legacy Sales
+         write uses. */
+      let companyId = str(expectedCompanyId);
+      if (!isId(companyId)) {
+        try {
+          const { getCanonicalCompany } = require("../companyContext/canonicalCompany.service");
+          const c = await getCanonicalCompany();
+          companyId = str(c?._id || c?.companyId || c);
+        } catch (err) {
+          console.warn("[workOrderStyleLink] no canonical company for a style-less release:", err?.message || err);
+        }
+      }
+      return { companyId, byStyle: new Map() };
+    }
     throw fail(CODES.REQUIRED, "No approved style could be proved for this production release.");
   }
   const malformed = wanted.filter((id) => !isId(id));
@@ -393,7 +430,7 @@ async function assertStylesUsable(styleIds, { expectedCompanyId = null } = {}) {
   }
 
   const styles = await SampleStyle().find({ _id: { $in: wanted.map((id) => new mongoose.Types.ObjectId(id)) } })
-    .select("_id journeyId enquiryId isActive status")
+    .select("_id companyId journeyId enquiryId isActive status")
     .lean();
   const byId = new Map(styles.map((s) => [str(s._id), s]));
 

@@ -36,45 +36,67 @@ function ceoAuth(req, res, next) {
 }
 
 // ── Proxy helper ──────────────────────────────────────────────────────────────
-const proxy = (targetPath) => async (req, res) => {
-  try {
+/* Forwards the CEO's read to the department route that owns the data, with the
+   CEO's own credentials. It used to forward the Cookie ONLY — and in Chrome
+   (cross-origin dev, and anywhere the cookie is refused) the Authorization
+   header is the only credential there is, so the department route saw nobody.
+   It also answered 200 whatever the department route said, so a refusal
+   rendered as an empty page. Both carried through now (6 Oct 2026).
+   `targetPath` may be a function of the request, for routes with an id. */
+const fetchInternal = (req, path) =>
+  new Promise((resolve, reject) => {
     const http = require("http");
+    const r = http.request(
+      {
+        hostname: "127.0.0.1",
+        port: process.env.PORT || 5000,
+        path,
+        method: "GET",
+        headers: {
+          Cookie: req.headers.cookie || "",
+          ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
+          "Content-Type": "application/json",
+        },
+      },
+      (response) => {
+        let b = "";
+        response.on("data", (c) => (b += c));
+        response.on("end", () => {
+          try {
+            resolve({ status: response.statusCode || 200, data: JSON.parse(b) });
+          } catch {
+            reject(new Error(`The ${path.split("?")[0]} read did not answer with JSON (HTTP ${response.statusCode}).`));
+          }
+        });
+      },
+    );
+    r.on("error", reject);
+    r.end();
+  });
+
+const proxy = (targetPath, shape) => async (req, res) => {
+  try {
     const qs = req.url.includes("?")
       ? req.url.slice(req.url.indexOf("?"))
       : `?${new URLSearchParams(req.query)}`;
-    const port = process.env.PORT || 5000;
-    const data = await new Promise((resolve, reject) => {
-      const r = http.request(
-        {
-          hostname: "127.0.0.1",
-          port,
-          path: `${targetPath}${qs}`,
-          method: "GET",
-          headers: {
-            Cookie: req.headers.cookie || "",
-            "Content-Type": "application/json",
-          },
-        },
-        (response) => {
-          let b = "";
-          response.on("data", (c) => (b += c));
-          response.on("end", () => {
-            try {
-              resolve(JSON.parse(b));
-            } catch {
-              reject(new Error("JSON"));
-            }
-          });
-        },
-      );
-      r.on("error", reject);
-      r.end();
-    });
-    res.json(data);
+    const target = typeof targetPath === "function" ? targetPath(req) : targetPath;
+    const { status, data } = await fetchInternal(req, `${target}${qs}`);
+    res.status(status).json(shape && status < 400 ? shape(data) : data);
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
 };
+
+// ── MACHINES & PURCHASE ORDERS ────────────────────────────────────────────────
+/* The CEO pages for these shipped calling routes this router never had
+   (found by scripts/pageSweep.js, 6 Oct 2026). Each is the owning
+   department's own read, so the figures cannot disagree with Store's. */
+const PO_BASE = "/api/cms/inventory/operations/purchase-orders";
+router.get("/machines", ceoAuth, proxy("/api/cms/machines"));
+router.get("/purchase-orders/stats", ceoAuth, proxy(PO_BASE, (d) => ({ success: true, stats: d.stats || null })));
+router.get("/purchase-orders/vendors", ceoAuth, proxy(`${PO_BASE}/data/vendors`));
+router.get("/purchase-orders/:id", ceoAuth, proxy((req) => `${PO_BASE}/${encodeURIComponent(req.params.id)}`));
+router.get("/purchase-orders", ceoAuth, proxy(PO_BASE));
 
 // ── RAW ITEMS ─────────────────────────────────────────────────────────────────
 router.get(
@@ -135,7 +157,7 @@ router.get("/raw-items/:id", ceoAuth, async (req, res) => {
           port,
           path: `/api/cms/raw-items/${req.params.id}`,
           method: "GET",
-          headers: { Cookie: req.headers.cookie || "" },
+          headers: { Cookie: req.headers.cookie || "", ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}), },
         },
         (response) => {
           let b = "";

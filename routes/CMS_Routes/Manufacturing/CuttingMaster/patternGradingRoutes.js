@@ -103,6 +103,45 @@ function normaliseRef(r) {
   };
 }
 
+
+/*
+ * SEAM ALLOWANCES LIVE ON THE AUTHORED MASTER, NOT ON THE SIZE BEING CUT.
+ *
+ * An allowance is drawn once, on the canonical master, in the same session as the measurement groups. Every other
+ * size row of a V3 product carries a chart and nothing else — no geometry, no groups, no seams — because its pattern
+ * is solved from the master rather than uploaded. Reading the allowances off the row for the size being cut
+ * therefore found nothing for everyone except whoever happened to be the master's own size, and the cutting screen
+ * drew the pieces with no allowance at all while the designer screen showed them correctly.
+ *
+ * So they are taken from the row that actually holds them: the master's, falling back to the size's own and then to
+ * the config, so a product that did author per-size seams keeps working.
+ */
+function resolveSeamSource(patternConfig, sizePattern) {
+  const onSize = (sizePattern?.seamEdges || []);
+  if (onSize.length) return onSize;
+  const masterName = patternConfig?.basePatternSize;
+  if (masterName) {
+    const master = (patternConfig.sizePatterns || []).find((p) => p.sizeName === masterName);
+    if ((master?.seamEdges || []).length) return master.seamEdges;
+  }
+  /* any size that has them, rather than none at all — an allowance drawn somewhere beats a piece cut without one */
+  const anywhere = (patternConfig?.sizePatterns || []).find((p) => (p.seamEdges || []).length);
+  if (anywhere) return anywhere.seamEdges;
+  return patternConfig?.seamEdges || [];
+}
+
+const mapSeamEdges = (list) => (list || [])
+  .filter((se) => se.visible !== false)
+  .map((se) => ({
+    id: se.clientId || se._id?.toString(),
+    clientId: se.clientId || se._id?.toString(),
+    name: se.name || "Seam", pathIdx: se.pathIdx,
+    fromSegIdx: se.fromSegIdx, toSegIdx: se.toSegIdx,
+    toPathIdx: se.toPathIdx != null ? se.toPathIdx : undefined,
+    fullPath: !!se.fullPath,
+    width: se.width, visible: se.visible !== false, outwardSign: se.outwardSign || 1,
+  }));
+
 function normaliseGroup(g) {
   // Accept both old-style (clientId/name) and new-style (groupId/groupName)
   const id = String(g.groupId || g.clientId || g.id || "");
@@ -1598,17 +1637,7 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
           : (selectedSizePattern.unitsPerInch || 25.4);
 
         // Seam / fold
-        resolvedSeamEdges = (selectedSizePattern.seamEdges || [])
-          .filter((se) => se.visible !== false)
-          .map((se) => ({
-            id: se.clientId || se._id?.toString(),
-            clientId: se.clientId || se._id?.toString(),
-            name: se.name || "Seam", pathIdx: se.pathIdx,
-            fromSegIdx: se.fromSegIdx, toSegIdx: se.toSegIdx,
-            toPathIdx: se.toPathIdx != null ? se.toPathIdx : undefined,
-            fullPath: !!se.fullPath,
-            width: se.width, visible: se.visible !== false, outwardSign: se.outwardSign || 1,
-          }));
+        resolvedSeamEdges = mapSeamEdges(resolveSeamSource(patternConfig, selectedSizePattern));
 
         resolvedFoldAxes = (selectedSizePattern.foldAxes || []).map((fa) => ({
           id: fa.clientId || fa._id?.toString(),
@@ -1766,17 +1795,7 @@ router.get("/pattern-grading/employee/:employeeId/cad-data", async (req, res) =>
         };
       });
 
-      resolvedSeamEdges = (patternConfig.seamEdges || [])
-        .filter((se) => se.visible !== false)
-        .map((se) => ({
-          id: se.clientId || se._id?.toString(),
-          clientId: se.clientId || se._id?.toString(),
-          name: se.name || "Seam", pathIdx: se.pathIdx,
-          fromSegIdx: se.fromSegIdx, toSegIdx: se.toSegIdx,
-          toPathIdx: se.toPathIdx != null ? se.toPathIdx : undefined,
-          fullPath: !!se.fullPath,
-          width: se.width, visible: se.visible !== false, outwardSign: se.outwardSign || 1,
-        }));
+      resolvedSeamEdges = mapSeamEdges(resolveSeamSource(patternConfig, selectedSizePattern));
 
       resolvedFoldAxes = (patternConfig.foldAxes || []).map((fa) => ({
         id: fa.clientId || fa._id?.toString(),

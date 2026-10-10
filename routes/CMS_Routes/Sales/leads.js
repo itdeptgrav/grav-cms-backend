@@ -106,6 +106,7 @@ const Account = require("../../../models/CMS_Models/Sales/Account");
 const Activity = require("../../../models/CMS_Models/Sales/Activity");
 const { nextFollowUpAt } = require("../../../services/leadNextAction");
 const SalesDepartment = require("../../../models/SalesDepartment");
+const { resolveActorNames } = require("../../../services/actorNames");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { createWithRef } = require("../../../services/leadRef");
@@ -725,8 +726,10 @@ function pickEditable(body = {}) {
 async function resolveEmployeeName(employeeId, req) {
   if (!employeeId) return undefined;
   if (String(employeeId) === String(req.user?.id || "")) return req.user?.name;
-  const employee = await SalesDepartment.findById(employeeId).select("name").lean();
-  return employee?.name;
+  /* the owner may be a dept_users, employees, department_roles or legacy
+     salesdepartments id — one resolver for all of them (3 Oct 2026) */
+  const names = await resolveActorNames([employeeId]);
+  return names.get(String(employeeId)) || undefined;
 }
 
 // Permissions correction: only a Sales manager may set assignedTo/sourcedBy
@@ -1283,6 +1286,49 @@ router.get("/", salesAuth, async (req, res) => {
 // auto-merge" policy as accounts.js's own /duplicate-check. Placed before
 // POST / on purpose (mirrors accounts.js's own route order) even though there
 // is no actual path collision (no generic POST /:id handler exists here).
+/* ── EVERY EXISTING CUSTOMER, ONTO THE PIPELINE (8 Oct 2026, owner) ─────────
+   The Sales settings page's button. One Lead per active Customer that has
+   none yet (services/sales/customerPipelineImport.js decides "has none" by
+   the import link, then e-mail, then phone). `?dryRun=1` lists without
+   writing. Managers and administrators only — it writes dozens of records. */
+router.post("/import-customers", salesAuth, async (req, res) => {
+  try {
+    if (!(await isSalesManager(req.user))) {
+      return res.status(403).json({ success: false, message: "Only a Sales manager or an administrator can place every customer on the pipeline." });
+    }
+    const { scope, ownership } = await scopeAndOwnership(req);
+    const { importCustomersIntoPipeline } = require("../../../services/sales/customerPipelineImport");
+    const dryRun = String(req.query.dryRun || req.body?.dryRun || "") === "1" || req.body?.dryRun === true;
+    const actor = { id: req.user?.id, name: req.user?.name };
+    const r = await importCustomersIntoPipeline({ scope, ownership, actor, fallbackOwner: actor, dryRun });
+    return res.json({
+      success: true,
+      message: dryRun
+        ? `${r.created.length} of ${r.customers} customers would be placed on the pipeline; ${r.alreadyThere.length} already there.`
+        : `${r.created.length} customer${r.created.length === 1 ? "" : "s"} placed on the pipeline; ${r.alreadyThere.length} already there${r.skippedTest.length ? `; ${r.skippedTest.length} internal test account${r.skippedTest.length === 1 ? "" : "s"} skipped` : ""}${r.failed.length ? `; ${r.failed.length} failed` : ""}.`,
+      ...r,
+    });
+  } catch (err) {
+    if (err?.code && err?.status) return res.status(err.status).json({ success: false, code: err.code, message: err.message });
+    console.error("[leads] import-customers:", err);
+    return res.status(500).json({ success: false, message: err.message || "The import failed." });
+  }
+});
+
+/* The Leads the FIRST version of the import made (8 Oct 2026, same day) are
+   not the pipeline; this archives them. Managers and administrators only. */
+router.post("/import-customers/retire-leads", salesAuth, async (req, res) => {
+  try {
+    if (!(await isSalesManager(req.user))) return res.status(403).json({ success: false, message: "Only a Sales manager or an administrator can do this." });
+    const { retireImportedLeads } = require("../../../services/sales/customerPipelineImport");
+    const r = await retireImportedLeads();
+    return res.json({ success: true, message: `${r.retired} lead${r.retired === 1 ? "" : "s"} made by the earlier import archived.`, ...r });
+  } catch (err) {
+    console.error("[leads] retire imported leads:", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post("/duplicate-check", salesAuth, async (req, res) => {
   try {
     const { company, email, phone, website, excludeId, contacts } = req.body || {};
@@ -1499,12 +1545,18 @@ router.post("/", salesAuth, async (req, res) => {
 router.get("/:id", salesAuth, async (req, res) => {
   try {
     const lead = await Lead.findOne(await scoped(req, { _id: req.params.id }))
-      .populate("assignedTo", "name email")
+      /* assignedTo is resolved by name below, not populated: its ref is the
+         legacy SalesDepartment, which is empty, and a populate NULLS the id */
       // Populated only here, not on the list — a Converted Lead's own page
       // needs the human Journey reference + name to link to it; the list
       // never shows this.
       .populate("conversion.journeyId", "journeyId name")
       .lean();
+    if (lead && lead.assignedTo) {
+      const n = await resolveActorNames([lead.assignedTo]);
+      const id = String(lead.assignedTo);
+      lead.assignedTo = { _id: id, name: n.get(id) || lead.assignedToName || "", email: "" };
+    }
     if (!lead)
       return res
         .status(404)
@@ -3173,7 +3225,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     if (req.user?.employeeId) {
       try {
         const { emailsForLead } = require("../../../services/gmailLeadMatch.service");
-        const out = await emailsForLead({ employeeId: req.user.employeeId, leadId: lead._id });
+        const out = await emailsForLead({ employeeId: req.user.employeeId, leadId: lead._id }, await evidenceCtx(req));
         if (out?.connected) {
           for (const m of out.messages || []) {
             if (!m.sentAt) continue;
@@ -3218,7 +3270,7 @@ router.post("/:id/activities/auto-sync", salesAuth, async (req, res) => {
     } else if (ambiguous.email) {
       try {
         const { emailsForLead } = require("../../../services/gmailLeadMatch.service");
-        const out = await emailsForLead({ employeeId: req.user?.employeeId, leadId: lead._id });
+        const out = await emailsForLead({ employeeId: req.user?.employeeId, leadId: lead._id }, await evidenceCtx(req));
         skippedCounts.emails = out?.messages?.length || 0;
       } catch { /* best-effort count only */ }
     }

@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:35.252Z",
+ "productRef": "PROD-SHI-F&BSERSHI-739",
+ "stockItem": {
+  "_id": "6974ccf828f083586d38dd49",
+  "reference": "PROD-SHI-F&BSERSHI-739",
+  "name": "F&B Service Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

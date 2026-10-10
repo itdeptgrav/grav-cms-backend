@@ -320,8 +320,10 @@ function mergeOntoApproved(approved = [], submitted = []) {
 
       /* R&D's own fields. */
       specification: str(sent.specification),
-      consumptionPerPiece: num(sent.consumptionPerPiece),
-      unit: str(sent.unit),
+      /* R&D's figure when they entered one; else the merchandiser's assumed
+         consumption from the approved selection (4 Oct 2026) */
+      consumptionPerPiece: present(sent.consumptionPerPiece) ? num(sent.consumptionPerPiece) : (a.assumedConsumption ?? null),
+      unit: str(sent.unit) || str(a.assumedUnit),
       /* Null and 0 are different claims: "not said" and "said none". */
       allowancePercent: present(sent.allowancePercent) ? num(sent.allowancePercent) : null,
       evidenceNote: str(sent.evidenceNote),

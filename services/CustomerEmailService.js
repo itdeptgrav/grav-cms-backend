@@ -119,7 +119,7 @@ const infoRow = (label, value) =>
   `<div class="info-row"><div class="info-lbl">${label}</div><div class="info-val">${value || "—"}</div></div>`;
 
 // ── Send via Brevo ────────────────────────────────────────────────────────────
-async function brevoSend(apiKey, to, toName, subject, html, text, customHeader) {
+async function brevoSend(apiKey, to, toName, subject, html, text, customHeader, attachments = []) {
   const response = await axios.post(
     `${BREVO_BASE}/smtp/email`,
     {
@@ -129,6 +129,11 @@ async function brevoSend(apiKey, to, toName, subject, html, text, customHeader) 
       htmlContent: html,
       textContent: text,
       headers: { "X-Mailin-custom": customHeader },
+      /* Brevo's shape: `[{ name, content: <base64> }]` (6 Oct 2026 — the
+         proforma invoice PDF rides on its own mail). Omitted when empty. */
+      ...(Array.isArray(attachments) && attachments.length
+        ? { attachment: attachments.map((a) => ({ name: a.name, content: a.content })) }
+        : {}),
     },
     { headers: { "api-key": apiKey, "Content-Type": "application/json", Accept: "application/json" } }
   );
@@ -235,6 +240,10 @@ class CustomerEmailService {
       let textItems = "";
 
       if (requestData.items && requestData.items.length > 0) {
+        /* `stockItemImages` is filled by nothing in this backend, so the
+           photo comes from the product's own variant images (9 Oct 2026). */
+        const orderLines = require("./mail/orderLinesMail");
+        const stockMap = await orderLines.loadStock(requestData.items.map((i) => i.stockItemId));
 
         requestData.items.forEach((item) => {
           const productName = item.stockItemName || "—";
@@ -243,7 +252,9 @@ class CustomerEmailService {
           totalItems += qty;
 
           // ── Product image ───────────────────────────────────────────────
-          const imgUrl = (item.stockItemImages || [])[0] || null;
+          const imgUrl = (item.stockItemImages || [])[0]
+            || orderLines.thumb(orderLines.photoFor(stockMap.get(String(item.stockItemId?._id || item.stockItemId || "")), item.variants?.[0]?.attributes))
+            || null;
           const imgHtml = imgUrl
             ? `<img src="${imgUrl}" width="56" height="56" ` +
             `style="width:56px;height:56px;object-fit:cover;border-radius:4px;` +
@@ -501,8 +512,21 @@ class CustomerEmailService {
   // ─────────────────────────────────────────────────────────────────────────
   // 4. QUOTATION EMAIL
   // ─────────────────────────────────────────────────────────────────────────
-  async sendQuotationEmail(requestData, quotationData, salesPerson) {
+  /**
+   * @param {object} [opts]
+   * @param {string} [opts.docLabel]   what the document calls itself on the
+   *   screen that sent it — "Quotation" or "Proforma Invoice". Used in the
+   *   subject, the title and the body, so the mail names the same document
+   *   the customer is handed.
+   * @param {{name:string, content:string}} [opts.attachment]  the document
+   *   as a PDF, base64 — built by the browser from the saved figures and
+   *   attached to the mail (6 Oct 2026, owner).
+   */
+  async sendQuotationEmail(requestData, quotationData, salesPerson, opts = {}) {
     try {
+      const docLabel = /proforma|\bpi\b/i.test(String(opts.docLabel || "")) ? "Proforma Invoice" : "Quotation";
+      const docWord = docLabel.toLowerCase();
+      const attachments = opts.attachment?.content ? [{ name: opts.attachment.name || `${docLabel.replace(/\s+/g, "-")}.pdf`, content: opts.attachment.content }] : [];
       const s = await getSettings();
       const cfg = s.emailNotifications?.quotationSent || {};
       if (cfg.enabled === false) return { success: false, reason: "disabled" };
@@ -523,13 +547,26 @@ class CustomerEmailService {
       const salesRepName = salesPerson?.name || salesPerson?.email || s.repName || "Sales Team";
       const vars = this._vars(s, { name: customerName, requestId, quotationNumber });
 
-      const title = interpolate(cfg.title || "Your Quotation is Ready", vars);
-      const subtitle = interpolate(cfg.subtitle || "Please review and approve at the earliest.", vars);
+      /* The saved template (Sales → Settings) is written for a quotation.
+         When the document is a proforma invoice, the word is swapped in the
+         saved text too — a customer handed a PI must not read "quotation". */
+      const named = (text) => docLabel === "Quotation" ? text : String(text || "")
+        .replace(/\bQuotations\b/g, "Proforma Invoices").replace(/\bquotations\b/g, "proforma invoices")
+        .replace(/\bQuotation\b/g, "Proforma Invoice").replace(/\bquotation\b/g, "proforma invoice")
+        .replace(/\bQUOTATION\b/g, "PROFORMA INVOICE");
+      const title = named(interpolate(cfg.title || `Your ${docLabel} is Ready`, vars));
+      const subtitle = named(interpolate(cfg.subtitle || "Please review and approve at the earliest.", vars));
       const greeting = interpolate(cfg.greeting || "Dear {name},", vars);
-      const body = interpolate(cfg.bodyText || "We are pleased to present you with a quotation for your custom clothing request.", vars);
-      const btnText = interpolate(cfg.buttonText || "Review & Approve Quotation", vars);
-      const ftNote = interpolate(cfg.footerNote || "", vars);
-      const subject = interpolate(cfg.subject || `Grav Clothing – Quotation ${quotationNumber} for Request ${requestId}`, vars);
+      const body = named(interpolate(cfg.bodyText || `Please find below our ${docWord} for your order.`, vars))
+        + (attachments.length ? ` The complete ${docWord} is attached to this e-mail as a PDF for your records.` : "");
+      const btnText = named(interpolate(cfg.buttonText || `Review & Approve ${docLabel}`, vars));
+      const ftNote = named(interpolate(cfg.footerNote || "", vars));
+      const subject = named(interpolate(cfg.subject || `Grav Clothing – ${docLabel} ${quotationNumber} for Request ${requestId}`, vars));
+      const longDate = (d) => (d ? new Date(d).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" }) : "—");
+      const deliveryBy = requestData.customerInfo?.deliveryDeadline
+        ? new Date(requestData.customerInfo.deliveryDeadline).toLocaleDateString("en-IN", { day: "numeric", month: "long", year: "numeric" })
+        : "";
+      const totalPieces = (quotationData.items || []).reduce((n, i) => n + (Number(i.quantity) || 0), 0);
 
       // Build items rows — with product images, variant column, conditional discount
       let itemRows = "";
@@ -678,7 +715,7 @@ class CustomerEmailService {
       let textPay = "";
       if (quotationData.paymentSchedule && quotationData.paymentSchedule.length > 0) {
         quotationData.paymentSchedule.forEach((p) => {
-          const dueDate = p.dueDate ? new Date(p.dueDate).toLocaleDateString("en-IN") : "—";
+          const dueDate = longDate(p.dueDate);
           payRows += `<div class="payment-row"><div class="payment-cell" style="font-weight:600;">Step ${p.stepNumber}: ${p.name || "Payment"}</div><div class="payment-cell" style="text-align:center;color:#64748b;">${p.percentage}%</div><div class="payment-cell" style="text-align:right;font-weight:600;">₹${p.amount?.toFixed(2) || "0.00"}</div><div class="payment-cell" style="text-align:right;color:#64748b;">Due: ${dueDate}</div></div>`;
           textPay += `\n  Step ${p.stepNumber}: ₹${p.amount?.toFixed(2) || "0.00"} (${p.percentage}%) — Due: ${dueDate}`;
         });
@@ -693,9 +730,12 @@ class CustomerEmailService {
         <p style="color:#374151;">${body}</p>
         <div class="info-box">
           ${infoRow("Request ID", requestId)}
-          ${infoRow("Quotation Number", quotationNumber)}
+          ${infoRow(`${docLabel} Number`, quotationNumber)}
           ${infoRow("Prepared By", salesRepName)}
           ${infoRow("Valid Until", validUntil)}
+          ${deliveryBy ? infoRow("Requested Delivery", deliveryBy) : ""}
+          ${totalPieces ? infoRow("Total Quantity", `${totalPieces} pcs across ${(quotationData.items || []).length} line${(quotationData.items || []).length === 1 ? "" : "s"}`) : ""}
+          ${attachments.length ? infoRow("Attached", `${attachments[0].name} (PDF)`) : ""}
         </div>
         ${itemRows ? `
         <div class="section-box">
@@ -741,21 +781,21 @@ class CustomerEmailService {
         <div class="section-box">
           <h4>Next Steps</h4>
           <ol class="step-list">
-            <li>Review the quotation details carefully</li>
-            <li>Approve the quotation online if everything looks correct</li>
-            <li>Contact our sales team for any questions or modifications</li>
-            <li>Once approved, our team will proceed with production</li>
+            <li>Review the ${docWord}${attachments.length ? " — the attached PDF is the complete document" : ""}</li>
+            <li>Approve it online if everything is in order, and share your purchase order</li>
+            <li>For any change in quantity, price or delivery, reply to this e-mail or call your sales representative</li>
+            <li>Once approved${payRows ? " and the advance is received" : ""}, production is scheduled against your delivery date</li>
           </ol>
         </div>
         ${ftNote ? `<div class="box-blue">${ftNote}</div>` : ""}
         <p style="font-size:13px;margin-top:20px;">Best regards,<br><strong>${salesRepName}</strong><br>${s.companyName || "Grav Clothing"} — Sales Department</p>
       `, s);
 
-      const text = `${title}\n\n${greeting}\n\n${body}\n\nRequest ID: ${requestId}\nQuotation: ${quotationNumber}\nPrepared By: ${salesRepName}\nValid Until: ${validUntil}\n\nItems:${textItems}\n\nCharges:\n${textCharges}\n  Grand Total: ₹${grandTotal}${textPay ? `\n\nPayment Schedule:${textPay}` : ""}\n\nApprove here: ${quotationUrl}\n\n${ftNote}\n\nBest regards, ${salesRepName}`;
+      const text = `${title}\n\n${greeting}\n\n${body}\n\nRequest ID: ${requestId}\n${docLabel}: ${quotationNumber}\nPrepared By: ${salesRepName}\nValid Until: ${validUntil}${deliveryBy ? `\nRequested Delivery: ${deliveryBy}` : ""}${attachments.length ? `\nAttached: ${attachments[0].name} (PDF)` : ""}\n\nItems:${textItems}\n\nCharges:\n${textCharges}\n  Grand Total: ₹${grandTotal}${textPay ? `\n\nPayment Schedule:${textPay}` : ""}\n\nApprove here: ${quotationUrl}\n\n${ftNote}\n\nBest regards, ${salesRepName}`;
 
-      const res = await brevoSend(apiKey, customerEmail, customerName, subject, html, text, "quotation_email");
-      console.log(`[CustomerEmailService] quotation sent for ${quotationNumber}:`, res.messageId);
-      return { success: true, messageId: res.messageId };
+      const res = await brevoSend(apiKey, customerEmail, customerName, subject, html, text, "quotation_email", attachments);
+      console.log(`[CustomerEmailService] ${docWord} sent for ${quotationNumber} to ${customerEmail}${attachments.length ? " with PDF" : ""}:`, res.messageId);
+      return { success: true, messageId: res.messageId, attached: attachments.length > 0 };
     } catch (err) {
       console.error("[CustomerEmailService] sendQuotationEmail:", err.response?.data || err.message);
       return { success: false, error: err.response?.data?.message || err.message };
@@ -985,15 +1025,23 @@ class CustomerEmailService {
         })
         : null;
 
-      // ── Items summary (brief — name + variant + qty) ──────────────────────
+      // ── Items summary (photo + name + variant + qty) ─────────────────────
+      /* The photo beside each line (9 Oct 2026, owner): from the product's
+         variant images, matched by the line's attributes. */
+      const orderLines = require("./mail/orderLinesMail");
+      const stockMap = await orderLines.loadStock((quotation?.items || []).map((i) => i.stockItemId));
       const itemsSummaryRows = (quotation?.items || [])
         .map((item) => {
           const variantStr = (item.attributes || [])
             .map(a => `${a.name}: ${a.value}`)
             .join(" · ");
+          const photo = orderLines.thumb(orderLines.photoFor(stockMap.get(String(item.stockItemId?._id || item.stockItemId || "")), item.attributes), 96);
+          const photoHtml = photo
+            ? `<img src="${photo}" width="40" height="40" alt="" style="display:inline-block;width:40px;height:40px;object-fit:cover;border-radius:4px;border:1px solid #e2e8f0;vertical-align:middle;margin-right:8px;" />`
+            : "";
           return (
             `<tr>` +
-            `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600;">${item.itemName || "—"}</td>` +
+            `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600;">${photoHtml}${item.itemName || "—"}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#64748b;">${variantStr || "—"}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:center;font-size:13px;font-weight:700;color:#0f172a;">${item.quantity}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:13px;font-weight:600;color:#0f172a;">₹${(item.priceIncludingGST || 0).toFixed(2)}</td>` +

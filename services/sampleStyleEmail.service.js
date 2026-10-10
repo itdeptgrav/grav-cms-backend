@@ -151,6 +151,14 @@ async function styleEmailContext(style, ctx) {
     : null;
   const bom = stockItemBom(stockItem);
   const variantTotal = (stockItem?.variants || []).length;
+  /* No reference photo on the brief or its enquiry? Then the linked
+     product's own photos (9 Oct 2026, owner: "the product photo is not
+     coming") — every product photo in this database sits on a VARIANT, so
+     the variants are walked, then the root. */
+  const gallery = images.length
+    ? images
+    : [...new Set([...(stockItem?.variants || []).flatMap((v) => v?.images || []), ...(stockItem?.images || [])].filter(Boolean))]
+      .slice(0, 6).map((url) => ({ url }));
 
   let customerName = account?.displayName || account?.companyName;
   if (!customerName) {
@@ -205,7 +213,7 @@ async function styleEmailContext(style, ctx) {
   return {
     customerName,
     account,
-    images,
+    images: gallery,
     stockItemId,
     stockItem,
     bom,
@@ -291,4 +299,77 @@ function bomTableHtml(bom, variantTotal = 0) {
 </table>`;
 }
 
-module.exports = { styleImages, linkedStockItemId, stockItemBom, styleEmailContext, imageGalleryHtml, bomTableHtml };
+/* ── THE MERCHANDISER'S SELECTION, AS A TABLE (4 Oct 2026, owner) ─────────
+   Every row of a development BOM revision (or of `style.materials.rawItems`,
+   which carries the same facts once Sales has approved): kind, material and
+   code, variant, colour / finish, placement / applies to, the ASSUMED
+   consumption per piece and the merchandiser's reason. "Keep the record on
+   that mail." */
+function devBomTableHtml(rows, { heading = "BILL OF MATERIALS (Merchandising's selection)" } = {}) {
+  const list = Array.isArray(rows) ? rows : [];
+  if (!list.length) {
+    return `<p style="margin:16px 0 4px;font-size:12px;color:#64748b;font-weight:600">${escapeHtml(heading)}</p>
+<p style="margin:0;font-size:13.5px;color:#64748b">No materials recorded yet.</p>`;
+  }
+  const td = "padding:6px 10px 6px 0;border-bottom:1px solid #eef1f5;vertical-align:top";
+  const body = list.map((r) => {
+    const kind = r.category ? String(r.category).charAt(0) + String(r.category).slice(1).toLowerCase().replace("_", " ") : "";
+    const variant = (r.variantCombination || []).filter(Boolean).join(" · ");
+    const cons = r.consumptionPerPiece != null && r.consumptionPerPiece !== ""
+      ? `${r.consumptionPerPiece} ${r.consumptionUnit || ""}`.trim()
+      : r.quantity != null && r.quantity !== "" ? `${r.quantity} ${r.unit || ""}`.trim() : "—";
+    return `<tr>
+  <td style="${td};color:#64748b;white-space:nowrap">${escapeHtml(kind || "—")}</td>
+  <td style="${td}"><strong>${escapeHtml(r.rawItemName || "—")}</strong>${r.rawItemSku ? `<br/><span style="color:#94a3b8;font-size:12px">${escapeHtml(r.rawItemSku)}</span>` : ""}</td>
+  <td style="${td};color:#475569">${escapeHtml(variant || "—")}</td>
+  <td style="${td};color:#475569">${escapeHtml([r.colourOrShade, r.finish].filter(Boolean).join(" · ") || "—")}</td>
+  <td style="${td};color:#475569">${escapeHtml([r.placement, r.appliesTo].filter(Boolean).join(" · ") || "—")}</td>
+  <td style="${td};text-align:right;white-space:nowrap">${escapeHtml(cons)}</td>
+  <td style="${td};color:#64748b;font-style:italic">${escapeHtml(r.selectionNote || "")}</td>
+</tr>`;
+  }).join("");
+  const th = "padding:0 10px 6px 0;font-weight:600";
+  return `<p style="margin:16px 0 6px;font-size:12px;color:#64748b;font-weight:600">${escapeHtml(heading)}</p>
+<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+  <thead><tr style="text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#94a3b8">
+    <th style="${th}">Kind</th><th style="${th}">Material</th><th style="${th}">Variant</th>
+    <th style="${th}">Colour / finish</th><th style="${th}">Placement / applies to</th>
+    <th style="${th};text-align:right">Consumption / pc</th><th style="${th}">Why this one</th>
+  </tr></thead>
+  <tbody>${body}</tbody>
+</table>`;
+}
+
+/* ── R&D'S TECHNICAL RECORD, AS TABLES (4 Oct 2026, owner) ─────────────────
+   The materials with specification, consumption, unit and allowance; the
+   operations with their times; the packaging / service / development
+   requirements. Whatever is filled is on the mail; an empty section says so. */
+function technicalTableHtml(technical = {}) {
+  const td = "padding:6px 10px 6px 0;border-bottom:1px solid #eef1f5;vertical-align:top";
+  const th = "padding:0 10px 6px 0;font-weight:600";
+  const head = (t) => `<p style="margin:16px 0 6px;font-size:12px;color:#64748b;font-weight:600">${escapeHtml(t)}</p>`;
+  const table = (cols, rows) => `<table cellpadding="0" cellspacing="0" style="border-collapse:collapse;width:100%;font-size:13px">
+  <thead><tr style="text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.03em;color:#94a3b8">${cols.map((c) => `<th style="${th}">${escapeHtml(c)}</th>`).join("")}</tr></thead>
+  <tbody>${rows.map((r) => `<tr>${r.map((v) => `<td style="${td}">${escapeHtml(v == null || v === "" ? "—" : String(v))}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+  const mats = Array.isArray(technical.materials) ? technical.materials : [];
+  const ops = Array.isArray(technical.operations) ? technical.operations : [];
+  const reqs = Array.isArray(technical.requirements) ? technical.requirements : [];
+  let out = head("TECHNICAL RECORD — MATERIALS");
+  out += mats.length
+    ? table(["Material", "Variant", "Specification", "Consumption / pc", "Allowance %", "Evidence"],
+      mats.map((m) => [`${m.rawItemName || "—"}${m.rawItemSku ? ` (${m.rawItemSku})` : ""}`, (m.variantCombination || []).join(" · "),
+        m.specification, m.consumptionPerPiece != null && m.consumptionPerPiece !== "" ? `${m.consumptionPerPiece} ${m.unit || ""}`.trim() : "", m.allowancePercent, m.evidenceNote]))
+    : `<p style="margin:0;font-size:13px;color:#64748b">No material facts recorded.</p>`;
+  out += head("OPERATIONS");
+  out += ops.length
+    ? table(["Operation", "Code", "SAM (min)", "Machine / note"], ops.map((o) => [o.operationName || o.name, o.operationCode || o.code, o.sam ?? o.samMinutes, o.machine || o.note]))
+    : `<p style="margin:0;font-size:13px;color:#64748b">No operations recorded (the Production Manager records the route).</p>`;
+  if (reqs.length) {
+    out += head("PACKAGING, OUTSIDE SERVICES AND DEVELOPMENT");
+    out += table(["Family", "Requirement", "Note"], reqs.map((r) => [r.family, r.name || r.description, r.note]));
+  }
+  return out;
+}
+
+module.exports = {
+  devBomTableHtml, technicalTableHtml, styleImages, linkedStockItemId, stockItemBom, styleEmailContext, imageGalleryHtml, bomTableHtml };

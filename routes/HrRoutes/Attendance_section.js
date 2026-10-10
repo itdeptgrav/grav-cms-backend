@@ -1905,42 +1905,12 @@ async function syncLeaveForOverride({
   } else if (!oldIsLeave && newIsLeave) await createAutoLeave(newStatus);
 }
 
-function buildLeaveDateMap(leaveApp, holidaySetOrNull) {
-  const totalDays = leaveApp.totalDays || 0;
-  const paidDays = leaveApp.paidDays != null ? leaveApp.paidDays : totalDays;
-  const leaveCode = LEAVE_TYPE_TO_STATUS[leaveApp.leaveType] || "LWP";
-  const isFullLOP = leaveApp.leaveType === "LOP" || paidDays === 0;
-
-  const map = new Map(); // dateStr → statusCode
-  let paidUsed = 0;
-
-  const start = new Date(leaveApp.fromDate + "T00:00:00");
-  const end = new Date(leaveApp.toDate + "T00:00:00");
-
-  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-    const ds = dateStrOf(new Date(d));
-    const dow = new Date(ds + "T00:00:00").getDay();
-    const isSunday = dow === 0;
-    const isHoliday = holidaySetOrNull ? holidaySetOrNull.has(ds) : false;
-
-    if (isSunday || isHoliday) {
-      // Rest day — don't consume a paid slot, skip from map
-      continue;
-    }
-
-    let code;
-    if (isFullLOP) {
-      code = "LWP";
-    } else if (paidUsed < paidDays) {
-      code = leaveCode;
-      paidUsed++;
-    } else {
-      code = "LWP";
-    }
-    map.set(ds, code);
-  }
-  return map;
-}
+/* The per-day status map for an approved leave. Moved to
+   services/leaveDateMap.js (5 Oct 2026), which also stopped it turning every
+   half-day leave into a whole day — it never read `isHalfDay`, so an
+   approved half-day SL was written into attendance as L-SL instead of P/SL.
+   See that file. All four callers below use it unchanged. */
+const { buildLeaveDateMap } = require("../../services/leaveDateMap");
 
 async function applyLeaveToAttendance(leaveApp) {
   if (!leaveApp || leaveApp.status !== "hr_approved")
@@ -2328,7 +2298,12 @@ async function applyRegularizationToAttendance(r, actor = {}) {
     emp.netWorkMins = netWorkMins;
     emp.lateMins = lateMins;
     emp.lateDisplay = fmtLateMins(lateMins);
+    /* A correction that takes the late away still leaves it in the late
+       streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+       and services/lateStreak.js. Read before this line overwrites it. */
+    const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
     emp.isLate = lateMins > 0;
+    if (_wasLate && !emp.isLate) emp.lateRegularized = true;
     emp.earlyDepartureMins = earlyDepartureMins;
     emp.isEarlyDeparture = earlyDepartureMins > 0;
     emp.otMins = otMins;
@@ -2452,67 +2427,9 @@ async function applyApprovedLeavesForDate(dateStr) {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// COUNT-BASED LATE/EARLY PROMOTION HELPER (per HR policy doc)
-//   1st, 2nd late → P* (no deduction)
-//   Nth late (lateHDOnCount=3)       → HD, counter resets
-//   Nth late (lateFullDayOnCount=5)  → AB, counter resets
-//   Same rule for early-out (P~) with earlyOut* settings
-//   HR overrides and today are never promoted.
-//
-// state = { lateCount, earlyCount }  — mutated in-place
-// Returns { promotedStatus: "HD"|"AB"|null, promoted: bool }
-// ─────────────────────────────────────────────────────────────────────────────
-function applyLateCountPromotion(entry, state, policy, dateStr, todayStr) {
-  const none = { promotedStatus: null, promoted: false };
-  if (!policy?.enabled) return none;
-  const lateHDOn = policy.lateHDOnCount ?? 3;
-  const lateFullDayOn = policy.lateFullDayOnCount ?? 5;
-  const earlyHDOn = policy.earlyOutHDOnCount ?? 3;
-  const earlyFullDayOn = policy.earlyOutFullDayOnCount ?? 5;
-
-  /* WHAT COUNTS IS THE RAW LATENESS, NOT WHAT HR DECIDED ABOUT THE DAY.
-     This used to return before incrementing whenever HR had overridden the
-     day. So when HR pardoned somebody's 3rd late by marking it Present, that
-     day vanished from the streak and the NEXT late inherited its position —
-     the 4th late became "the 3rd" and was docked a half day. The pardon
-     moved the penalty instead of removing it.
-
-     A pardon forgives the deduction on that day. It does not un-late the day.
-     So the count always advances on a raw late; only the PROMOTION is
-     withheld when HR has already ruled on the day, or the day is still today
-     and not yet over. */
-  const rawLate =
-    !!entry.isLate && ["P*", "LHD", "LAB"].includes(entry.systemPrediction);
-  const rawEarly =
-    !rawLate &&
-    !!entry.isEarlyDeparture &&
-    ["P~", "EAB"].includes(entry.systemPrediction);
-  const mayPromote = !entry.hrFinalStatus && dateStr !== todayStr;
-
-  if (rawLate) {
-    state.lateCount++;
-    if (state.lateCount >= lateFullDayOn) {
-      state.lateCount = 0;
-      return mayPromote ? { promotedStatus: "LAB", promoted: true } : none;
-    }
-    if (state.lateCount === lateHDOn) {
-      return mayPromote ? { promotedStatus: "LHD", promoted: true } : none;
-    }
-    return none; // 4th (and any other in-between) late: counted, not docked
-  }
-  if (rawEarly) {
-    state.earlyCount++;
-    if (state.earlyCount >= earlyFullDayOn) {
-      state.earlyCount = 0;
-      return mayPromote ? { promotedStatus: "EAB", promoted: true } : none;
-    }
-    if (state.earlyCount === earlyHDOn) {
-      return mayPromote ? { promotedStatus: "HD", promoted: true } : none;
-    }
-  }
-  return none;
-}
+/* The late / early-out streak rule. Moved to services/lateStreak.js (5 Oct
+   2026) — see there for why a pardoned or leave-covered late still counts. */
+const { applyLateCountPromotion } = require("../../services/lateStreak");
 
 async function applyMonthlyLatePromotion(dayDoc, settings) {
   const policy = settings.lateHalfDayPolicy;
@@ -2533,7 +2450,7 @@ async function applyMonthlyLatePromotion(dayDoc, settings) {
     dateStr: { $lte: dayDoc.dateStr },
   })
     .select(
-      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus",
+      "dateStr employees.employeeDbId employees.biometricId employees.isLate employees.isEarlyDeparture employees.systemPrediction employees.hrFinalStatus employees.inTime employees.lateRegularized",
     )
     .sort({ dateStr: 1 })
     .lean();
@@ -4250,10 +4167,21 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
     emp.hrReviewedBy = req.user?.name || req.user?.email || "HR";
 
     const punchFields = { inTime, finalOut, lunchOut, lunchIn, teaOut, teaIn };
+    /* ── A STATUS WITH NO TIMES DOES NOT ERASE THE DAY'S PUNCHES (5 Oct 2026) ──
+       Both HR dialogs send inTime/finalOut as null when the chosen status has
+       no times (leave, LWP, Absent, a holiday, comp off). Applied, that wiped
+       what the device recorded and recomputed the day as not late — so a
+       late day turned into PL fell out of the late streak and the NEXT late
+       was docked a half day in its place. Changing what a day COUNTS AS is not
+       a punch edit; removing a punch is punch-correction's job. So for these
+       statuses the time fields are ignored, whoever sent them. */
+    const NO_TIME_STATUSES = new Set(["AB", "WO", "PH", "FH", "NH", "OH", "RH", "L-CL", "L-SL", "L-EL", "LWP", "CO"]);
+    const keepPunches = hrFinalStatus !== undefined && NO_TIME_STATUSES.has(hrFinalStatus);
     const punchChanges = [];
     let anyTimeUpdated = false;
     for (const [field, value] of Object.entries(punchFields)) {
       if (value === undefined) continue;
+      if (keepPunches) continue;
       anyTimeUpdated = true;
       const oldVal = emp[field] ? fmtTimeIST12(emp[field]) : "—";
       const newDate = value ? parseTimeOnDateIST(value, dateStr) : null;
@@ -4299,7 +4227,12 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
           )
         : 0;
       emp.lateMins = Math.max(0, lateMins);
+      /* A correction that takes the late away still leaves it in the late
+         streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+         and services/lateStreak.js. Read before this line overwrites it. */
+      const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
       emp.isLate = emp.lateMins > 0;
+      if (_wasLate && !emp.isLate) emp.lateRegularized = true;
       const earlyDepartureMins = emp.finalOut
         ? Math.max(
             0,
@@ -4675,7 +4608,12 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
         )
       : 0;
     emp.lateMins = Math.max(0, lateMins);
+    /* A correction that takes the late away still leaves it in the late
+       streak — see `lateRegularized` in models/HR_Models/Dailyattendance.js
+       and services/lateStreak.js. Read before this line overwrites it. */
+    const _wasLate = !!emp.isLate && ["P*", "LHD", "LAB"].includes(emp.systemPrediction);
     emp.isLate = emp.lateMins > 0;
+    if (_wasLate && !emp.isLate) emp.lateRegularized = true;
 
     const earlyDepartureMins = emp.finalOut
       ? Math.max(
@@ -5079,10 +5017,12 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
        function. This screen is the sheet on screen; if the two disagreed
        about who was there, one of them would be lying. */
     const _musterSeen = new Set();
+    const _musterPunched = new Set(); // inactive people only stay if they punched
     for (const d of dayDocs)
       for (const e of d.employees || []) {
         const b = String(e.biometricId || "").toUpperCase();
         if (b) _musterSeen.add(b);
+        if (b && (Number(e.punchCount) > 0 || (e.rawPunches || []).length > 0 || !!e.inTime)) _musterPunched.add(b);
       }
     let _musterLeave = new Set();
     let _musterLeaveUnknown = false;
@@ -5102,6 +5042,7 @@ router.get("/muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       dojByBid,
       onLeaveInRange: _musterLeave,
       leaveUnknown: _musterLeaveUnknown,
+      punchedInRange: _musterPunched,
     });
     const filteredActive = _deptFiltered.filter((e) =>
       _musterOnRoll(extractBiometricId(e), onStaff(e)),
@@ -6525,12 +6466,14 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
        each appears on. Together they answer both questions the sheet needs:
        was this person on the roll at all, and from which day were they not. */
     const seenInRange = new Set();
+    const punchedInRange = new Set(); // inactive people only stay if they punched
     const lastSeenInRange = new Map();
     for (const doc of dayDocs) {
       for (const e of doc.employees || []) {
         const b = String(e.biometricId || "").toUpperCase();
         if (!b) continue;
         seenInRange.add(b);
+        if ((Number(e.punchCount) > 0 || (e.rawPunches || []).length > 0 || !!e.inTime)) punchedInRange.add(b);
         lastSeenInRange.set(b, doc.dateStr); // dayDocs are sorted ascending
       }
     }
@@ -6587,6 +6530,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
       dojByBid,
       onLeaveInRange,
       leaveUnknown,
+      punchedInRange,
     });
     const onRollThisPeriod = (emp) =>
       onRoll(extractBiometricId(emp), onStaff(emp));
@@ -6892,10 +6836,22 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         ),
       );
     }
+    /* The catch-all below is for device ids with NO employee record — a
+       badge nobody registered still worked those days. It used to take
+       everybody not yet processed, which re-added exactly the people the roll
+       decision above had just left off: an inactive employee with only blank
+       device rows was excluded by onRollThisPeriod and then put straight back
+       here from those rows. Anyone with a record has already been judged. */
+    const hasEmployeeRecord = new Set(
+      rosterCandidates
+        .map((e) => String(extractBiometricId(e) || "").toUpperCase())
+        .filter(Boolean),
+    );
     for (const dayDoc of dayDocs) {
       for (const entry of dayDoc.employees || []) {
         const key = String(entry.biometricId || "").toUpperCase();
         if (!key || processedBids.has(key)) continue;
+        if (hasEmployeeRecord.has(key)) continue;
         if (
           department &&
           department !== "all" &&

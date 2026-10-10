@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:30:04.457Z",
+ "productRef": "PROD-BOT-GARTRO-497",
+ "stockItem": {
+  "_id": "69725478c156e7d5ce9781a1",
+  "reference": "PROD-BOT-GARTRO-497",
+  "name": "Gardener Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

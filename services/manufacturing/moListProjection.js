@@ -314,7 +314,9 @@ function searchMatch(search) {
  * `pagination.total` a count of the FILTERED set rather than of everything.
  */
 function buildListPipeline(q) {
-  const baseMatch = { status: MO_BASE_STATUS };
+  /* a sampling run (R&D's development order, handled by IE) is not a
+     planning-register order (4 Oct 2026, owner) */
+  const baseMatch = { status: MO_BASE_STATUS, orderOrigin: { $ne: "sampling" } };
 
   const search = searchMatch(q.search);
   if (search) Object.assign(baseMatch, search);

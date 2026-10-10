@@ -227,6 +227,94 @@ function summaryFrom(rows, action) {
   return `${verb} ${shown}${rest > 0 ? ` and ${rest} more` : ""}.`;
 }
 
+/* ── ATTENDANCE CORRECTIONS SPEAK FOR THEMSELVES (5 Oct 2026) ──────────────
+   The generic path diffs the body against a record it loads from the URL.
+   An attendance correction names its record in the BODY (biometricId +
+   dateStr), so there was nothing to load and the card read "Changing
+   Biometric id, Date str, Hr final status and 1 more." — which day, whose,
+   to what? An approver cannot be responsible for that. These three routes
+   now name the person and the day, and show the status as from → to. */
+const ATTENDANCE_STATUS_WORDS = {
+  P: "Present", "P*": "Late", "P~": "Early out", HD: "Half day", LHD: "Late half day",
+  AB: "Absent", LAB: "Late absent", EAB: "Early absent", MP: "Miss punch", WO: "Weekly off",
+  PH: "Holiday", FH: "Festival holiday", NH: "National holiday", OH: "Optional holiday",
+  RH: "Restricted holiday", "L-CL": "Casual leave", "L-SL": "Sick leave", "L-EL": "PL",
+  LWP: "LWP", WFH: "Work from home", CO: "Comp off", "P/CL": "P/CL", "P/SL": "P/SL",
+  "P/PL": "P/PL", "P/LWP": "P/LWP",
+};
+const statusWord = (s) => (s ? ATTENDANCE_STATUS_WORDS[s] || s : "(none)");
+
+function readableDay(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr || ""));
+  if (!m) return String(dateStr || "");
+  return new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])).toLocaleDateString("en-IN", {
+    weekday: "short", day: "numeric", month: "short", year: "numeric", timeZone: "UTC",
+  });
+}
+
+async function describeAttendance(path, body) {
+  const kind = path.includes("/attendance/bulk-day-override")
+    ? "bulk"
+    : path.includes("/attendance/day-override")
+      ? "day"
+      : path.includes("/attendance/punch-correction")
+        ? "punch"
+        : null;
+  if (!kind || !body || typeof body !== "object") return null;
+
+  if (kind === "bulk") {
+    const n = Array.isArray(body.updates) ? body.updates.length
+      : Array.isArray(body.overrides) ? body.overrides.length
+      : Array.isArray(body.entries) ? body.entries.length : 0;
+    return {
+      entityId: "",
+      entityLabel: "Attendance",
+      summary: `Bulk attendance change${n ? ` — ${n} day${n === 1 ? "" : "s"}` : ""}${body.hrFinalStatus ? ` to ${statusWord(body.hrFinalStatus)}` : ""}.`,
+      changes: [],
+    };
+  }
+
+  const bid = String(body.biometricId || "").toUpperCase();
+  const dateStr = String(body.dateStr || "");
+  if (!bid || !dateStr) return null;
+
+  const DailyAttendance = require("../models/HR_Models/Dailyattendance");
+  const day = await DailyAttendance.findOne(
+    { dateStr, "employees.biometricId": bid },
+    { employees: { $elemMatch: { biometricId: bid } } },
+  ).lean();
+  const e = day?.employees?.[0] || null;
+  const who = `${e?.employeeName || bid}${e?.employeeName ? ` (${bid})` : ""}`;
+  const when = readableDay(dateStr);
+  const changes = [];
+
+  if (kind === "day") {
+    const current = e ? e.hrFinalStatus || e.systemPrediction : null;
+    if (body.hrFinalStatus !== undefined) {
+      changes.push({ field: "Status", path: "hrFinalStatus", label: "Status",
+        from: statusWord(current), to: statusWord(body.hrFinalStatus || null) });
+    }
+    if (body.hrRemarks) {
+      changes.push({ field: "Remarks", path: "hrRemarks", label: "Remarks",
+        from: e?.hrRemarks || "", to: String(body.hrRemarks) });
+    }
+    const to = body.hrFinalStatus !== undefined ? ` → ${statusWord(body.hrFinalStatus || null)}` : "";
+    return { entityId: bid, entityLabel: who, summary: `${who} · ${when}${to}.`, changes };
+  }
+
+  // punch correction
+  const slot = String(body.punchType || "punch").replace(/_/g, " ");
+  const act = body.action === "remove" ? "Remove" : body.action === "add" ? "Add" : "Change";
+  changes.push({ field: `Punch · ${slot}`, path: `punch.${body.punchType || ""}`, label: `Punch · ${slot}`,
+    from: act === "Add" ? "" : "(recorded)", to: body.action === "remove" ? "(removed)" : String(body.punchTime || "") });
+  return {
+    entityId: bid,
+    entityLabel: who,
+    summary: `${who} · ${when} — ${act.toLowerCase()} ${slot}${body.punchTime && body.action !== "remove" ? ` at ${body.punchTime}` : ""}.`,
+    changes,
+  };
+}
+
 /**
  * The describe() hook handed to departmentWrites.
  *
@@ -238,6 +326,15 @@ function describeChange(action) {
   return async function describe(req) {
     const path = req.originalUrl || req.url || "";
     const section = req.auditSection || "";
+
+    /* Attendance first; anything it cannot read falls through to the generic
+       card, and a describe() must never cost the write (see the header). */
+    try {
+      const att = await describeAttendance(path, req.body);
+      if (att) return att;
+    } catch {
+      /* fall through */
+    }
 
     const { doc } = await loadBefore(path);
 

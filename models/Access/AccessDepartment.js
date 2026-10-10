@@ -101,6 +101,12 @@ const accessDepartmentSchema = new mongoose.Schema(
      * only decides what Command Centre offers in that picker. */
     budgetEnabled: { type: Boolean, default: true },
 
+    /* CCTV camera access. Opt-in per department (default off): only departments
+     * with this flag may open the /cctv page and see the camera tile. Mirrors
+     * the budgetEnabled feature-flag pattern, but is surfaced in toPublicTile()
+     * because the gate is enforced client-side (tile visibility + page guard). */
+    cctvEnabled: { type: Boolean, default: false },
+
     // Forward-looking. The long-term replacement for role-string comparisons:
     // a route asks "does this user have capability X" rather than "is this
     // user's role literally 'hr_manager'". Empty for the seeded 12 — they are
@@ -166,6 +172,9 @@ accessDepartmentSchema.methods.toPublicTile = function () {
     // same login-redirect address dashboardPath already exposes for every
     // other department.
     externalBaseUrl: this.externalBaseUrl || "",
+    // Per-department CCTV grant. The onboarding tile and the /cctv page guard
+    // read this to decide whether to show/allow CCTV for the signed-in user.
+    cctvEnabled: this.cctvEnabled === true,
   };
 };
 

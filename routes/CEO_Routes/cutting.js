@@ -45,6 +45,7 @@ const proxy = (path) => async (req, res) => {
           method: "GET",
           headers: {
             Cookie: req.headers.cookie || "",
+            ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
             "Content-Type": "application/json",
           },
         },

@@ -176,7 +176,7 @@ describe("capabilities that must stay separate", () => {
 
   test("attendance correction and attendance close are distinct authorities", () => {
     const correct = capsFor("PUT", "/hr/attendance/day-override");
-    const close = capsFor("POST", "/hr/attendance/sync-period");
+    const close = capsFor("DELETE", "/hr/attendance/remove-from-month");
 
     expect(correct).toContain(CAPABILITIES.ATTENDANCE_CORRECT);
     expect(close).toContain(CAPABILITIES.ATTENDANCE_CLOSE);
@@ -217,11 +217,19 @@ describe("capabilities that must stay separate", () => {
       ["GET", "/api/hr/payroll/items"],
       ["GET", "/api/hr/payroll/preview"],
       ["GET", "/api/hr/payroll/export"],
-      ["GET", "/api/employees/config/salary"],
       ["GET", "/api/employees/import-export/export"],
     ]) {
       expect(capsFor(method, path)).toContain(CAPABILITIES.COMPENSATION_READ);
     }
+  });
+
+  test("the salary RULES are readable by whoever adds people; changing them is the owner's", () => {
+    /* 7 Oct 2026: the new-employee form computes pay from these, and editors
+       and approvers add employees whose pay goes to the owner. Refused, the
+       form fell back to defaults that differ from the company's. */
+    expect(capsFor("GET", "/api/employees/config/salary")).toContain(CAPABILITIES.PEOPLE_WRITE);
+    expect(capsFor("GET", "/api/employees/config/salary")).not.toContain(CAPABILITIES.COMPENSATION_READ);
+    expect(capsFor("PUT", "/api/employees/config/salary")).toContain(CAPABILITIES.COMPENSATION_WRITE);
   });
 
   test("the CEO/management projection is read-only and holds no protected read", () => {

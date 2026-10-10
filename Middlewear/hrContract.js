@@ -203,6 +203,7 @@ function hrContract(opts = {}) {
         capabilities: declaration.capabilities,
         scope: declaration.scope,
         selfParams: declaration.selfParams,
+        selfRecord: declaration.selfRecord,
         managerScope: declaration.managerScope,
         req,
       });
@@ -260,7 +261,19 @@ function hrContract(opts = {}) {
         }
 
         const extra = verdict.capabilities.filter((c) => !capabilitiesHeld.has(c));
-        if (extra.length) {
+        /* HELD FOR THE OWNER, NOT REFUSED (5 Oct 2026, owner's rule). Where the
+           declaration allows it and the ONLY thing the caller lacks is one of
+           those capabilities, the write goes on to the department guard marked
+           for the owner: services/changeRequests.js holds it whatever the
+           caller's role, and only the owner may decide it. Anything else
+           missing still refuses below. */
+        const ownerHoldable = Array.isArray(declaration.holdForOwnerOn) ? declaration.holdForOwnerOn : [];
+        if (extra.length && ownerHoldable.length && extra.every((c) => ownerHoldable.includes(c))) {
+          req.holdForOwner = {
+            capability: extra[0],
+            fields: verdict.byCapability[extra[0]] || [],
+          };
+        } else if (extra.length) {
           logDenial(req, declaration, {
             decision: DECISIONS.MISSING_CAPABILITY,
             actor: result.actor,

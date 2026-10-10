@@ -315,7 +315,7 @@ async function resolveProductLine(companyId, { journeyId, productLineRef }) {
  * who accepted version 1 must see version 2 as a revision of the thing they
  * already looked at.
  */
-async function issue(scope, { journeyId, productLineRef, body = {}, actor = null } = {}) {
+async function issue(scope, { journeyId, productLineRef, body = {}, actor = null, house = null } = {}) {
   if (!scope?.companyId) {
     throw fail("COMPANY_CONTEXT_UNAVAILABLE", "Your company could not be resolved.");
   }
@@ -354,17 +354,37 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
     targetPriceCeiling = { amount, currency: currency.slice(0, 8), basis };
   }
 
-  const { journey, enquiry, line } = await resolveProductLine(scope.companyId, {
-    journeyId, productLineRef,
-  });
-  const buyerDisplayLabel = await buyerLabelFor(journey);
+  /* ── AN IN-HOUSE SAMPLE HAS NO JOURNEY (6 Oct 2026, owner: "the sampling
+     section works without a customer; the industry samples in its free time").
+     The request's grain is company + journey + product line, and both are
+     required and immutable. A house sample supplies its OWN id as that grain
+     — `journeyId` = the style, `productLineRef` = HOUSE-<style> — so the
+     request, the intake and the Merchandiser's file need no second shape,
+     the unique index holds, and the file simply carries no journey reference
+     ("Not carried on this file"). `house.style` is the SampleStyle, already
+     proved to this company by the caller. */
+  let journey, enquiry, line;
+  if (house?.style) {
+    const hs = house.style;
+    if (hs.sampleType !== "house") throw fail("VALIDATION", "Only an in-house sample is issued without a Journey.");
+    journey = { _id: hs._id, journeyId: "", accountId: null, companyId: scope.companyId };
+    enquiry = { _id: hs._id };
+    line = { productLineRef: `HOUSE-${str(hs._id)}`, product: str(hs.productName), stockItemId: hs.sourceStockItemId || hs.production?.stockItemId || null };
+    productLineRef = line.productLineRef;
+  } else {
+    ({ journey, enquiry, line } = await resolveProductLine(scope.companyId, { journeyId, productLineRef }));
+  }
+  const buyerDisplayLabel = house?.style ? "In-house sample" : await buyerLabelFor(journey);
 
   /* A named sample style must belong to this journey — a request pointing at
      somebody else's style would open a Development File on the wrong work. */
   let sampleStyle = null;
   if (isId(body.sampleStyleId)) {
-    sampleStyle = await SampleStyle.findById(body.sampleStyleId).select("journeyId styleCode").lean();
-    if (!sampleStyle || str(sampleStyle.journeyId) !== str(journey._id)) {
+    sampleStyle = await SampleStyle.findById(body.sampleStyleId).select("journeyId styleCode sampleType").lean();
+    const onThisGrain = sampleStyle && (house?.style
+      ? str(sampleStyle._id) === str(journey._id)
+      : str(sampleStyle.journeyId) === str(journey._id));
+    if (!onThisGrain) {
       throw fail("NOT_FOUND", "That sample style is not on this Journey.", { field: "sampleStyleId" });
     }
   }

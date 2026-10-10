@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:47.056Z",
+ "productRef": "PROD-BOT-SECSUPTRO-002",
+ "stockItem": {
+  "_id": "6975cd898786accba01a52dc",
+  "reference": "PROD-BOT-SECSUPTRO-002",
+  "name": "Security Supervisor Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

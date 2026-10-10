@@ -40,7 +40,7 @@ const FINISHING = new Set(["embroidery", "printing", "washing", "trimming", "iro
 async function orderContext(companyId, moId) {
   const [mo, wos] = await Promise.all([
     CustomerRequest.findById(moId).select("requestId customerInfo.name customerInfo.deliveryDeadline requestType status dueDate items").lean(),
-    packagingAccess.findWorkOrders(companyId, { customerRequestId: oid(moId) }, "_id workOrderNumber quantity stockItemName status packagingRecords").lean(),
+    packagingAccess.findWorkOrders(companyId, { customerRequestId: oid(moId) }, "_id workOrderNumber quantity stockItemName status packagingRecords assignedDeadline").lean(),
   ]);
   if (!mo) return null;
   const quantity = wos.reduce((n, w) => n + (w.quantity || 0), 0)
@@ -49,7 +49,14 @@ async function orderContext(companyId, moId) {
     mo, wos,
     moId: String(mo._id), moNumber: mo.requestId ? `MO-${mo.requestId}` : "", customerName: mo.customerInfo?.name || "",
     requestType: mo.requestType || "", status: mo.status || "", dueDate: mo.dueDate || null,
-    deliveryDate: mo.customerInfo?.deliveryDeadline || null,
+    /* PPC's target date: the latest work-order deadline Sales assigned, else
+       the customer's delivery date (7 Oct 2026, owner) — the same rule the
+       control center's order rows apply. */
+    ...(() => {
+      const ds = wos.filter((w) => w.status !== "cancelled" && w.assignedDeadline).map((w) => new Date(w.assignedDeadline).getTime()).filter((t) => !Number.isNaN(t));
+      const sales = ds.length ? new Date(Math.max(...ds)) : null;
+      return { deliveryDate: sales || mo.customerInfo?.deliveryDeadline || null, deliveryDateSource: sales ? "sales_wo" : (mo.customerInfo?.deliveryDeadline ? "customer" : ""), customerDeliveryDate: mo.customerInfo?.deliveryDeadline || null };
+    })(),
     quantity, workOrderIds: wos.map((w) => w._id), shortIds: new Set(wos.map((w) => String(w._id).slice(-8).toLowerCase())),
     workOrders: wos.map((w) => ({ id: String(w._id), number: displayWorkOrderNumber(w), product: w.stockItemName || "", quantity: w.quantity || 0 })),
   };
@@ -321,8 +328,9 @@ async function checkTarget(companyId, moId, body) {
   else if (t.from < today) errors.push(`The first date (${fmtDay(t.from)}) is in the past. Start today (${fmtDay(today)}) or later.`);
 
   if (!errors.length) {
-    if (!delivery) warnings.push(`${ctx.moNumber} has no delivery date, so this target cannot be checked against it.`);
-    else if (t.to > delivery) warnings.push(`This ends on ${fmtDay(t.to)}, after the customer's delivery date (${fmtDay(delivery)}).`);
+    const dateWord = ctx.deliveryDateSource === "sales_wo" ? "the work-order deadline Sales set" : "the customer's delivery date";
+    if (!delivery) warnings.push(`${ctx.moNumber} has no target date — Sales has set no work-order deadline and the order carries no delivery date — so this target cannot be checked against one.`);
+    else if (t.to > delivery) warnings.push(`This ends on ${fmtDay(t.to)}, after ${dateWord} (${fmtDay(delivery)}). The order must finish by then.`);
     if (previous) warnings.push(`${label} already has a target on ${ctx.moNumber}: "${ev.describeTarget(previous)}" Saving replaces it.`);
     if (asked < left) warnings.push(`After this target, ${left - asked} of ${label}'s pieces on ${ctx.moNumber} still have no target.`);
     const assessment = await assess(companyId, moId, t);

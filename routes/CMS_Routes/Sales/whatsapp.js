@@ -286,7 +286,7 @@ router.get("/for-lead", async (req, res) => {
     if (!leadId && !accountId && !customerId) {
       return res.status(400).json({ success: false, message: "leadId, accountId or customerId is required" });
     }
-    const identity = await identityFor({ leadId, accountId, customerId });
+    const identity = await identityFor({ leadId, accountId, customerId }, await require("../../../services/companyContext/evidenceContext").evidenceContext(req));
     if (!identity) return res.status(404).json({ success: false, message: leadId ? "Lead not found" : "Customer not found" });
 
     const tails = [...new Set((identity.phones || []).map(last10).filter((t) => t.length === 10))];

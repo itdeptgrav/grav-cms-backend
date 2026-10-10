@@ -111,6 +111,8 @@ const publishedRows = (bom) => (bom?.rows || []).map((r) => ({
   category: str(r.category),
   name: str(r.rawItemName),
   reference: str(r.rawItemSku),
+  /* the variant the merchandiser chose, as Store names it (3 Oct 2026) */
+  variant: Array.isArray(r.variantCombination) ? r.variantCombination.map(str).filter(Boolean).join(" · ") : "",
   colourOrShade: str(r.colourOrShade),
   finish: str(r.finish),
   placement: str(r.placement),
@@ -123,6 +125,9 @@ const publishedRows = (bom) => (bom?.rows || []).map((r) => ({
      question. It is Merchandising's text about Merchandising's decision, so
      it crosses with the rest of the identity. */
   selectionNote: str(r.selectionNote),
+  /* the merchandiser's assumed consumption per piece (4 Oct 2026) */
+  consumptionPerPiece: r.consumptionPerPiece === null || r.consumptionPerPiece === undefined ? null : Number(r.consumptionPerPiece),
+  consumptionUnit: str(r.consumptionUnit),
 }));
 
 /**
@@ -233,6 +238,16 @@ function project(file, receipt, boms) {
     workingChangeRequestedSource: str(working?.changesRequestedSource) || null,
 
     selectedMaterials: publishedRows(approved),
+    /* ── SALES APPROVES THE SELECTION (3 Oct 2026, owner) ───────────────
+       The submitted revision, published row by row so the salesperson can
+       read what Merchandising chose and approve it from the pipeline. Only a
+       SUBMITTED revision crosses: a draft is still being written. */
+    submittedMaterials: working && working.state === BOM_STATE.SUBMITTED ? publishedRows(working) : [],
+    submittedRevisionNo: working && working.state === BOM_STATE.SUBMITTED ? working.revisionNo : null,
+    submittedPreparedByName: working && working.state === BOM_STATE.SUBMITTED ? str(working.createdBy?.name) : "",
+    submittedSubmittedByName: working && working.state === BOM_STATE.SUBMITTED ? str(working.submittedBy?.name) : "",
+    submittedSubmittedAt: working && working.state === BOM_STATE.SUBMITTED ? (working.submittedAt || null) : null,
+    approvalAwaitingSales: Boolean(working && working.state === BOM_STATE.SUBMITTED),
 
     releasedToRndAt: file?.releasedToRndAt || null,
     releasedByName: str(file?.releasedBy?.name),

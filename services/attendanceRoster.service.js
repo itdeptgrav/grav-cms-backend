@@ -123,6 +123,9 @@ function rollMembership({
   dojByBid = new Map(),
   onLeaveInRange = new Set(),
   leaveUnknown = false,
+  /* Set<bid> of everyone with at least one PUNCH in the period, or null to
+     skip the inactive rule (a caller that did not compute it). */
+  punchedInRange = null,
 }) {
   const rangeHasAttendance = seenInRange.size > 0;
   /**
@@ -136,6 +139,14 @@ function rollMembership({
     // Removed from every month this sheet covers: HR's own answer, and it
     // outranks anything inferred from rows.
     if (bid && excludedForWholeRange(exclusionMap, bid, from, to)) return false;
+    /* INACTIVE AND NEVER PUNCHED: not on this sheet (5 Oct 2026, owner's
+       rule). The device keeps writing blank rows for people HR has marked
+       inactive — five of them had two empty rows each on 12–13 Sep 2026
+       — and a row alone used to put them on the roll, as a month of
+       absences. A row is not attendance; a punch is. Somebody inactive who
+       DID punch during the period stays: they worked those days, and the
+       sheet is what they are paid from. */
+    if (punchedInRange && bid && !isOnStaff && !punchedInRange.has(bid)) return false;
     // On the roll, plainly.
     if (bid && seenInRange.has(bid)) return true;
     // No biometric id — nothing to judge them by, so judge them present.

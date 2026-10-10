@@ -1,4 +1,6 @@
 "use strict";
+/* A leave cannot start before the employee's date of joining. */
+const { checkLeaveStartsAfterJoining } = require("../../services/leaveDateWindow");
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
@@ -834,6 +836,20 @@ router.post(
           .status(403)
           .json({ success: false, message: "Not a manager of this employee" });
       const config = await LeaveConfig.getConfig();
+      /* A leave cannot start before the person worked here. Both dates are
+         already in hand; nothing compared them, so a half-day SL filed for
+         5 Sept 2025 by somebody who joined on 4 May 2026 was accepted, minted
+         a 2025 balance, and left the day they meant (5 Sept 2026) reading HD
+         in HR. See services/leaveDateWindow.js. */
+      {
+        const startsOk = checkLeaveStartsAfterJoining(te, fromDate);
+        if (!startsOk.ok)
+          return res.status(400).json({
+            success: false,
+            code: startsOk.code,
+            message: startsOk.message,
+          });
+      }
       const year = new Date(fromDate).getFullYear();
       const wd = workingDaysSinceJoining(te.dateOfJoining);
       if (wd < config.initialWaitingDays)
@@ -1551,6 +1567,21 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
 
+    /* A leave cannot start before the person worked here. Both dates are
+       already in hand; nothing compared them, so a half-day SL filed for
+       5 Sept 2025 by somebody who joined on 4 May 2026 was accepted, minted
+       a 2025 balance, and left the day they meant (5 Sept 2026) reading HD
+       in HR. See services/leaveDateWindow.js. */
+    {
+      const startsOk = checkLeaveStartsAfterJoining(emp, fromDate);
+      if (!startsOk.ok)
+        return res.status(400).json({
+          success: false,
+          code: startsOk.code,
+          message: startsOk.message,
+        });
+    }
+
     const config = await LeaveConfig.getConfig();
     const year = new Date(fromDate).getFullYear();
 
@@ -2100,6 +2131,20 @@ router.put("/:id", AllEmployeeAppMiddleware, async (req, res) => {
     const { fromDate, toDate, reason, isHalfDay, halfDaySlot } = req.body;
     const nF = fromDate || a.fromDate,
       nT = isHalfDay ? nF : toDate || a.toDate;
+    /* An edit may not MOVE a leave to before the employee joined. Checked only
+       when the start date changes, so a leave already on a bad date can still
+       be corrected to the right one — which is exactly the repair the
+       5 Sept 2025 application needs. See services/leaveDateWindow.js. */
+    if (nF !== a.fromDate) {
+      const owner = await Employee.findById(a.employeeId).select("dateOfJoining").lean();
+      const startsOk = checkLeaveStartsAfterJoining(owner, nF);
+      if (!startsOk.ok)
+        return res.status(400).json({
+          success: false,
+          code: startsOk.code,
+          message: startsOk.message,
+        });
+    }
     const nt = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5
       : countLeaveDays(nF, nT);
@@ -2250,6 +2295,20 @@ router.put("/manager/:id/edit", AllEmployeeAppMiddleware, async (req, res) => {
       isHalfDay || (isHalfDay === undefined && a.isHalfDay)
         ? nF
         : toDate || a.toDate;
+    /* An edit may not MOVE a leave to before the employee joined. Checked only
+       when the start date changes, so a leave already on a bad date can still
+       be corrected to the right one — which is exactly the repair the
+       5 Sept 2025 application needs. See services/leaveDateWindow.js. */
+    if (nF !== a.fromDate) {
+      const owner = await Employee.findById(a.employeeId).select("dateOfJoining").lean();
+      const startsOk = checkLeaveStartsAfterJoining(owner, nF);
+      if (!startsOk.ok)
+        return res.status(400).json({
+          success: false,
+          code: startsOk.code,
+          message: startsOk.message,
+        });
+    }
 
     const totalDays = (isHalfDay !== undefined ? isHalfDay : a.isHalfDay)
       ? 0.5

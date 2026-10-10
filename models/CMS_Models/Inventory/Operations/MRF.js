@@ -48,6 +48,33 @@ const itemAttributeSchema = new mongoose.Schema(
   { _id: false }
 );
 
+// ── The manager's decision on ONE line ───────────────────────────────────────
+// Lines are approved and rejected one at a time, and an approved line goes to
+// the Store at once — see services/mrfItemApproval.service.js, which is the only
+// writer and the only reader that should interpret it.
+//
+// Absent on every line decided before item-wise approval existed: those lines'
+// decisions are derived from the request-level tl* fields by `lineApproval`,
+// and scripts/migrations/mrf-item-approval-backfill.js can write them down.
+// Deliberately no defaults — "no record" and "awaiting" must stay distinguishable.
+const lineApprovalSchema = new mongoose.Schema(
+  {
+    decision: { type: String, enum: ["PENDING", "APPROVED", "REJECTED"] },
+    // What the requester asked for. The line's own `requestedQty` becomes the
+    // APPROVED quantity when a manager approves less, because that is the figure
+    // every Store path issues, reserves and buys against.
+    requestedQty: { type: Number, min: 0 },
+    approvedQty: { type: Number, min: 0 },
+    rejectedQty: { type: Number, min: 0 },
+    reason: { type: String, trim: true, default: "" },
+    decidedBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+    decidedByName: { type: String, trim: true, default: "" },
+    decidedById: { type: String, trim: true, default: "" },   // biometricId / cowork id
+    decidedAt: { type: Date, default: null },
+  },
+  { _id: false }
+);
+
 // ── Per-item sub-doc ──────────────────────────────────────────────────────────
 const mrfItemSchema = new mongoose.Schema(
   {
@@ -97,6 +124,9 @@ const mrfItemSchema = new mongoose.Schema(
       ],
       default: "PENDING",
     },
+
+    // The manager's item-wise decision — see lineApprovalSchema above.
+    approval: { type: lineApprovalSchema, default: undefined },
 
     // ── Store availability reporting ──────────────────────────────────────
     // Set by the Store Person after the TL approves. Independent of
@@ -243,6 +273,8 @@ const mrfItemSchema = new mongoose.Schema(
 // Remaining quantity still owed on this line, in the requester's unit.
 mrfItemSchema.virtual("remainingQty").get(function () {
   if (["REJECTED", "UNFULFILLED"].includes(this.itemStatus)) return 0;
+  // Still waiting on the manager — the Store owes nothing on it yet.
+  if (this.approval && this.approval.decision === "PENDING") return 0;
   return Math.max(0, (this.requestedQty || 0) - (this.issuedQty || 0));
 });
 
@@ -254,6 +286,10 @@ const statusEventSchema = new mongoose.Schema(
     actorName: { type: String, trim: true, default: "" },
     actorRole: { type: String, trim: true, default: "" },  // employee | tl | store | system
     detail: { type: String, trim: true, default: "" },
+    // Set on item-level events (ITEM_APPROVED / ITEM_REJECTED) so the trail can
+    // say which line a decision was about. Absent on request-level events.
+    itemId: { type: mongoose.Schema.Types.ObjectId, default: undefined },
+    itemName: { type: String, trim: true, default: undefined },
   },
   { _id: false }
 );
@@ -385,6 +421,26 @@ const mrfSchema = new mongoose.Schema(
     },
 
     items: [mrfItemSchema],
+
+    /* ── THE MANAGER'S DECISIONS, ROLLED UP ─────────────────────────────────
+       Beside `status`, not inside it: `status` is the Store's lifecycle and a
+       request is "with the Store" (APPROVED) as soon as ONE line is approved,
+       while other lines may still be waiting. This says how far the manager has
+       got — written by services/mrfItemApproval.service.js on every decision.
+       Absent on requests decided before item-wise approval; readers fall back
+       to `approvalStatusOf`, which derives the same answer. */
+    approvalStatus: {
+      type: String,
+      enum: [
+        "AWAITING_APPROVAL",    // nothing decided yet
+        "PARTIALLY_PROCESSED",  // some lines decided, some still waiting
+        "APPROVED",             // every line approved in full
+        "PARTIALLY_APPROVED",   // all decided; some rejected or approved for less
+        "REJECTED",             // every line rejected
+        "CANCELLED",            // withdrawn while lines still waited
+      ],
+    },
+    lastDecisionAt: { type: Date, default: null },
 
     // ═══════════════════════════════════════════════════════════════════════
     // Approval routing — Employee → Primary Manager/TL → Store
@@ -591,8 +647,12 @@ mrfSchema.index({ companyId: 1, approverAltIds: 1, status: 1 });
 
 // Append an audit event. Callers should use this rather than pushing directly
 // so every entry carries a consistent shape.
-mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "", detail = "" }) {
-  this.statusHistory.push({ at: new Date(), action, actorName, actorRole, detail });
+mrfSchema.methods.logEvent = function ({ action, actorName = "", actorRole = "", detail = "", itemId, itemName }) {
+  this.statusHistory.push({
+    at: new Date(), action, actorName, actorRole, detail,
+    ...(itemId ? { itemId } : {}),
+    ...(itemName ? { itemName } : {}),
+  });
   return this;
 };
 

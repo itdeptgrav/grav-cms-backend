@@ -1,3 +1,7 @@
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 /* Server-owned field policy. `selectFor` narrows the QUERY to what this caller
    may read; `projectFor` narrows the RESPONSE to the declared allowlist. Both
@@ -44,6 +48,47 @@ function dropHrAuthorizationCache(reason) {
     console.warn("[employees] HR authorisation cache invalidation skipped:", err.message);
   }
 }
+
+/* ── WHEN SOMEBODY LEAVES, NOTHING CURRENT POINTS AT THEM (5 Oct 2026) ──────
+   Deactivation ended their sessions and nothing else: they stayed somebody's
+   manager, open requests stayed waiting on them, and their app grants stayed
+   active. services/employeeDeparture.js detaches all three and deletes
+   nothing. Called from every route that can turn a record inactive, only on
+   the transition, and it must never fail the deactivation itself — a
+   failure is logged and HR can re-run it. */
+async function detachIfDeparted(req, before, after) {
+  const { detachDepartedEmployee, hasLeft } = require("../../services/employeeDeparture");
+  if (!after || hasLeft(before) || !hasLeft(after)) return null;
+  try {
+    const db = require("mongoose").connection.db;
+    const by = req.user?.name || req.user?.email || "";
+    const done = await detachDepartedEmployee(db, after, { by });
+    if (done.grants.length) dropHrAuthorizationCache("departed employee's grants deactivated");
+    const parts = [
+      done.reports.length && `${done.reports.length} report(s) no longer have them as manager`,
+      done.departments.length && `removed as manager of ${done.departments.length} department(s)`,
+      done.requests.length && `taken off ${done.requests.length} waiting request(s), which HR now decides`,
+      done.grants.length && `${done.grants.length} app access grant(s) switched off`,
+    ].filter(Boolean);
+    if (parts.length) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:employees",
+        entity: "employee",
+        entityId: after._id,
+        entityLabel: `${after.firstName || ""} ${after.lastName || ""}`.trim(),
+        action: "update",
+        summary: `Left the company: ${parts.join("; ")}.`,
+        before: { reports: done.reports, departments: done.departments, waitingRequests: done.requests, grants: done.grants },
+        after: { reports: [], departments: [], waitingRequests: [], grants: [] },
+      });
+    }
+    return done;
+  } catch (err) {
+    console.error(`[departure] ${after?._id}: could not detach — ${err.message}`);
+    return null;
+  }
+}
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
@@ -64,8 +109,13 @@ const {
   decryptEmployeeDocs,
 } = require("../../utils/salaryEncryption");
 const { computeSalary } = require("../../services/salaryFormula");
+/* The department NAME to display. `department` is a copy of what
+   `departmentId` references and the two had drifted; this prefers the
+   reference. See services/employeeDepartment.js. */
+const { departmentNameOf } = require("../../services/employeeDepartment");
 
 require("dotenv").config();
+const { flattenToPaths } = require("../../services/mongoPaths");
 
 // ─── SALARY CALCULATION ─────────────────────────────────────────────
 // The formula itself lives in services/salaryFormula.js. It used to be copied
@@ -269,6 +319,19 @@ router.put("/config/salary", EmployeeAuthMiddlewear, async (req, res) => {
 // ─── CREATE new employee ──────────────────────────────────────────────────────
 router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    /* BACKSTOP. A create carrying pay from somebody who may not set pay is
+       marked `holdForOwner` by the HR contract and must be HELD for the owner
+       by the department guard (services/changeRequests.js). It reaches this
+       handler only as the owner-approved replay. If it ever arrives any other
+       way — a mount reordered, a path exempted — refuse, rather than create
+       somebody with pay nobody allowed to be set. */
+    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      return res.status(403).json({
+        success: false,
+        code: "OWNER_APPROVAL_REQUIRED",
+        message: "Pay on a new employee is set by the HR owner — this should have been sent to them for approval. Nothing was saved.",
+      });
+    }
     const { user } = req;
     const employeeData = req.body;
 
@@ -313,6 +376,17 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
       !employeeData.secondaryManager.managerId
     ) {
       delete employeeData.secondaryManager;
+    }
+
+    /* ── ONE DEPARTMENT, NOT TWO ─────────────────────────────────────────
+       `department` is a display COPY of the department `departmentId` points
+       at, and nothing used to keep the two in step. Derived here so the copy
+       cannot be created already disagreeing with the reference. See
+       services/employeeDepartment.js for why the copy exists at all. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(employeeData, Department);
     }
 
     // ── Inherit the department's managers ─────────────────────────────────
@@ -584,7 +658,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       }
     }
 
-    const canUpdate = user.role === "hr_manager" || user.id === id;
+    const canUpdate = isHrOperator(req) || user.id === id;
     if (!canUpdate) {
       return res
         .status(403)
@@ -602,33 +676,47 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // between them is silently logged as edits nobody made.
     const beforeDoc = await Employee.findById(id).lean();
 
-    // ── The biometric ID is write-once ──────────────────────────────────────
-    // It is the join key across both datastores — Mongo's employee record and
-    // the Firestore cowork document share it, and every attendance row, punch
-    // and payroll item is keyed on it. Changing it does not rename those; it
-    // orphans them, and the employee silently stops having a history.
-    //
-    // So: set it once, on an employee who has none, and never again. Sent
-    // unchanged is fine and common — the form posts the whole record back —
-    // and only an actual attempt to change one is refused, loudly, because
-    // silently ignoring it would leave HR believing it had been renamed.
-    //
-    // identityId is deliberately NOT locked. It is a display/HR number with
-    // nothing keyed on it.
+    /* ── The biometric ID is editable, and it is a RENAME WITH CONSEQUENCES ──
+       It was write-once: an attempt to change it was refused with
+       BIOMETRIC_ID_IMMUTABLE. HR asked for it to be editable (10 Oct 2026),
+       so it is.
+ 
+       What has NOT changed is why it was locked. It is the join key across
+       both datastores — Mongo's employee record and the Firestore cowork
+       document share it — and about eighteen collections file their rows
+       under it, among them Attendance, Dailyattendance, Payroll,
+       LeaveManagement, OvertimeReport, AttendanceExclusion, FacePhoto,
+       FaceEnrollInvite and EmployeeDocument, plus the manufacturing and
+       request collections. Writing a new value here renames the employee's
+       key and nothing else: the existing rows keep the OLD id and stop
+       resolving to this person.
+ 
+       So the change is allowed, reported, and written into the change log
+       (recordChange below carries before/after, and the biometric ID is part
+       of the audit snapshot), and the response says what moved so the caller
+       can say it too. Re-keying the dependent rows is a separate migration
+       and deliberately not attempted inside a form save — a partial re-key
+       across eighteen collections is worse than a clean rename plus a
+       migration that can be run, checked and repeated.
+ 
+       Sent unchanged is fine and common — a section posts its own keys back —
+       and that case is dropped rather than written, so an ordinary save is
+       not recorded as a rename.
+ 
+       identityId was never locked. It is a display/HR number with nothing
+       keyed on it. */
+    let biometricIdRenamed = null;
     if (updateData.biometricId !== undefined && beforeDoc?.biometricId) {
       const next = String(updateData.biometricId || "").trim().toUpperCase();
       const current = String(beforeDoc.biometricId).trim().toUpperCase();
       if (next && next !== current) {
-        return res.status(400).json({
-          success: false,
-          code: "BIOMETRIC_ID_IMMUTABLE",
-          message:
-            `Biometric ID cannot be changed. ${beforeDoc.biometricId} is the ` +
-            `key their attendance, punches and payroll are stored under — ` +
-            `renaming it here would orphan all of it, not move it.`,
-        });
+        /* Normalised on the way in, because every reader compares it
+           case-insensitively and a stored "b-12" would match nothing. */
+        updateData.biometricId = next;
+        biometricIdRenamed = { from: beforeDoc.biometricId, to: next };
+      } else {
+        delete updateData.biometricId;
       }
-      delete updateData.biometricId;
     }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
@@ -682,6 +770,15 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     if (updateData.departmentId === "" || updateData.departmentId === null) {
       delete updateData.departmentId;
     }
+
+    /* The display copy follows the reference on every update too — this is
+       the half that was missing, and it is how a record ended up reading
+       department "SAMPLING" while departmentId pointed at R&D. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(updateData, Department);
+    }
     if (updateData.primaryManager && !updateData.primaryManager.managerId) {
       delete updateData.primaryManager;
     }
@@ -710,15 +807,39 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       updateData.salary.adminOverride = calculated.adminOverride;
     }
 
-    const updated = await Employee.findByIdAndUpdate(id, updateData, {
-      new: true,
-      runValidators: false,
-    }).select("-password -temporaryPassword -__v");
+    /* THE SHIFT TIMES ARE THE ONE SUB-OBJECT THAT MEANT "REPLACE".
+       ------------------------------------------------------------------
+       The form sends `workShift: { mode }` with no times for General and
+       Core, deliberately: those modes read their hours from the attendance
+       settings, and copying them onto the employee freezes a snapshot that
+       stops following that page. It relied on the whole-object replace below
+       to drop any times already stored. Merging keeps them, so they are
+       cleared by name instead — the intent is preserved rather than left to
+       a side effect of how the write happened to be built. */
+    if (updateData.workShift?.mode && updateData.workShift.mode !== "custom") {
+      updateData.workShift.start = "";
+      updateData.workShift.end = "";
+      updateData.workShift.punches = null;
+    }
+
+    /* DOT PATHS, NOT NESTED OBJECTS — see services/mongoPaths.js.
+       `$set: { documents: {...} }` replaces the whole sub-document, so a
+       section save that carried an Aadhaar number erased the PAN, the UAN and
+       the uploaded files beside it; `address` replaced the same way could drop
+       `address.permanent.state`, which is what the monthly leave cap is judged
+       on. The bulk route next door always did this correctly and had the only
+       copy of the helper. */
+    const updated = await Employee.findByIdAndUpdate(
+      id,
+      { $set: flattenToPaths(updateData) },
+      { new: true, runValidators: false },
+    ).select("-password -temporaryPassword -__v");
 
     if (!updated)
       return res
         .status(404)
         .json({ success: false, message: "Employee not found" });
+    await detachIfDeparted(req, beforeDoc, updated.toObject());
 
     /* An email is the key every access record is filed under, and it is
        editable right here. Changing it without moving those records orphans
@@ -779,6 +900,12 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       success: true,
       message: "Employee updated successfully",
       data: decryptedDoc,
+      /* A biometric ID rename is reported rather than left to be noticed.
+         The rows already filed under the old id keep it — see the block above
+         — and the person saving is the only one who can decide to have them
+         migrated, so they have to be told it happened. Absent on every
+         ordinary save. */
+      ...(biometricIdRenamed ? { biometricIdRenamed } : {}),
     });
   } catch (error) {
     console.error("Update employee error:", error);
@@ -803,7 +930,7 @@ router.patch("/:id/documents", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
     const { documents } = req.body;
 
-    if (user.role !== "hr_manager" && user.id !== id) {
+    if (!isHrOperator(req) && user.id !== id) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -875,7 +1002,7 @@ router.patch("/:id/profile-photo", EmployeeAuthMiddlewear, async (req, res) => {
     const { id } = req.params;
     const { profilePhoto } = req.body;
 
-    if (user.role !== "hr_manager" && user.id !== id) {
+    if (!isHrOperator(req) && user.id !== id) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1096,7 +1223,7 @@ router.get("/all", EmployeeAuthMiddlewear, async (req, res) => {
 router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1150,6 +1277,14 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
     }
     if (clean.departmentId === "" || clean.departmentId === null)
       delete clean.departmentId;
+
+    /* A bulk move between departments is the most likely way for many records
+       to drift at once, so it derives the name as the single update does. */
+    {
+      const Department = require("../../models/HR_Models/Departments");
+      const { syncDepartmentName } = require("../../services/employeeDepartment");
+      await syncDepartmentName(clean, Department);
+    }
     if (clean.primaryManager && !clean.primaryManager.managerId)
       delete clean.primaryManager;
     if (clean.secondaryManager && !clean.secondaryManager.managerId)
@@ -1167,21 +1302,9 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Nested objects → dot paths, so a partial {salary:{gross}} or
     // {address:{current:{city}}} merges instead of replacing the sub-document.
-    const flatten = (obj, prefix = "", out = {}) => {
-      for (const [k, v] of Object.entries(obj)) {
-        const path = prefix ? `${prefix}.${k}` : k;
-        if (
-          v &&
-          typeof v === "object" &&
-          !Array.isArray(v) &&
-          !(v instanceof Date)
-        )
-          flatten(v, path, out);
-        else out[path] = v;
-      }
-      return out;
-    };
-    const paths = flatten(clean);
+    // services/mongoPaths.js — the same helper the single PUT above uses, so
+    // the two routes cannot disagree about what a partial update means.
+    const paths = flattenToPaths(clean);
 
     const results = { updated: 0, failed: [] };
     for (const empId of employeeIds) {
@@ -1212,6 +1335,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
         doc.set("updatedByName", user.name || "");
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
+        await detachIfDeparted(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
         // Same reason as the single-employee update: a change of employment
         // type changes whether the app will let them in, and the answer is
         // cached for five minutes.
@@ -1265,7 +1389,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
 // shadowed by the param route.
 router.get("/history", EmployeeAuthMiddlewear, async (req, res) => {
   try {
-    if (req.user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res
         .status(403)
         .json({ success: false, message: "Permission denied" });
@@ -1436,7 +1560,13 @@ router.get("/:id/details", EmployeeAuthMiddlewear, async (req, res) => {
         customFields: employee.personalCustomFields || [],
       },
       workInfo: {
-        department: employee.department,
+        /* The POPULATED department's name, falling back to the stored string
+           only when there is no reference to read. Records that drifted
+           before the write-side fix therefore display the truth without
+           waiting for a migration — and this screen stops disagreeing with
+           the edit form beside it, which has always driven its dropdown from
+           the reference. */
+        department: departmentNameOf(employee),
         departmentId: employee.departmentId,
         designation: employee.designation || employee.jobPosition,
         jobTitle: employee.jobTitle,
@@ -1654,7 +1784,7 @@ router.get(
 router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res.status(403).json({
         success: false,
         message: "Only HR managers can delete employees",
@@ -1694,6 +1824,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     // have. Both caches, because they answer different questions.
     invalidateAppAccess(req.params.id);
     dropHrAuthorizationCache("employee deactivated");
+    const departure = await detachIfDeparted(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
 
     // Audit: who deactivated this employee.
     recordChange(req, {
@@ -1710,7 +1841,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     res
       .status(200)
-      .json({ success: true, message: "Employee deactivated successfully" });
+      .json({ success: true, message: "Employee deactivated successfully", departure });
   } catch (error) {
     console.error("Delete employee error:", error);
     if (error.name === "CastError")

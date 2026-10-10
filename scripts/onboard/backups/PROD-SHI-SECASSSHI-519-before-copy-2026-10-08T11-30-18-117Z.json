@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:18.118Z",
+ "productRef": "PROD-SHI-SECASSSHI-519",
+ "stockItem": {
+  "_id": "697322c8cb185373c591d510",
+  "reference": "PROD-SHI-SECASSSHI-519",
+  "name": "Security Associate Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

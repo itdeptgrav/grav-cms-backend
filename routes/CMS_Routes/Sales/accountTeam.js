@@ -10,6 +10,7 @@ const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const { recordChange } = require("../../../services/changeLog");
 const { makeSolePrimary } = require("../../../services/crmPrimary");
 const SalesDepartment = require("../../../models/SalesDepartment");
+const { listSalesPeople } = require("../../../services/sales/salesPeople");
 
 const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
 
@@ -17,7 +18,9 @@ const actor = (req) => ({ id: req.user?.id, name: req.user?.name || "" });
 // from (Sales department employees). Read-only.
 router.get("/users", salesAuth, async (req, res) => {
   try {
-    const users = await SalesDepartment.find({}).select("name email role").sort({ name: 1 }).lean();
+    /* the Sales team is the access register's role holders, not the empty
+       legacy salesdepartments collection (3 Oct 2026) */
+    const users = await listSalesPeople();
     res.json({ success: true, users });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });

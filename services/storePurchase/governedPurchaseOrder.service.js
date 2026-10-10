@@ -163,6 +163,12 @@ function shortfallLines(mrf) {
  */
 function outstandingLines(mrf) {
   return (mrf.items || [])
+    /* Only lines the Store owes: not rejected, not written off, and not still
+       waiting on the manager — the request may be with the Store while some of
+       its lines are not. Buying against those would order material nobody
+       approved, or somebody declined. */
+    .filter((i) => !["REJECTED", "UNFULFILLED"].includes(i.itemStatus))
+    .filter((i) => !(i.approval && i.approval.decision === "PENDING"))
     .map((i) => {
       const buy = num(i.buyQty) || 0;
       const left = Math.max(0, (num(i.requestedQty) || 0) - (num(i.issuedQty) || 0));
@@ -1661,7 +1667,7 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
      the legacy read-through, and so is the base — assigning either over the
      other would drop it (and a dropped tenancy clause reads across companies). */
   const clauses = [tenantContext.tenantFilter(tenant), base];
-  if (rx) clauses.push({ $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { "items.rawItemName": rx }] });
+  if (rx) clauses.push({ $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { requestedForName: rx }, { "items.rawItemName": rx }] });
   const filter = { $and: clauses };
 
   const [storedMatchCount, docs] = await Promise.all([
@@ -1669,7 +1675,10 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
     MRF.find(filter)
       .select("mrfNumber requestedForDept requestedForName status fulfilmentDecision "
         + "spendRequestId spendRequestNumber createdAt items.rawItemName items.unit "
-        + "items.requestedQty items.issuedQty items.buyQty items.rawItem items.rawItemSku items.variantId items.variantCombination")
+        + "items.requestedQty items.issuedQty items.buyQty items.rawItem items.rawItemSku items.variantId items.variantCombination "
+        /* `outstandingLines` reads both: a rejected line, or one still waiting on
+           the manager, is not something to buy. */
+        + "items.itemStatus items.approval")
       .sort({ createdAt: -1, _id: -1 })
       .limit(cap)
       .lean(),

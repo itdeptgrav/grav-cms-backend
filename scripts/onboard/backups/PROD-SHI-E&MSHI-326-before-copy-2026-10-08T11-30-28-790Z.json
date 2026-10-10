@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:28.792Z",
+ "productRef": "PROD-SHI-E&MSHI-326",
+ "stockItem": {
+  "_id": "6975a8c8cd0afcc274c2078b",
+  "reference": "PROD-SHI-E&MSHI-326",
+  "name": "E&M Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

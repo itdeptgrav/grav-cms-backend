@@ -113,4 +113,24 @@ async function peek({ companyId, documentType, at = new Date(), siteId = null })
   return { fiscalYear, issued: doc?.next || 0 };
 }
 
-module.exports = { DOCUMENT_TYPES, fiscalYearOf, allocate, format, peek };
+/**
+ * Move a counter FORWARD to at least `sequence` — never back.
+ *
+ * For a counter that fell behind documents that already exist (a database
+ * copied or restored with its documents but an older counter). `$max` makes it
+ * safe to race with `allocate`: whichever lands second still leaves the
+ * counter at the higher of the two, and no number is ever handed out twice.
+ */
+async function advanceTo({ companyId, documentType, fiscalYear, siteId = null, sequence }) {
+  const spec = DOCUMENT_TYPES[documentType];
+  if (!spec) throw fail("VALIDATION", `Unknown document type "${documentType}".`);
+  const n = Math.floor(Number(sequence));
+  if (!companyId || !fiscalYear || !Number.isFinite(n) || n < 0) return;
+  await SpDocumentSequence.findOneAndUpdate(
+    { companyId, documentType, fiscalYear, siteId: spec.perSite ? siteId || null : null },
+    { $max: { next: n } },
+    { upsert: true, setDefaultsOnInsert: true },
+  );
+}
+
+module.exports = { DOCUMENT_TYPES, fiscalYearOf, allocate, advanceTo, format, peek };

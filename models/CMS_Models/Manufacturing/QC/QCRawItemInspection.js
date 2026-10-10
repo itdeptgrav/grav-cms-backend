@@ -58,6 +58,15 @@ const schema = new mongoose.Schema(
     purchaseOrderNumber: { type: String, default: "", trim: true },
     vendorName:   { type: String, default: "", trim: true },
 
+    /* which goods receipt the label was received under (8 Oct 2026) — the unit
+       of raw-material QC work for a material-request GRN; null for a label
+       printed from stock on hand */
+    goodsReceiptId:     { type: mongoose.Schema.Types.ObjectId, ref: "GoodsReceipt", default: null, index: true },
+    goodsReceiptNumber: { type: String, default: "", trim: true },
+    goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    materialRequestId:  { type: mongoose.Schema.Types.ObjectId, default: null },
+    materialRequestNumber: { type: String, default: "", trim: true },
+
     /* the verdict, as quantities */
     status:            { type: String, enum: STATUSES, required: true, index: true },
     passedQuantity:    { type: Number, required: true, min: 0 },
@@ -71,6 +80,51 @@ const schema = new mongoose.Schema(
     inspectedByBiometricId: { type: String, default: "", trim: true },
     inspectedAt:            { type: Date, default: Date.now, index: true },
 
+    /* ── THE STORE-SIDE EFFECT OF A DEFECT (10 Oct 2026) ─────────────────────
+       A defective verdict takes `defectiveQuantity` off the raw item's (and
+       variant's) on-hand and off the label, with a stock transaction on the
+       RawItem — see services/manufacturing/qcDefectStock.service.js. This block
+       is the receipt: whether it landed, the before/after it saw, which
+       transaction row it wrote, and — once a re-check replaces this verdict —
+       the credit that put it back. `applied: false` with an `error` means the
+       verdict stands but the Store's figures did not move, and says why. */
+    stockDebit: {
+      type: new mongoose.Schema({
+        applied:  { type: Boolean, default: false },
+        at:       { type: Date, default: null },
+        quantity: { type: Number, default: 0 },          // in the label's unit
+        unit:     { type: String, default: "" },
+        baseQuantity: { type: Number, default: null },  // in the item's registered unit
+        baseUnit:     { type: String, default: "" },
+        rawItemId:    { type: mongoose.Schema.Types.ObjectId, default: null },
+        variantId:    { type: mongoose.Schema.Types.ObjectId, default: null },
+        transactionId: { type: mongoose.Schema.Types.ObjectId, default: null },  // RawItem.stockTransactions[]._id
+        previousQuantity: { type: Number, default: null },
+        newQuantity:      { type: Number, default: null },
+        variantPreviousQuantity: { type: Number, default: null },
+        variantNewQuantity:      { type: Number, default: null },
+        labelBefore: { type: Number, default: null },
+        labelAfter:  { type: Number, default: null },
+        location: {
+          type: new mongoose.Schema({
+            warehouseId:  { type: mongoose.Schema.Types.ObjectId, default: null },
+            locationId:   { type: mongoose.Schema.Types.ObjectId, default: null },
+            locationCode: { type: String, default: "" },
+            quantity:     { type: Number, default: 0 },
+            movementId:   { type: mongoose.Schema.Types.ObjectId, default: null },
+          }, { _id: false }),
+          default: null,
+        },
+        error:     { type: String, default: "" },
+        errorCode: { type: String, default: "" },
+        /* set when a re-check replaced this verdict and the debit was put back */
+        reversedAt:            { type: Date, default: null },
+        reversalTransactionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        reversedById:          { type: mongoose.Schema.Types.ObjectId, default: null },
+      }, { _id: false }),
+      default: null,
+    },
+
     /* a re-check of the same sticker on the same order supersedes this one */
     superseded:     { type: Boolean, default: false, index: true },
     supersededById: { type: mongoose.Schema.Types.ObjectId, default: null },
@@ -83,6 +137,7 @@ schema.index({ manufacturingOrderId: 1, superseded: 1, inspectedAt: -1 });
 schema.index({ barcodeId: 1, manufacturingOrderId: 1, superseded: 1 });
 schema.index({ inspectedByEmail: 1, date: 1 });
 schema.index({ date: 1, superseded: 1 });
+schema.index({ goodsReceiptId: 1, superseded: 1 });
 
 module.exports = mongoose.models.QCRawItemInspection || mongoose.model("QCRawItemInspection", schema);
 module.exports.STATUSES = STATUSES;

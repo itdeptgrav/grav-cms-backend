@@ -40,6 +40,11 @@ beforeAll(async () => {
      field-sensitive decision, which happens before any handler runs. The
      handler is represented by "the write would have happened here". */
   app.use("/api/employees", async (req, res) => {
+    /* What the real chain does with a create the contract MARKED for the owner
+       (pay from a non-owner, 5 Oct 2026): the department guard holds it, and
+       the create handler refuses it as a backstop. Either way, nothing here
+       is written. */
+    if (req.holdForOwner) return res.status(202).json({ held: true, requiredRole: "owner" });
     if (req.method !== "GET") {
       const patch = req.body?.updates || req.body || {};
       await Employee.updateOne({ _id: target._id }, { $set: patch });
@@ -149,11 +154,21 @@ describe("access grants are never writable through an HR employee route", () => 
 });
 
 describe("salary needs compensation.write, and only an owner has it", () => {
-  test("an editor cannot create, update or bulk-update a salary", async () => {
+  test("an editor's NEW employee with a salary goes to the owner, and writes nothing", async () => {
+    /* Owner's rule, 5 Oct 2026: not refused — held for the owner. The
+       security property is unchanged: an editor still cannot SET pay. */
+    const token = await hrUser("editor");
+    const r = await send("POST", "/api/employees", token, { firstName: "New", salary: { gross: 100000 } });
+    expect({ status: r.status, held: r.body.held, requiredRole: r.body.requiredRole }).toEqual({
+      status: 202, held: true, requiredRole: "owner",
+    });
+    expect((await reload()).salary.gross).not.toBe(100000);
+  });
+
+  test("an editor cannot update or bulk-update a salary", async () => {
     const token = await hrUser("editor");
 
     for (const [method, path, body] of [
-      ["POST", "/api/employees", { firstName: "New", salary: { gross: 100000 } }],
       ["PUT", `/api/employees/${target._id}`, { salary: { gross: 100000 } }],
       ["PUT", `/api/employees/${target._id}`, { bankDetails: { accountNumber: "1" } }],
       ["PATCH", "/api/employees/bulk-update", {

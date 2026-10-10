@@ -35,12 +35,16 @@ async function resolveActorNames(ids) {
   const oids = [...want].map((s) => new mongoose.Types.ObjectId(s));
   const Employee = mongoose.models.Employee || require("../models/Employee");
   const DeptUser = mongoose.models.DeptUser || require("../models/Access/DeptUser");
-  const [emps, depts] = await Promise.all([
+  const DepartmentRole = mongoose.models.DepartmentRole || require("../models/Access/DepartmentRole");
+  const SalesDepartment = mongoose.models.SalesDepartment || require("../models/SalesDepartment");
+  const [emps, depts, roles, legacy] = await Promise.all([
     Employee.find({ _id: { $in: oids } }).select("firstName middleName lastName name email").lean().catch(() => []),
     DeptUser.find({ _id: { $in: oids } }).select("name email").lean().catch(() => []),
+    DepartmentRole.find({ _id: { $in: oids } }).select("name email").lean().catch(() => []),
+    SalesDepartment.find({ _id: { $in: oids } }).select("name email").lean().catch(() => []),
   ]);
   for (const e of emps) { const n = employeeName(e); if (n) out.set(String(e._id), n); }
-  for (const d of depts) { const n = d.name || d.email || ""; if (n && !out.has(String(d._id))) out.set(String(d._id), n); }
+  for (const list of [depts, roles, legacy]) for (const d of list) { const n = d.name || d.email || ""; if (n && !out.has(String(d._id))) out.set(String(d._id), n); }
   return out;
 }
 

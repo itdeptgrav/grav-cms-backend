@@ -1,3 +1,7 @@
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 const router = express.Router();
 const Department = require("../../models/HR_Models/Departments");
@@ -361,7 +365,7 @@ router.get("/:id/manager-candidates", EmployeeAuthMiddleware, async (req, res) =
     const holders = pairs.length
       ? await Employee.find({
           $and: [
-            { $or: [{ isActive: { $ne: false } }, { status: "active" }] },
+            { isActive: { $ne: false }, status: { $ne: "inactive" } }, // BOTH: either flag alone means they have left (5 Oct 2026)
             {
               $or: pairs.map((pr) => ({
                 department: new RegExp(`^${esc(pr.departmentName)}$`, "i"),
@@ -439,7 +443,7 @@ router.get("/:id/manager-candidates", EmployeeAuthMiddleware, async (req, res) =
 router.put("/:id/managers", EmployeeAuthMiddleware, async (req, res) => {
   try {
     const { user } = req;
-    if (user.role !== "hr_manager") {
+    if (!isHrOperator(req)) {
       return res.status(403).json({
         success: false,
         message: "Only HR can assign department managers",

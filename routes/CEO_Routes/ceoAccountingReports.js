@@ -76,25 +76,42 @@ async function resolveCompanyId(req) {
   return co ? String(co._id) : null;
 }
 
-function mintReadToken() {
-  return jwt.sign(
-    {
-      id: "ceo-readonly-proxy",
-      role: "accountant",
-      userType: "accountant",
-      name: "CEO Read-Only",
-      _ceoProxy: true,
-    },
-    SECRET,
-    { expiresIn: "2m" },
-  );
+/* ── THE CEO READS AS THEIR OWN ACCOUNTING ACCOUNT (6 Oct 2026) ──────────────
+   This used to sign the internal request with a hand-made token in the OLD
+   CMS shape — `role: "accountant"`, no organisation. Accounting was then
+   hardened (Middlewear/AccountantOrgAuthMiddleware.js) to give that shape no
+   access at all, answering 401 ACCOUNTING_SESSION_UPGRADE_REQUIRED, and the
+   proxy passed that straight back: every CEO accounting page was refused.
+
+   Now it signs as the signed-in person's OWN accounting account (Acc_User,
+   matched by the email on their CEO session), with accounting's own
+   organisation-aware token — so accounting's permissions, company scoping
+   and revocation apply to the CEO exactly as to anybody else. Somebody with
+   no accounting account is told so, instead of being shown an upgrade
+   error about a session they never had. Short-lived; never leaves the
+   server. */
+async function mintReadToken(req) {
+  const { Acc_User } = require("../../models/Accountant_model/Acc_OrgModels");
+  const { signOrgToken } = require("../../Middlewear/AccountantOrgAuthMiddleware");
+  const email = String(req.ceoUser?.email || "").toLowerCase().trim();
+  if (!email) return null;
+  const user = await Acc_User.findOne({ email, isActive: { $ne: false } }).lean();
+  return user ? signOrgToken(user, "2m") : null;
 }
 
 // Forward a GET to an internal endpoint with the minted token; pass JSON through.
-async function passThrough(url, res) {
+async function passThrough(url, res, req) {
   try {
+    const token = await mintReadToken(req);
+    if (!token) {
+      return res.status(403).json({
+        success: false,
+        code: "NO_ACCOUNTING_ACCOUNT",
+        message: `${req.ceoUser?.email || "This account"} has no accounting account. Ask the accounting owner to add it (Accounting › Settings › Users).`,
+      });
+    }
     const r = await fetch(url, {
-      headers: { Authorization: `Bearer ${mintReadToken()}` },
+      headers: { Authorization: `Bearer ${token}` },
     });
     const text = await r.text();
     res.status(r.status);
@@ -147,7 +164,7 @@ async function proxyReport(reportPath, req, res) {
       params.set(k, req.query[k]);
   }
 
-  return passThrough(`${SELF_BASE}${reportPath}?${params.toString()}`, res);
+  return passThrough(`${SELF_BASE}${reportPath}?${params.toString()}`, res, req);
 }
 
 // ── Which company (for the page header) ────────────────────────────────────
@@ -219,6 +236,7 @@ router.get("/bank-recon/session/:id", ceoAuth, (req, res) =>
   passThrough(
     `${SELF_BASE}${ACC_RECON}/sessions/${encodeURIComponent(req.params.id)}`,
     res,
+    req,
   ),
 );
 
@@ -233,6 +251,7 @@ router.get("/ledger/:id/statement", ceoAuth, async (req, res) => {
       req.params.id,
     )}/statement?${params.toString()}`,
     res,
+    req,
   );
 });
 
@@ -250,6 +269,7 @@ router.get("/ledgers", ceoAuth, async (req, res) => {
   return passThrough(
     `${SELF_BASE}${ACC_COA}/ledgers?${params.toString()}`,
     res,
+    req,
   );
 });
 

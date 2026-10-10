@@ -99,9 +99,20 @@ const lower = (v) => str(v).toLowerCase();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
 
 async function configuredCompanyId() {
+  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+  /* UNSET on a deployment with exactly ONE company: there is one possible
+     answer, so take it, and write it where the content library and the
+     channel directory read it synchronously (they run after this, inside the
+     same request). Without this every Marketing page answered "Marketing's
+     company is not configured" on a database that has one company (found by
+     scripts/pageSweep.js, 6 Oct 2026). A value that IS set is never second-
+     guessed: set-but-wrong is a configuration error and is still reported. */
+  if (!str(process.env.MARKETING_COMPANY_ID)) {
+    const only = await Acc_Company.find({ isActive: { $ne: false }, deletedAt: null }).select("_id").limit(2).lean();
+    if (only.length === 1) process.env.MARKETING_COMPANY_ID = String(only[0]._id);
+  }
   const id = str(process.env.MARKETING_COMPANY_ID);
   if (!/^[a-f\d]{24}$/i.test(id)) return null;
-  const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
   const exists = await Acc_Company.exists({ _id: id });
   return exists ? new mongoose.Types.ObjectId(id) : null;
 }

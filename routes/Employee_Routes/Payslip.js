@@ -1,4 +1,8 @@
 "use strict";
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 const router = express.Router();
 
@@ -35,7 +39,7 @@ router.get("/:employeeId/history", AllEmployeeAppMiddleware, async (req, res) =>
         const { employeeId } = req.params;
 
         // Authorization: employee can only see their own payslips
-        if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
+        if (!isHrOperator(req) && String(user.id) !== String(employeeId)) {
             return res.status(403).json({
                 success: false,
                 message: "Access denied - you can only view your own payslips"
@@ -90,7 +94,7 @@ router.get("/:employeeId/pdf", AllEmployeeAppMiddleware, async (req, res) => {
         // this one streams a finished document, so a mistake here hands one
         // employee another's salary rather than a payload they still have to
         // render.
-        if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
+        if (!isHrOperator(req) && String(user.id) !== String(employeeId)) {
             return res.status(403).json({ success: false, message: "Access denied" });
         }
 
@@ -149,7 +153,7 @@ router.get("/:employeeId", AllEmployeeAppMiddleware, async (req, res) => {
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
         const year = parseInt(req.query.year) || new Date().getFullYear();
 
-        if (user.role !== "hr_manager" && String(user.id) !== String(employeeId)) {
+        if (!isHrOperator(req) && String(user.id) !== String(employeeId)) {
             return res.status(403).json({ success: false, message: "Access denied" });
         }
 

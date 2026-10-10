@@ -466,6 +466,8 @@ describe("the development BOM records identity, never somebody else's fact", () 
 
     for (const [field, owner] of [
       ["quantity", /R&D/], ["consumption", /R&D/], ["allowancePercent", /R&D/],
+      /* "consumptionPerPiece" + "consumptionUnit" are the ONE exception since 4 Oct
+         2026: the merchandiser's assumed figure, carried to Sales and R&D. */
       ["rate", /Costing/], ["unitCost", /Costing/],
       ["supplier", /Supply Chain/], ["purchaseOrder", /Store/], ["stock", /Store/],
     ]) {
@@ -483,6 +485,7 @@ describe("the development BOM records identity, never somebody else's fact", () 
     const paths = Object.keys(DevelopmentBomRevision.schema.path("rows").schema.paths);
     for (const banned of [
       "quantity", "consumption", "unit", "allowance", "allowancePercent", "wastage",
+      /* consumptionPerPiece / consumptionUnit are allowed (4 Oct 2026) — exact-name check below */
       "rate", "unitCost", "totalCost", "price", "supplier", "supplierId",
       "purchaseOrder", "stock", "reserved", "issueQuantity", "sampleResult",
     ]) {

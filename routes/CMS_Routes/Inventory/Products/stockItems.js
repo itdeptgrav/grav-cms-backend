@@ -1074,14 +1074,22 @@ router.get("/", async (req, res) => {
     if (String(req.query.sampledOnly || "") === "1") {
       const { SETTLED_SAMPLE_STATUSES } = require("../../../../services/sampleReadiness");
       const SampleStyle = require("../../../../models/CMS_Models/Sales/SampleStyle");
-      const approvedIds = await SampleStyle.distinct("sourceStockItemId", {
-        isActive: true,
-        "sample.status": { $in: SETTLED_SAMPLE_STATUSES },
-      });
-      // `sourceStockItemId` is sparse — styles for never-registered products
-      // have none — so distinct() can return nulls. Filtered out, or an $in
+      const settled = { isActive: true, "sample.status": { $in: SETTLED_SAMPLE_STATUSES } };
+      /* Two fields name the product a style settled (6 Oct 2026): a style
+         raised AGAINST a registered product carries `sourceStockItemId`; one
+         whose product was registered DURING development — every in-house
+         sample from the Sampling section, and any journey style registered by
+         R&D — carries only `production.stockItemId`. Reading the first alone
+         left every house-sampled product out of this picker, so the one flow
+         built to reuse them could not find them. */
+      const [sourceIds, producedIds] = await Promise.all([
+        SampleStyle.distinct("sourceStockItemId", settled),
+        SampleStyle.distinct("production.stockItemId", settled),
+      ]);
+      // Both fields are sparse — styles for never-registered products have
+      // neither — so distinct() can return nulls. Filtered out, or an $in
       // carrying null would match documents by accident.
-      filter._id = { $in: approvedIds.filter(Boolean) };
+      filter._id = { $in: [...new Set([...sourceIds, ...producedIds].filter(Boolean).map(String))] };
     }
 
     // ── Merchandiser/Production work-queue alerts (26 Aug 2026) ──────────────
@@ -1109,7 +1117,10 @@ router.get("/", async (req, res) => {
     const [totalItems, stockItems, statsAgg, missingRawItemsAgg, missingOperationsAgg] = await Promise.all([
       StockItem.countDocuments(filter),
       StockItem.find(filter)
-        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice status images variants hsnCode profitMargin operations genderCategory")
+        /* `attributes` and `baseSalesPrice` added 7 Oct 2026: the PI form
+           reads this list when it offers every product, and builds its size
+           table from them. Additive — every earlier field is unchanged. */
+        .select("name additionalNames reference category unit totalQuantityOnHand averageCost averageSalesPrice baseSalesPrice status images variants attributes hsnCode profitMargin operations genderCategory")
         .sort({ createdAt: -1 }).skip(skip).limit(limitNum),
       StockItem.aggregate([{
         $group: {

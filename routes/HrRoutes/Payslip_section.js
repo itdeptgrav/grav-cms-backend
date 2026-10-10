@@ -1,4 +1,8 @@
 "use strict";
+/* "May this request act as HR?" from the HR contract's own verdict — it used to
+   be `user.role !== "hr_manager"`, which refused the CEO and platform admins
+   the contract had already let in. See services/access/hrOperator.js. */
+const { isHrOperator } = require("../../services/access/hrOperator");
 const express = require("express");
 const router = express.Router();
 
@@ -56,7 +60,7 @@ router.get("/:employeeId/pdf", EmployeeAuthMiddlewear, async (req, res) => {
         const { employeeId } = req.params;
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
         const year = parseInt(req.query.year) || new Date().getFullYear();
-        if (user.role !== "hr_manager" && user.id !== employeeId)
+        if (!isHrOperator(req) && user.id !== employeeId)
             return res.status(403).json({ success: false, message: "Access denied" });
         const employee = await Employee.findById(employeeId).select("-password -temporaryPassword -__v").lean();
         if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
@@ -98,7 +102,7 @@ router.get("/:employeeId", EmployeeAuthMiddlewear, async (req, res) => {
         const { employeeId } = req.params;
         const month = parseInt(req.query.month) || new Date().getMonth() + 1;
         const year = parseInt(req.query.year) || new Date().getFullYear();
-        if (user.role !== "hr_manager" && user.id !== employeeId)
+        if (!isHrOperator(req) && user.id !== employeeId)
             return res.status(403).json({ success: false, message: "Access denied" });
         const employee = await Employee.findById(employeeId).select("-password -temporaryPassword -__v").lean();
         if (!employee) return res.status(404).json({ success: false, message: "Employee not found" });
@@ -119,7 +123,7 @@ router.get("/:employeeId/history", EmployeeAuthMiddlewear, async (req, res) => {
     try {
         const { user } = req;
         const { employeeId } = req.params;
-        if (user.role !== "hr_manager" && user.id !== employeeId)
+        if (!isHrOperator(req) && user.id !== employeeId)
             return res.status(403).json({ success: false, message: "Access denied" });
         const items = await PayrollItem.find({ employeeId })
             .sort({ year: -1, month: -1 }).limit(24)

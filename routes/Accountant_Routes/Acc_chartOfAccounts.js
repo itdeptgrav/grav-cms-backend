@@ -1005,6 +1005,61 @@ router.patch("/groups/:id/order", companyScope, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // LEDGERS — CRUD
 // ─────────────────────────────────────────────────────────────────────────────
+/* GET /chart-of-accounts/by-department?companyId=
+ *
+ * What Accounting › Departments and its drill-down read. The pages shipped
+ * calling this and the route never existed, so the sidebar entry answered 404
+ * for everybody (found by scripts/pageSweep.js, 6 Oct 2026).
+ *
+ * Departments and headcount are HR's — every CURRENT employee, grouped by
+ * their department. A balance is shown only where an Accounting ledger is
+ * actually linked to that employee (`linkedEmployeeId`); an employee with
+ * none is listed with `_id: null` and zero, never matched to a ledger by name.
+ * `totalPayable` adds the credit balances of those linked ledgers. */
+router.get("/by-department", companyScope, async (req, res) => {
+  try {
+    const companyId = req.companyId;
+    const db = mongoose.connection.db;
+    const [employees, ledgers] = await Promise.all([
+      db.collection("employees")
+        .find({ isActive: { $ne: false }, status: { $ne: "inactive" } })
+        .project({ firstName: 1, lastName: 1, biometricId: 1, identityId: 1, status: 1, department: 1 })
+        .toArray(),
+      Acc_Ledger.find({ companyId, linkedEmployeeId: { $ne: null }, deletedAt: null })
+        .select("name linkedEmployeeId openingBalance openingBalanceType currentBalance currentBalanceType")
+        .lean(),
+    ]);
+    const ledgerOf = new Map(ledgers.map((l) => [String(l.linkedEmployeeId), l]));
+    const signed = (amt, type) => (type === "Cr" ? -Math.abs(amt || 0) : Math.abs(amt || 0));
+
+    const groups = new Map();
+    for (const e of employees) {
+      const dept = String(e.department || "").trim() || "Unassigned";
+      if (!groups.has(dept)) groups.set(dept, { name: dept, employees: [], employeeCount: 0, totalPayable: 0, salaryExpenseLedger: null });
+      const g = groups.get(dept);
+      const l = ledgerOf.get(String(e._id));
+      const name = [e.firstName, e.lastName].filter(Boolean).join(" ");
+      const current = l ? signed(l.currentBalance, l.currentBalanceType) : 0;
+      g.employees.push({
+        _id: l ? l._id : null,
+        name: l ? l.name : name,
+        openingBalance: l ? signed(l.openingBalance, l.openingBalanceType) : 0,
+        currentBalance: current,
+        currentBalanceType: l ? l.currentBalanceType : "Dr",
+        employee: { _id: e._id, name, employeeId: e.biometricId || "", identityId: e.identityId || "", status: e.status || "active" },
+      });
+      g.employeeCount++;
+      if (current < 0) g.totalPayable += -current;
+    }
+    const departments = [...groups.values()].sort((a, b) => a.name.localeCompare(b.name));
+    for (const d of departments) d.employees.sort((a, b) => a.employee.name.localeCompare(b.employee.name));
+    res.json({ success: true, departments });
+  } catch (err) {
+    console.error("[chart-of-accounts/by-department]", err);
+    res.status(500).json({ success: false, message: "Could not load departments." });
+  }
+});
+
 router.get("/ledgers", companyScopeOptional, async (req, res) => {
   try {
     const {

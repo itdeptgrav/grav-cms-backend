@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:41.661Z",
+ "productRef": "PROD-SHI-GMSHI-386",
+ "stockItem": {
+  "_id": "6a2298039c551a6a9fbe8913",
+  "reference": "PROD-SHI-GMSHI-386",
+  "name": "Gm shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

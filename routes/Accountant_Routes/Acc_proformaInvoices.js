@@ -329,6 +329,23 @@ router.get("/", companyScope, async (req, res) => {
 // -----------------------------------------------------------------------------
 // GET /:id — single PI with seller + bank info for the detail page / PDF
 // -----------------------------------------------------------------------------
+/* GET /next-number?companyId=&date= — the number the form previews. The new-PI
+   page asked for it and it did not exist, so "next-number" fell into /:id and
+   came back "not a valid id" (pageSweep, 7 Oct 2026). Same allocator the save
+   uses (nextPINumber); it reserves nothing — save allocates again and a typed
+   number is still checked for clashes. MUST stay above /:id. */
+router.get("/next-number", companyScope, async (req, res) => {
+  try {
+    const companyId = req.companyId || req.query.companyId;
+    const date = req.query.date ? new Date(req.query.date) : new Date();
+    const voucherNumber = await nextPINumber(companyId, computeFY(isNaN(date) ? new Date() : date));
+    res.json({ success: true, voucherNumber });
+  } catch (e) {
+    console.error("[proforma-invoices/next-number]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+});
+
 router.get("/:id", companyScope, async (req, res) => {
   try {
     const pi = await Acc_ProformaInvoice.findById(req.params.id).lean();

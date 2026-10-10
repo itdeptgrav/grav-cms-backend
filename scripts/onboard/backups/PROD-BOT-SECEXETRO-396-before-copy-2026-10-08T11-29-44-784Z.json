@@ -1,0 +1,19 @@
+{
+ "takenAt": "2026-10-08T11:29:44.787Z",
+ "productRef": "PROD-BOT-SECEXETRO-396",
+ "stockItem": {
+  "_id": "69732ab6cb185373c591d60a",
+  "reference": "PROD-BOT-SECEXETRO-396",
+  "name": "Security Executive Trouser",
+  "measurements": [
+   "Length",
+   "Waist",
+   "Sheet",
+   "Thigh",
+   "Knee",
+   "Buttom",
+   "Crouch Kista Cut"
+  ]
+ },
+ "config": null
+}

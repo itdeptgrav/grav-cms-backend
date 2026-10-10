@@ -36,6 +36,9 @@ const purchaseWorkspace = require("../../../../services/storePurchase/purchaseWo
 /* A2: the one authority that decides whether a material purchase order may
    exist at all. Both creation journeys go through it. */
 const governed = require("../../../../services/storePurchase/governedPurchaseOrder.service");
+/* The person who raised the MRF is told when it is ordered and when it
+   arrives (10 Oct 2026, owner). Fire and forget, after the commit. */
+const poMail = require("../../../../services/storePurchase/purchaseOrderMail.service");
 const sequences = require("../../../../services/storePurchase/documentSequence.service");
 const actionHistory = require("../../../../services/storePurchase/actionHistory.service");
 const approvalPolicy = require("../../../../services/storePurchase/approvalPolicy.service");
@@ -1146,6 +1149,7 @@ router.post(
        been issued to anybody, and both of those used to fire during creation
        whenever the body said ISSUED. They belong to the transition endpoint,
        which is the only place issuance now happens. */
+    if (purchaseOrder.sourceMrfId) poMail.notifyPurchaseOrderCreatedForMrf(purchaseOrder._id).catch(() => {});
 
     const body = {
       success: true,
@@ -1231,8 +1235,13 @@ router.put(
      * This route used to accept `status` and assign it directly, which made
      * it a second, unguarded way to issue or cancel an order: no issue
      * capability, no approval policy, no reason, no history. Status changes
-     * belong to PATCH /:id/status and nowhere else. */
-    if (req.body?.status !== undefined) {
+     * belong to PATCH /:id/status and nowhere else.
+     *
+     * "DRAFT" itself is not a change: only a draft is editable (below), and
+     * the edit form sent `status: "DRAFT"` on every save, so adding a product
+     * to a draft was refused with this message (owner, 7 Oct 2026). It is
+     * ignored; any other value is still refused. */
+    if (req.body?.status !== undefined && String(req.body.status).toUpperCase() !== "DRAFT") {
       throw fail(
         "VALIDATION",
         "An order's status is changed from the order itself, not by editing it.",
@@ -1880,6 +1889,7 @@ async function handleGoodsReceipt(req, res, { includePurchaseOrder = false, succ
       },
     });
 
+    if (purchaseOrder.sourceMrfId) poMail.notifyGoodsReceiptForMrf(created._id).catch(() => {});
     const body = await withPO({ success: true, message: `Goods receipt ${created.receiptNumber} recorded.`, goodsReceipt: created });
     return req.idempotent
       ? await req.idempotent.succeed(successStatus, body, { entityType: ENTITY, entityId: purchaseOrder._id })

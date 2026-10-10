@@ -478,6 +478,9 @@ const quotationItemSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+    /* true when the sales person set the rate by hand on the PI (9 Oct 2026);
+       the quotation routes then keep it instead of the price slab. */
+    gstManual: { type: Boolean, default: false },
     priceBeforeGST: {
       type: Number,
       min: 0,
@@ -686,6 +689,12 @@ const quotationSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesDepartment",
     },
+    /* The preparer's NAME and the moment, kept on the document itself
+       (6 Oct 2026, owner: "showcase who created this PI"). `preparedBy` is
+       an id into a collection the reader may not be able to open; a record
+       says who did it in words. */
+    preparedByName: { type: String, trim: true, default: "" },
+    preparedAt: { type: Date },
 
     // ── NEGOTIATION ────────────────────────────────────────────────────────
     // A price that goes to a customer is rarely the price they accept. Each
@@ -1364,6 +1373,91 @@ customerRequestSchema.index(
    what makes that run reversible: the batch identity, who authorised it, and
    exactly which references it assigned. Absent on every record created since,
    because those lines were minted by the hook below as they were written. */
+/* ── MATERIAL REQUESTS FROM PPC TO THE STORE (4 Oct 2026, owner) ──────────
+   "The store person can issue as much qty he wants against that order — a
+   request-based approach is needed on the PPC side." PPC raises a request
+   (raw item, variant, quantity, unit, reason); the Store issues against it and
+   every such issue names the request and the line (StockIssuance). Embedded
+   on the order rather than in a collection of its own — the cluster is at its
+   collection cap. Status is derived from the issues at read time
+   (services/ppc/materialRequests.service.js); only "cancelled" is stored. */
+const materialRequestPerson = { userId: { type: String, trim: true, default: "" }, name: { type: String, trim: true, default: "" }, email: { type: String, trim: true, default: "" } };
+customerRequestSchema.add({
+  materialRequests: [
+    new mongoose.Schema(
+      {
+        requestNumber: { type: String, trim: true, default: "" },
+        /* ── TWO KINDS OF REQUEST SHARE THIS ARRAY (7 Oct 2026) ─────────────
+           `source: "ppc"` (the default, every request before this date) asks
+           the Store to ISSUE material from stock against the order; its
+           status is derived from StockIssuance. `source: "merchandising"`
+           asks the Store to BRING material IN for the order — the Store
+           records goods receipts against it, so its lines carry a received
+           figure and its status is derived from those. The PPC views skip
+           merchandising requests; the Store's Purchase register lists them. */
+        source: { type: String, enum: ["ppc", "merchandising"], default: "ppc" },
+        companyId: { type: mongoose.Schema.Types.ObjectId, default: null },
+        status: {
+          type: String,
+          enum: ["draft", "open", "partially_issued", "issued", "partially_received", "received", "cancelled"],
+          default: "open",
+        },
+        /* Merchandising requests only: a DRAFT is the merchandiser's own —
+           editable, withdrawable, invisible to the Store — until submitted. */
+        submittedAt: { type: Date, default: null },
+        submittedBy: materialRequestPerson,
+        updatedAt: { type: Date, default: null },
+        reason: { type: String, trim: true, default: "" },
+        neededBy: { type: Date, default: null },
+        /* A merchandising request's replay key: the same key on the same
+           order answers the request already raised instead of a second one. */
+        idempotencyKey: { type: String, trim: true, default: "" },
+        lines: [
+          new mongoose.Schema(
+            {
+              rawItemId: { type: mongoose.Schema.Types.ObjectId, ref: "RawItem", required: true },
+              rawItemName: { type: String, trim: true, default: "" },
+              rawItemSku: { type: String, trim: true, default: "" },
+              variantId: { type: mongoose.Schema.Types.ObjectId, default: null },
+              variantCombination: [{ type: String, trim: true }],
+              quantity: { type: Number, required: true, min: 0 },
+              unit: { type: String, trim: true, default: "" },
+              note: { type: String, trim: true, default: "" },
+              /* Merchandising requests only: what the Store has received
+                 against this line, in the line's unit. */
+              receivedQuantity: { type: Number, default: 0, min: 0 },
+            },
+            { _id: true },
+          ),
+        ],
+        /* Merchandising requests only: one row per goods receipt recorded. */
+        receipts: [
+          new mongoose.Schema(
+            {
+              goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+              receiptNumber: { type: String, trim: true, default: "" },
+              receivedAt: { type: Date, default: Date.now },
+              byName: { type: String, trim: true, default: "" },
+              lines: [{
+                lineId: { type: mongoose.Schema.Types.ObjectId },
+                quantity: { type: Number, default: 0 },
+                unit: { type: String, trim: true, default: "" },
+              }],
+            },
+            { _id: true },
+          ),
+        ],
+        createdBy: materialRequestPerson,
+        createdAt: { type: Date, default: Date.now },
+        cancelledAt: { type: Date, default: null },
+        cancelledBy: materialRequestPerson,
+        cancelReason: { type: String, trim: true, default: "" },
+      },
+      { _id: true },
+    ),
+  ],
+});
+
 customerRequestSchema.add({
   lineRefBackfill: {
     batchId: { type: String, trim: true },

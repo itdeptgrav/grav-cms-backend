@@ -191,6 +191,11 @@ async function routeLine({ tenant, mrf, line, owner, actor }) {
   if (["REJECTED", "UNFULFILLED"].includes(str(line.itemStatus))) {
     return { ...base, outcome: OUTCOME.LINE_CLOSED, message: "This line is closed." };
   }
+  /* Its request reached the Store because a sibling line was approved; this
+     one is still with the manager. Its approval routes it then. */
+  if (line.approval && line.approval.decision === "PENDING") {
+    return { ...base, outcome: OUTCOME.LINE_CLOSED, message: "This line is still waiting for the manager's approval." };
+  }
   const quantity = Number(line.requestedQty);
   /* `Number(null)` and `Number("")` are both 0 and both finite, so a blank
      quantity would otherwise read as a deliberate zero. */

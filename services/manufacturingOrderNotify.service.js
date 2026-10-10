@@ -30,6 +30,10 @@ const { notifyEvent, APP_URL } = require("./departmentNotify.service");
 const { buildManufacturingOrderPdf } = require("./manufacturingOrderPdf");
 const { resolveOrderOrigin } = require("./orderOrigin");
 const { personsOnOrder } = require("./personRoster");
+/* Photo + one line per variant, shared by every mail that lists an order
+   (9 Oct 2026, owner: "variant wise detail is not showing properly ... the
+   product photo is not coming"). */
+const orderLines = require("./mail/orderLinesMail");
 
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
   { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
@@ -50,7 +54,7 @@ const prettyDate = (d) =>
  * @param {object} request     the CustomerRequest just moved to production
  * @param {Array}  workOrders  the WorkOrders raised for it
  */
-async function notifyManufacturingOrderCreated(request, workOrders = []) {
+async function notifyManufacturingOrderCreated(request, workOrders = [], stock = null) {
   try {
     if (!request) return { sent: 0, skipped: "no-request" };
 
@@ -59,6 +63,7 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
     const items = request.items || [];
     const totalQty = items.reduce((s, i) => s + (i.totalQuantity || 0), 0);
     const productNames = items.map((i) => i.stockItemName).filter(Boolean);
+    if (!stock) stock = await orderLines.loadStock(items.map((i) => i.stockItemId));
 
     // ── The PDF, if the PM wants one ────────────────────────────────────
     // Its own switch, separate from the template's — see ProductionSettings.
@@ -79,20 +84,17 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
     // The request asked for "total WO, wo wise" — a count alone does not let
     // the PM plan, and the PDF is the formal record rather than the thing
     // somebody reads on a phone.
-    const woRows = workOrders.slice(0, 40).map((wo) => `
-      <tr>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-family:monospace;font-size:12px">${esc(workOrderLabel(wo))}</td>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px">${esc(wo.stockItemName || wo.productName || "—")}</td>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px;text-align:right">${esc(wo.quantity ?? wo.totalQuantity ?? "—")}</td>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px">${esc(String(wo.status || "pending").replace(/_/g, " "))}</td>
-      </tr>`).join("");
+    /* Each row names its variant and carries its photo: the same product
+       appears once per size, and "Chef Trouser" five times told nobody
+       which size was which. */
+    const woRows = orderLines.workOrderRowsHtml(workOrders, stock, workOrderLabel, 40);
 
     const woTable = workOrders.length ? `
       <h4 style="margin:20px 0 6px;font-size:13px">Work orders (${workOrders.length})</h4>
       <table style="width:100%;border-collapse:collapse;border:1px solid #eee">
         <thead><tr style="background:#f3f4f6">
           <th style="padding:6px 8px;text-align:left;font-size:11px;color:#666">WORK ORDER</th>
-          <th style="padding:6px 8px;text-align:left;font-size:11px;color:#666">PRODUCT</th>
+          <th style="padding:6px 8px;text-align:left;font-size:11px;color:#666">PRODUCT &middot; VARIANT</th>
           <th style="padding:6px 8px;text-align:right;font-size:11px;color:#666">QTY</th>
           <th style="padding:6px 8px;text-align:left;font-size:11px;color:#666">STATUS</th>
         </tr></thead>
@@ -100,29 +102,8 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
       </table>
       ${workOrders.length > 40 ? `<p style="font-size:11px;color:#888">…and ${workOrders.length - 40} more. The attached PDF lists every one.</p>` : ""}` : "";
 
-    // Per-product breakdown with quantities and variants.
-    const productRows = items.map((i) => {
-      const variants = (i.variants || [])
-        .map((v) => {
-          const attrs = Array.isArray(v.attributes) ? v.attributes.map((a) => a?.value).filter(Boolean).join(" / ") : "";
-          return `${esc(attrs || "base")} &times; ${esc(v.quantity || 0)}`;
-        }).join(" &nbsp;·&nbsp; ");
-      return `
-        <tr>
-          <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px">
-            <strong>${esc(i.stockItemName || "Unnamed product")}</strong>
-            ${i.stockItemReference ? `<br><span style="font-size:11px;color:#888">${esc(i.stockItemReference)}</span>` : ""}
-            ${variants ? `<br><span style="font-size:11px;color:#666">${variants}</span>` : ""}
-          </td>
-          <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px;text-align:right;white-space:nowrap">${esc(i.totalQuantity || 0)} pcs</td>
-        </tr>`;
-    }).join("");
-
-    const productTable = items.length ? `
-      <h4 style="margin:20px 0 6px;font-size:13px">Products (${items.length})</h4>
-      <table style="width:100%;border-collapse:collapse;border:1px solid #eee">
-        <tbody>${productRows}</tbody>
-      </table>` : "";
+    // Per-product breakdown: photo, then one line per variant with its quantity.
+    const productTable = orderLines.productLinesHtml(items, stock);
 
     // The order-type banner. First thing in the body, for the same reason it
     // is first in the PDF: a sampling run must not read as a customer's order.
@@ -133,9 +114,31 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
         <div style="font-size:12px;color:#555;margin-top:4px">${esc(origin.description)}</div>
       </div>`;
 
+    /* The commercial facts PPC plans against (7 Oct 2026, owner: "proper,
+       formal, informative … for the PPC department"): the PI, the customer's
+       PO, the order value, who released it and when. Read off the approved
+       quotation when there is one. */
+    const q = (request.quotations || []).find((x) => x?.status === "sales_approved") || (request.quotations || [])[0] || null;
+    const poNumber = q?.poProof?.poNumber || request.poProof?.poNumber || "";
+    let releasedBy = request.__releasedByName || "";
+    if (!releasedBy && q?.salesApproval?.approvedBy) {
+      /* the approver's id is a Sales user or a department user — read the name, never fail the mail */
+      try {
+        const id = q.salesApproval.approvedBy;
+        const sd = await require("../models/SalesDepartment").findById(id).select("name email").lean().catch(() => null);
+        const du = sd ? null : await require("../models/Access/DeptUser").findById(id).select("name email").lean().catch(() => null);
+        releasedBy = sd?.name || sd?.email || du?.name || du?.email || "";
+      } catch { /* unnamed */ }
+    }
+    const introHtml = `
+      <p style="font-size:13px;color:#333;margin:0 0 12px">Sales has released a new order to production. The details below are what the order was approved at;
+      the attached Manufacturing Order sheet is the formal record for planning. Please schedule the work orders against the delivery date and
+      raise any capacity or material concern with Sales before cutting begins.</p>`;
     return await notifyEvent("manufacturing_order_created", {
-      subject: `New Manufacturing Order ${moNumber} — ${origin.label}`,
-      heading: `Manufacturing Order ${moNumber} raised`,
+      subject: `New Manufacturing Order ${moNumber} — ${origin.label} · ${request.customerInfo?.name || "customer"} · ${totalQty} pcs`,
+      heading: `Manufacturing Order ${moNumber} released to production`,
+      bodyHtml: introHtml,
+      bodyText: "Sales has released a new order to production. The attached Manufacturing Order sheet is the formal record for planning.",
       // Placeholders for a PM-authored template. The banner and tables below
       // are facts about the record and stay with this call site — same rule
       // the sampling templates follow.
@@ -145,12 +148,20 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
         ["Order shape", personWiseOf(request) ? "Person-wise (measurement conversion)" : "Size-wise (bulk)"],
         ["MO number", moNumber],
         ["Customer", request.customerInfo?.name || "—"],
-        ["Total quantity", `${totalQty} pcs`],
+        ["Proforma invoice", q?.quotationNumber || "—"],
+        ["Customer PO", poNumber || "Not recorded"],
+        ["Order value", q?.grandTotal != null ? `₹${Number(q.grandTotal).toLocaleString("en-IN", { maximumFractionDigits: 2 })} incl. GST` : "—"],
+        ["Total quantity", `${totalQty} pcs across ${items.length} product${items.length === 1 ? "" : "s"}`],
         ["Work orders", String(workOrders.length)],
         ["Priority", String(request.priority || "medium").toUpperCase()],
         ["Delivery deadline", prettyDate(request.customerInfo?.deliveryDeadline)],
+        ["Released on", prettyDate(q?.salesApproval?.approvedAt || new Date())],
+        ...(releasedBy ? [["Released by", releasedBy]] : []),
+        ...(request.customerInfo?.description ? [["Order notes", String(request.customerInfo.description).slice(0, 300)]] : []),
       ],
       extraHtml: banner + productTable + woTable,
+      /* a preview / test send names its own recipients — see departmentNotify */
+      ...(Array.isArray(request.__onlyTo) ? { onlyTo: request.__onlyTo } : {}),
       ctaLabel: "Open Manufacturing Order",
       ctaUrl: moUrl(request),
       attachments,
@@ -170,8 +181,9 @@ async function notifyManufacturingOrderCreated(request, workOrders = []) {
 // and why the formats differ rather than one letter going to everyone.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const moUrl = (request) =>
-  `${APP_URL}/project-manager/dashboard/production/manufacturing-orders/${request._id}`;
+/* The order's page in PPC, the production control center (the old
+   /project-manager address only forwards there). */
+const moUrl = (request) => `${APP_URL}/ppc/orders/${request._id}`;
 
 const personWiseOf = (r) => Boolean(r?.requestType === "measurement_conversion" || r?.measurementId);
 
@@ -293,21 +305,12 @@ async function notifyOrderReleasedToProduction(request, workOrders = []) {
       <div style="font-size:12px;color:#555;margin-top:4px">${esc(origin.description)}</div>
     </div>`;
 
-  const productRows = items.map((i) => `
-      <tr>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px">
-          <strong>${esc(i.stockItemName || "Unnamed product")}</strong>
-          ${i.stockItemReference ? `<br><span style="font-size:11px;color:#888">${esc(i.stockItemReference)}</span>` : ""}
-        </td>
-        <td style="padding:6px 8px;border-bottom:1px solid #eee;font-size:12px;text-align:right;white-space:nowrap">${esc(i.totalQuantity || 0)} pcs</td>
-      </tr>`).join("");
-  const productTable = items.length
-    ? `<h4 style="margin:20px 0 6px;font-size:13px">Products (${items.length})</h4>
-       <table style="width:100%;border-collapse:collapse;border:1px solid #eee"><tbody>${productRows}</tbody></table>`
-    : "";
+  /* Read once for all four letters: the photos and variants of every product. */
+  const stock = await orderLines.loadStock(items.map((i) => i.stockItemId));
+  const productTable = orderLines.productLinesHtml(items, stock);
 
   const [pm, rnd, merch, sales] = await Promise.all([
-    notifyManufacturingOrderCreated(request, workOrders),
+    notifyManufacturingOrderCreated(request, workOrders, stock),
     sendAudienceNotice({
       eventKey: "mo_rnd_notice", audience: "rnd", request, workOrders,
       detailKeys: ["mo", "orderType", "shape", "qty", "deadline"],

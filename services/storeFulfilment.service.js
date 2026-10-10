@@ -70,6 +70,10 @@ const qty = (v) => {
 function remainingOn(item) {
   if (!item) return 0;
   if (["REJECTED", "UNFULFILLED"].includes(item.itemStatus)) return 0;
+  /* Still waiting on the manager. Its request reached the Store because a
+     SIBLING line was approved; this one has not been, so nothing is owed on it
+     yet — it must not be issued, priced or bought. */
+  if (item.approval && item.approval.decision === "PENDING") return 0;
   return Math.max(0, (Number(item.requestedQty) || 0) - (Number(item.issuedQty) || 0));
 }
 

@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:43.707Z",
+ "productRef": "PROD-SHI-HOTSHI-3453",
+ "stockItem": {
+  "_id": "6a7045ebda9bed3e006b36f2",
+  "reference": "PROD-SHI-HOTSHI-3453",
+  "name": "HOT Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

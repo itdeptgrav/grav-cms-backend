@@ -32,6 +32,8 @@ const DeptUser = require("../models/Access/DeptUser");
 const Employee = require("../models/Employee");
 const SalesSettings = require("../models/CMS_Models/Sales/SalesSettings");
 const { SAMPLING_TEMPLATE_DEFAULTS } = require("../models/CMS_Models/Sales/SalesSettings");
+const DepartmentRole = require("../models/Access/DepartmentRole");
+const { roleAtLeast } = DepartmentRole;
 
 // ── Event registry ──────────────────────────────────────────────────────────
 // key + label/description (read by the Sales Settings page) + the FIXED set
@@ -151,9 +153,17 @@ const EVENT_REGISTRY = [
     key: "manufacturing_order_created",
     label: "Manufacturing Order created",
     description:
-      "The Project Manager is notified whenever an order reaches production — with the order type " +
-      "(customer / sampling / internal / testing), its quantities, its work orders, and a PDF summary attached.",
-    departments: ["project-manager"],
+      "Production Planning & Control is notified whenever an order reaches production — with the order type " +
+      "(customer / sampling / internal / testing), its quantities, its work orders, and the Manufacturing Order " +
+      "sheet attached as a PDF. Goes to the PPC department and to everyone holding full control of PPC in Access Control.",
+    /* PPC absorbed the Production Manager portal (25 Sep 2026); the old
+       department row is kept beside it so nobody already receiving this
+       stops (7 Oct 2026, owner). */
+    departments: ["ppc", "project-manager"],
+    /* And the people Access Control names as FULL CONTROL of PPC, whatever
+       their primary department — the owner's own definition of who must
+       know (7 Oct 2026). */
+    roleRecipients: [{ slug: "ppc", minRole: "owner" }, { slug: "project-manager", minRole: "owner" }],
     templateKey: "manufacturingOrder",
     // This event's copy belongs to the PROJECT MANAGER, not Sales — it is
     // their own inbound notification, edited on their own settings page. See
@@ -257,6 +267,105 @@ const EVENT_REGISTRY = [
     label: "New product created — Production task",
     description: "The Production Supervisor is notified when a new product is created, with operations/costing as their next step.",
     departments: ["production-supervisor"],
+  },
+  /* ── THE DEVELOPMENT SELECTION (4 Oct 2026, owner) ────────────────────
+     Merchandising chooses the materials with an assumed consumption and
+     submits; SALES approves it from the style's BOM Approval step (which
+     also sends the style to R&D) or sends it back with a reason. Each mail
+     carries the product's details, its photos and the full material table. */
+  {
+    key: "development_bom_submitted",
+    label: "Materials submitted for Sales approval",
+    description: "Sales is notified when Merchandising submits the material selection (with assumed consumption) for a style.",
+    departments: ["sales"],
+  },
+  {
+    key: "development_bom_approved",
+    label: "Materials approved by Sales",
+    description: "Merchandising is notified when Sales approves the material selection and the style goes to R&D.",
+    departments: ["merchandiser"],
+  },
+  {
+    key: "development_bom_returned",
+    label: "Materials sent back by Sales",
+    description: "Merchandising is notified when Sales sends the material selection back with a reason.",
+    departments: ["merchandiser"],
+  },
+  /* ── SALES SETS THE SAMPLE QUANTITIES (4 Oct 2026, owner) ──────────────
+     After approving the tech sheet, Sales says how many of each product
+     variant the sample run makes; R&D is told, with the figures. */
+  {
+    key: "sample_quantities_set",
+    label: "Sample quantities set by Sales",
+    description: "R&D is notified when Sales sets the per-variant sample quantities after approving the tech sheet.",
+    departments: ["research-development"],
+  },
+  /* ── THE DEVELOPMENT ORDER, HANDLED BY IE (4 Oct 2026, owner) ──────────
+     R&D sends the order (variants, quantities, deadline) to Industrial
+     Engineering; IE assigns the operations, starts the run — which creates
+     the work orders — and completes it with the measured SAM per operation. */
+  {
+    key: "development_order_sent_to_ie",
+    label: "Development order sent to IE",
+    description: "Industrial Engineering is notified when R&D sends a development order, with the variants, quantities, deadline and approved BOM.",
+    departments: ["ie"],
+  },
+  {
+    key: "development_order_started",
+    label: "Development order started by IE",
+    description: "R&D is notified when IE starts processing a development order and its work orders reach the floor.",
+    departments: ["research-development"],
+  },
+  {
+    key: "development_order_completed",
+    label: "Development order completed by IE",
+    description: "R&D is notified when IE completes a development order, with the assumed and actual SAM per operation.",
+    departments: ["research-development"],
+  },
+  /* ── MATERIAL REQUESTS BETWEEN PPC AND THE STORE (4 Oct 2026, owner) ─── */
+  {
+    key: "ppc_material_request_raised",
+    label: "Material request raised by PPC",
+    description: "The Store is notified when PPC asks for raw material against an order, with the lines and the reason.",
+    departments: ["store"],
+  },
+  {
+    key: "store_material_request_issued",
+    label: "Store issued against a material request",
+    description: "PPC is notified when the Store issues raw material against one of its requests, with requested vs issued per line.",
+    departments: ["ppc"],
+  },
+  /* ── MERCHANDISING'S MATERIAL REQUESTS, AND THE MRF LETTERS (10 Oct 2026, owner) ──
+     "When a merchandiser raises a material request against an order the mail
+     comes to the Store … when a GRN is made against it the merchandiser gets
+     a mail … when a PO is created against an MRF, and when a GRN is made
+     against that PO, the employee who raised the MRF gets a mail — formal,
+     informative, with a PDF attached." The two MRF letters have NO department:
+     they go to the requester alone (`alsoTo`), whatever department they are
+     in — Store raised the order and does not need telling. */
+  {
+    key: "merch_material_request_submitted",
+    label: "Material request submitted by Merchandising",
+    description: "The Store is notified when Merchandising submits a material request against an order — the order, every raw item with its variant, quantity and unit, when it is needed, and the request as a PDF.",
+    departments: ["store"],
+  },
+  {
+    key: "merch_material_request_received",
+    label: "Goods receipt recorded against a Merchandising material request",
+    description: "Merchandising — and the person who raised the request — is notified when the Store records a goods receipt against it, line by line, with the receipt as a PDF.",
+    departments: ["merchandiser"],
+  },
+  {
+    key: "po_created_for_mrf",
+    label: "Purchase order raised for an MRF — tell the requester",
+    description: "The employee who raised a material request (MRF) is told when the Store raises a purchase order against it: supplier, lines, rates, expected delivery, and the purchase order as a PDF.",
+    departments: [],
+  },
+  {
+    key: "grn_recorded_for_mrf",
+    label: "Goods receipt against an MRF's purchase order — tell the requester",
+    description: "The employee who raised a material request (MRF) is told when the Store records a goods receipt against the purchase order raised for it, with the receipt as a PDF.",
+    departments: [],
   },
 ];
 const EVENT_BY_KEY = new Map(EVENT_REGISTRY.map((e) => [e.key, e]));
@@ -375,6 +484,25 @@ function addEmployee(map, e) {
  * EMAILED about it". That gap is the point: access is about permission, a
  * notification is about whose work it is.
  */
+/**
+ * Everyone Access Control grants at least `minRole` on a department — the
+ * "Owner · full control" holders when `minRole` is "owner" — whatever their
+ * primary department. A role row with company grants counts when any active
+ * grant reaches the role. Read beside `resolveDepartmentRecipients`, never
+ * instead of it (7 Oct 2026).
+ */
+async function resolveRoleRecipients(slug, minRole = "owner") {
+  const rows = await DepartmentRole.find({ departmentSlug: String(slug).toLowerCase(), isActive: true })
+    .select("email name role companyGrants").lean();
+  const out = [];
+  for (const r of rows) {
+    const grants = (r.companyGrants || []).filter((g) => g.isActive !== false).map((g) => g.role);
+    const roles = [r.role, ...grants].filter(Boolean);
+    if (roles.some((x) => roleAtLeast(x, minRole)) && r.email) out.push({ email: r.email.toLowerCase(), name: r.name || r.email });
+  }
+  return out;
+}
+
 async function resolveDepartmentRecipients(slug) {
   const dept = await AccessDepartment.findOne({ slug, isActive: true });
   if (!dept) return [];
@@ -488,7 +616,7 @@ function wrapEmail({ heading, bodyHtml, details, imageUrl, ctaLabel, ctaUrl, ext
  *   before this). Omitted entirely when empty, so every existing caller
  *   produces a byte-identical request to what it did before.
  */
-async function sendCmsEmail({ to, subject, html, text, attachments }) {
+async function sendCmsEmail({ to, cc, subject, html, text, attachments }) {
   if (process.env.ENABLE_EMAILS !== "true") {
     console.warn(`[departmentNotify] SKIPPED "${subject}" — ENABLE_EMAILS is not "true"`);
     return;
@@ -510,6 +638,7 @@ async function sendCmsEmail({ to, subject, html, text, attachments }) {
       {
         sender: { name: FROM_NAME, email: FROM_EMAIL },
         to: Array.isArray(to) ? to : [to],
+        ...(Array.isArray(cc) && cc.length ? { cc } : {}),
         subject,
         htmlContent: html,
         textContent: text,
@@ -548,6 +677,19 @@ async function sendCmsEmail({ to, subject, html, text, attachments }) {
  *   (events with a `templateKey`). Ignored by every other event.
  * @returns {Promise<{sent:number, skipped?:string}>}
  */
+/** The CC addresses Sales keeps for one event — lower-cased, de-duplicated, valid-looking. */
+async function ccFor(eventKey) {
+  try {
+    const SalesSettings = require("../models/CMS_Models/Sales/SalesSettings");
+    const s = await SalesSettings.findOne().select("departmentNotifications").lean();
+    const map = s?.departmentNotifications?.ccByEvent || {};
+    const list = map instanceof Map ? map.get(eventKey) : map[eventKey];
+    return [...new Set((Array.isArray(list) ? list : [])
+      .map((e) => String(e || "").trim().toLowerCase())
+      .filter((e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e)))];
+  } catch { return []; }
+}
+
 async function notifyEvent(eventKey, ctx = {}) {
   try {
     const event = EVENT_BY_KEY.get(eventKey);
@@ -564,9 +706,37 @@ async function notifyEvent(eventKey, ctx = {}) {
       return { sent: 0, skipped: "disabled" };
     }
 
-    const lists = await Promise.all(event.departments.map(resolveDepartmentRecipients));
+    /* Who gets it: the department's primary people (DeptUser rows, employees
+       whose star-marked department it is) AND, since 9 Oct 2026, everyone
+       Access Control names as OWNER (full control) of that department,
+       whatever their primary department. The owner's rule of 7 Oct 2026 for
+       the manufacturing-order mail ("everyone holding full control of PPC
+       must know") now holds for every event: a person given full control of
+       Sales, Merchandising, R&D, PPC or the Store is told what happens
+       there. Nothing else widened: an editor or viewer grant still receives
+       nothing unless the department is their primary. */
+    const lists = await Promise.all([
+      ...event.departments.map(resolveDepartmentRecipients),
+      ...event.departments.map((slug) => resolveRoleRecipients(slug, "owner")),
+      ...(event.roleRecipients || []).map((rr) => resolveRoleRecipients(rr.slug, rr.minRole)),
+    ]);
     const recipients = new Map();
     for (const list of lists) for (const r of list) recipients.set(r.email, r.name);
+    /* A preview or test send names its own recipients and nobody else
+       (7 Oct 2026) — the department lists above still decide whether the
+       event has an audience at all. */
+    if (Array.isArray(ctx.onlyTo) && ctx.onlyTo.length) {
+      const keep = new Set(ctx.onlyTo.map((e) => String(e).toLowerCase()));
+      for (const email of [...recipients.keys()]) if (!keep.has(email)) recipients.delete(email);
+      for (const email of keep) if (!recipients.has(email)) recipients.set(email, email);
+    }
+    /* `alsoTo` ADDS named people to the department's list — the person who
+       raised the document this event is about (10 Oct 2026), whatever their
+       department. An event with no departments reaches them alone. */
+    for (const e of Array.isArray(ctx.alsoTo) && !(Array.isArray(ctx.onlyTo) && ctx.onlyTo.length) ? ctx.alsoTo : []) {
+      const email = String(e || "").trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && !recipients.has(email)) recipients.set(email, email);
+    }
     if (!recipients.size) {
       // The single most likely cause of "the email never arrived": nobody
       // currently holds any of this event's departments in Access Control.
@@ -611,17 +781,22 @@ async function notifyEvent(eventKey, ctx = {}) {
     const textDetails = (ctx.details || []).filter(([, v]) => v).map(([l, v]) => `${l}: ${v}`).join("\n");
     const text = `${heading}\n\n${tplBody || ctx.bodyText || ""}${textDetails ? `\n\n${textDetails}` : ""}`;
 
-    await Promise.all(
-      [...recipients].map(([email, name]) =>
-        // `ctx.attachments` — `[{ name, content }]`, content a Buffer. Built by
-        // the call site (the Manufacturing Order PDF is the first user), never
-        // by a template: an attachment is a fact about the record, the same
-        // reasoning that keeps the details table and the CTA URL out of Sales'
-        // editable copy.
-        sendCmsEmail({ to: [{ email, name }], subject, html, text, attachments: ctx.attachments })),
-    );
-    console.log(`[departmentNotify] "${eventKey}" sent to ${recipients.size} recipient(s): ${[...recipients.keys()].join(", ")}`);
-    return { sent: recipients.size };
+    /* ── ONE SEND, WITH THE EVENT'S CC LIST (4 Oct 2026, owner) ─────────
+       Sales keeps a CC list per event (Sales → Settings → Department
+       notifications). The department's recipients are the `to`, the CC list
+       is copied once — sending per recipient, as before, would have copied
+       every CC address once per recipient. Addresses already in `to` are
+       not CC'd again. `ctx.attachments` — `[{ name, content }]` — is built
+       by the call site, never by a template. */
+    const cc = (await ccFor(eventKey))
+      .filter((email) => !recipients.has(email))
+      .map((email) => ({ email }));
+    await sendCmsEmail({
+      to: [...recipients].map(([email, name]) => ({ email, name })),
+      cc, subject, html, text, attachments: ctx.attachments,
+    });
+    console.log(`[departmentNotify] "${eventKey}" sent to ${recipients.size} recipient(s): ${[...recipients.keys()].join(", ")}${cc.length ? ` · cc ${cc.map((c) => c.email).join(", ")}` : ""}`);
+    return { sent: recipients.size, cc: cc.length };
   } catch (err) {
     console.error(`[departmentNotify] "${eventKey}" failed:`, err.message);
     return { sent: 0, skipped: "error" };
@@ -684,6 +859,7 @@ async function renderEventPreview(eventKey, ctx = {}) {
 }
 
 module.exports = {
+  resolveRoleRecipients,
   EVENT_REGISTRY, APP_URL, listEvents, listEventsWithTemplates, isEventEnabled, renderEventPreview,
   resolveDepartmentRecipients, notifyEvent, imageUrlFor, escapeHtml, interpolate,
 };

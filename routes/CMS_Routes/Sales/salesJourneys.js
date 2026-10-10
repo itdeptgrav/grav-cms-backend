@@ -1341,7 +1341,9 @@ router.post("/:journeyId/stage", salesAuth, async (req, res) => {
         samplesAwaitingCustomer: await require("../../../models/CMS_Models/Sales/SampleStyle").countDocuments({
           journeyId: journey._id,
           isActive: true,
-          "sample.status": "approved",
+          /* a style waived from sampling (picked from the register) still
+             needs THIS customer's yes — 6 Oct 2026, owner */
+          "sample.status": { $in: ["approved", "notApplicable"] },
           $or: [
             { "customerApproval.approved": { $ne: true } },
             { "customerApproval.approved": { $exists: false } },

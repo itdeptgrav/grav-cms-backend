@@ -314,7 +314,12 @@ function requireApproval(departmentSlug, opts = {}) {
       // Approver and above commit directly. Below editor should never have
       // reached this middleware, but if it is mounted without the role guard,
       // refuse rather than quietly queue a change from someone with no role.
-      if (roleAtLeast(role, "approver")) return next();
+      /* Marked for the owner by the HR contract (Middlewear/hrContract.js):
+         the caller may make this change except for a field only the owner may
+         set. An approver normally commits directly; this one is held like an
+         editor's, and only the owner may decide it. */
+      const forOwner = Boolean(req.holdForOwner) && !roleAtLeast(role, "owner");
+      if (!forOwner && roleAtLeast(role, "approver")) return next();
       if (!roleAtLeast(role, "editor")) {
         return res.status(403).json({
           success: false,
@@ -366,7 +371,7 @@ function requireApproval(departmentSlug, opts = {}) {
         method: req.method,
         changes: described.changes,
       });
-      if (!verdict.hold) {
+      if (!verdict.hold && !forOwner) {
         /* Left for the route's own logging and for auditTrail: this is now an
            ordinary write, and it should read as one in the history. Recorded
            on the request so a route that wants to say "committed directly,
@@ -405,6 +410,12 @@ function requireApproval(departmentSlug, opts = {}) {
         },
         requestedBy: actor,
         status: "pending",
+        ...(forOwner
+          ? {
+              requiredRole: "owner",
+              requiredRoleReason: `Sets ${(req.holdForOwner.fields || []).join(", ") || "pay"}, which only the owner may set.`,
+            }
+          : {}),
       });
 
       // The page's history has to show the submission, not only the outcome.
@@ -427,7 +438,10 @@ function requireApproval(departmentSlug, opts = {}) {
         success: true,
         held: true,
         code: "PENDING_APPROVAL",
-        message: "Sent for approval. It takes effect once an approver accepts it.",
+        message: forOwner
+          ? "Sent to the HR owner for approval. It takes effect once the owner accepts it."
+          : "Sent for approval. It takes effect once an approver accepts it.",
+        requiredRole: forOwner ? "owner" : "approver",
         changeRequest: {
           id: String(cr._id),
           entity: cr.entity,

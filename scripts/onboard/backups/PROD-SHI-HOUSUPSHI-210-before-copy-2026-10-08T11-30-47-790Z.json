@@ -1,0 +1,20 @@
+{
+ "takenAt": "2026-10-08T11:30:47.791Z",
+ "productRef": "PROD-SHI-HOUSUPSHI-210",
+ "stockItem": {
+  "_id": "6973215acb185373c591d4e1",
+  "reference": "PROD-SHI-HOUSUPSHI-210",
+  "name": "Housekeeping Supervisor Shirt",
+  "measurements": [
+   "Length",
+   "Chest",
+   "Stomach",
+   "Bottom hem",
+   "Shoulder",
+   "Sleeve Length",
+   "Cuff",
+   "Coller"
+  ]
+ },
+ "config": null
+}

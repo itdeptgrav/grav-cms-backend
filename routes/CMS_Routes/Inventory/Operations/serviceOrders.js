@@ -22,6 +22,8 @@ const Employee = require("../../../../models/Employee");
 const mrfApprover = require("../../../../services/mrfApprover.service");
 const { hasAll } = require("../../../../services/storePurchase/capabilities");
 const { requireTenant, CAPABILITIES } = require("../../../../Middlewear/storePurchaseTenant");
+const documentSequence = require("../../../../services/storePurchase/documentSequence.service");
+const tenantContext = require("../../../../services/storePurchase/tenantContext.service");
 
 /* Authenticate, THEN resolve the acting company through the established
    tenant/membership contract. `requireTenant` fails closed — a missing,
@@ -115,6 +117,13 @@ function isRequesterOf(emp, so) {
   return Boolean(mine) && mine === String(so.requestedById || "");
 }
 
+/* A direct order has no requesting department apart from Store, so the
+   people who operate it (sp.sourcing.manage) are also the ones who confirm
+   the work was done. A request-made order keeps the requester rule. */
+function mayAcceptOrder(emp, so, tenant) {
+  return isRequesterOf(emp, so) || (so.origin === "direct" && mayOperate(tenant));
+}
+
 const NEXT_ACTION = {
   DRAFT: "Issue to the supplier",
   ISSUED: "Mark started, or record completion",
@@ -176,6 +185,8 @@ const publicServiceOrder = (so, { detail = false } = {}) => ({
   nextAction: NEXT_ACTION[so.status] || "",
   spendRequestId: so.spendRequestId ? String(so.spendRequestId) : null,
   spendRequestNumber: so.spendRequestNumber || "",
+  origin: so.origin || (so.spendRequestId ? "spend_request" : "direct"),
+  vendorId: so.vendor ? String(so.vendor) : null,
   vendorName: so.vendorName || "",
   vendorGstin: so.vendorGstin || "",
   title: so.title || "",
@@ -192,6 +203,8 @@ const publicServiceOrder = (so, { detail = false } = {}) => ({
   lineCount: (so.lines || []).length,
   ...(detail ? {
     purpose: so.purpose || "",
+    expectedStartDate: so.expectedStartDate || null,
+    createdByName: so.createdByName || "",
     budgetLedgerName: so.budgetLedgerName || "",
     budgetLedgerId: so.budgetLedgerId ? String(so.budgetLedgerId) : null,
     lines: (so.lines || []).map((l) => ({
@@ -217,6 +230,167 @@ const publicServiceOrder = (so, { detail = false } = {}) => ({
       at: h.at, byName: h.byName || "", action: h.action || "", note: h.note || "",
     })),
   } : {}),
+});
+
+
+/* ══ CREATE — STORE RAISES A SERVICE ORDER DIRECTLY (7 Oct 2026) ═══════════
+ * Owner: the Store had no way to create a service order; the "Create service
+ * order" button sent them to the request desk, as if Store had to ask itself
+ * for the work. This makes the order from the form: supplier, what is being
+ * done, lines priced by the person raising it. It opens as a DRAFT and goes
+ * through the same lifecycle (issue → start → completion → acceptance) as an
+ * order made from a request; `origin: "direct"` is what lets Store accept it.
+ *
+ * Everything authoritative is computed here, never taken from the body: the
+ * number (the SVO sequence), the company (the tenant), net, GST and totals,
+ * the creator. A service picked from the master is re-read in this company
+ * and must be ACTIVE; its code, SAC and billing unit are snapshotted. A
+ * supplier picked from the register is re-read through the Store's tenancy
+ * filter and its name/GSTIN snapshotted; a typed name with no register row
+ * is accepted as text, as the request path accepts it.
+ */
+const money = (n) => Math.round((Number(n) || 0) * 100) / 100;
+const text = (v, max = 500) => String(v ?? "").trim().slice(0, max);
+const dateOrNull = (v) => {
+  if (!v) return null;
+  const d = new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+};
+
+router.post("/", async (req, res) => {
+  try {
+    if (!mayOperate(req.tenant)) {
+      return res.status(403).json({ success: false, message: "You need Store sourcing/operational access to create a service order." });
+    }
+    const emp = await actor(req);
+    if (!emp) return refuseUnlinkedStaff(res);
+    const body = req.body || {};
+    const companyId = req.tenant.companyId;
+
+    /* ── supplier ── */
+    let vendor = null, vendorName = text(body.vendorName, 200), vendorGstin = text(body.vendorGstin, 20);
+    if (body.vendor) {
+      if (!mongoose.isValidObjectId(body.vendor)) {
+        return res.status(400).json({ success: false, field: "vendor", message: "That supplier was not found." });
+      }
+      const Vendor = require("../../../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
+      const v = await Vendor.findOne({ _id: body.vendor, ...tenantContext.tenantFilter(req.tenant) })
+        .select("_id companyName gstNumber status").lean();
+      if (!v) return res.status(400).json({ success: false, field: "vendor", message: "That supplier was not found." });
+      if (["Blacklisted", "Archived"].includes(v.status)) {
+        return res.status(400).json({ success: false, field: "vendor", message: `${v.companyName} is ${v.status.toLowerCase()} and cannot be given a service order.` });
+      }
+      vendor = v._id; vendorName = v.companyName || vendorName; vendorGstin = v.gstNumber || vendorGstin;
+    }
+    if (!vendorName) {
+      return res.status(400).json({ success: false, field: "vendor", message: "Choose the supplier who will do the work." });
+    }
+
+    /* ── lines ── */
+    const raw = Array.isArray(body.lines) ? body.lines : [];
+    if (!raw.length) return res.status(400).json({ success: false, field: "lines", message: "Add at least one service line." });
+    if (raw.length > 100) return res.status(400).json({ success: false, field: "lines", message: "A service order holds at most 100 lines." });
+
+    const serviceIds = [...new Set(raw.map((l) => l?.service).filter((s) => s && mongoose.isValidObjectId(s)).map(String))];
+    const Service = require("../../../../models/CMS_Models/Inventory/Services/Service");
+    const masters = serviceIds.length
+      ? await Service.find({ _id: { $in: serviceIds }, companyId }).select("_id serviceCode name billingUnit sacCode status").lean()
+      : [];
+    const byId = new Map(masters.map((s) => [String(s._id), s]));
+
+    const lineErrors = [];
+    const lines = raw.map((l, i) => {
+      const n = i + 1;
+      let svc = null;
+      if (l?.service) {
+        svc = byId.get(String(l.service)) || null;
+        if (!svc) lineErrors.push({ line: n, message: `Line ${n}: that service is not in this company's service master.` });
+        else if (svc.status !== "ACTIVE") lineErrors.push({ line: n, message: `Line ${n}: ${svc.name} is inactive.` });
+      }
+      const description = text(l?.description, 500) || svc?.name || "";
+      if (!description) lineErrors.push({ line: n, message: `Line ${n}: say what service is being done.` });
+      const quantity = Number(l?.quantity);
+      if (!(quantity > 0)) lineErrors.push({ line: n, message: `Line ${n}: the quantity must be more than 0.` });
+      const rate = Number(l?.rate);
+      if (!(rate >= 0) || Number.isNaN(rate)) lineErrors.push({ line: n, message: `Line ${n}: the rate must be 0 or more.` });
+      const gstRate = Number(l?.gstRate ?? 0);
+      if (!(gstRate >= 0 && gstRate <= 100)) lineErrors.push({ line: n, message: `Line ${n}: GST must be between 0 and 100%.` });
+      const net = money((quantity > 0 ? quantity : 0) * (rate >= 0 ? rate : 0));
+      const gstAmount = money(net * (gstRate >= 0 && gstRate <= 100 ? gstRate : 0) / 100);
+      return {
+        spendLineId: null,
+        service: svc ? svc._id : null,
+        serviceCode: svc?.serviceCode || "",
+        serviceName: svc?.name || "",
+        description,
+        specification: text(l?.specification, 2000),
+        billingUnit: text(l?.billingUnit, 60) || svc?.billingUnit || "",
+        sacCode: text(l?.sacCode, 20) || svc?.sacCode || "",
+        quantity: quantity > 0 ? quantity : 0,
+        rate: rate >= 0 ? rate : 0,
+        netAmount: net,
+        gstRate: gstRate >= 0 && gstRate <= 100 ? gstRate : 0,
+        gstAmount,
+        lineTotal: money(net + gstAmount),
+        quoteRef: text(l?.quoteRef, 120),
+        expectedCompletionDate: dateOrNull(l?.expectedCompletionDate) || dateOrNull(body.expectedCompletionDate),
+      };
+    });
+    if (lineErrors.length) {
+      return res.status(400).json({ success: false, field: "lines", message: lineErrors[0].message, lineErrors });
+    }
+
+    const expectedStartDate = dateOrNull(body.expectedStartDate);
+    const expectedCompletionDate = dateOrNull(body.expectedCompletionDate);
+    if (expectedStartDate && expectedCompletionDate && expectedCompletionDate < expectedStartDate) {
+      return res.status(400).json({ success: false, field: "expectedCompletionDate", message: "The completion date is before the start date." });
+    }
+
+    const subtotal = money(lines.reduce((t, l) => t + l.netAmount, 0));
+    const taxAmount = money(lines.reduce((t, l) => t + l.gstAmount, 0));
+    const rates = [...new Set(lines.map((l) => l.gstRate))];
+    const taxMode = rates.length <= 1 ? "SINGLE_RATE" : "MIXED_RATE";
+
+    let serviceOrderNumber;
+    try {
+      serviceOrderNumber = (await documentSequence.allocate({ companyId, documentType: "SERVICE_ORDER", siteId: null })).number;
+    } catch {
+      return res.status(500).json({ success: false, message: "Could not allocate a service-order number. Try again." });
+    }
+
+    const who = mrfApprover.buildFullName(emp);
+    const title = text(body.title, 200) || lines[0].description;
+    const so = await ServiceOrder.create({
+      companyId,
+      siteId: null,
+      serviceOrderNumber,
+      spendRequestId: null,
+      spendRequestNumber: "",
+      origin: "direct",
+      vendor, vendorName, vendorGstin,
+      title,
+      purpose: text(body.purpose, 2000),
+      department: text(body.department, 120) || "Store & Purchase",
+      /* Store raised it, so Store is the requester of record. */
+      requestedBy: emp._id,
+      requestedById: String(emp.biometricId || emp.identityId || ""),
+      requestedByName: who,
+      lines,
+      subtotal, taxAmount, totalAmount: money(subtotal + taxAmount),
+      taxMode, taxRate: taxMode === "SINGLE_RATE" ? (rates[0] || 0) : 0,
+      expectedStartDate,
+      expectedCompletionDate: expectedCompletionDate || lines.map((l) => l.expectedCompletionDate).filter(Boolean)[0] || null,
+      status: "DRAFT",
+      createdBy: emp._id,
+      createdByName: who,
+      history: [{ at: new Date(), by: emp._id, byName: who, action: "created", note: "Raised directly by Store" }],
+    });
+
+    return res.status(201).json({ success: true, serviceOrder: publicServiceOrder(so.toObject(), { detail: true }) });
+  } catch (e) {
+    console.error("[service-order] create:", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
 });
 
 /* ══ REGISTER ═══════════════════════════════════════════════════════════════ */
@@ -293,6 +467,7 @@ router.get("/:id", async (req, res) => {
        so the whole page no longer collapses over it. */
     const emp = await actor(req);
     const isRequester = isRequesterOf(emp, so);
+    const canAccept = mayAcceptOrder(emp, so, req.tenant);
     /* Store may view any; the requester may view their own. */
     if (!canRead && !isRequester) {
       return res.status(403).json({ success: false, message: "This service order is not yours to view." });
@@ -333,7 +508,7 @@ router.get("/:id", async (req, res) => {
          person may take, using the SAME server-authoritative meaning. A read
          permission is `canRead`, never mislabelled as the right to operate.
          `canAccept` is the requester's right (accept / request rework). */
-      viewer: { canRead, canOperate, canAccept: isRequester, isRequester },
+      viewer: { canRead, canOperate, canAccept, isRequester },
       billing,
     });
   } catch (e) {
@@ -369,10 +544,12 @@ async function transition(req, res, {
     if (requireRequester) {
       /* Requester acceptance/correction needs no Store capability — only that
          this is their order, in their resolved company. */
-      if (!isRequesterOf(emp, so)) {
+      if (!mayAcceptOrder(emp, so, req.tenant)) {
         return res.status(403).json({
           success: false,
-          message: "Only the department that requested this service can accept it or ask for a correction.",
+          message: so.origin === "direct"
+            ? "Only Store, which raised this service order, can accept it or ask for a correction."
+            : "Only the department that requested this service can accept it or ask for a correction.",
         });
       }
     } else if (!mayOperate(req.tenant)) {

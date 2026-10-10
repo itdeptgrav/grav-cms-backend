@@ -317,6 +317,10 @@ router.post("/development/:fileId/bom/submit", requireCompany, canSelect, handle
     fileId: req.params.fileId, body: req.body || {},
     actor: actor(req), idempotencyKey: idempotencyKey(req),
   });
+  /* Sales is told, with the full material table (4 Oct 2026) — best effort */
+  require("../../../services/merchandising/developmentNotify.service")
+    .notifyDevelopmentBom("submitted", { companyId: req.merchandising.companyId, fileId: req.params.fileId, revisionNo: out?.revisionNo ?? null, actor: actor(req) })
+    .catch((e) => console.error("[developmentRoute] submit mail:", e?.message || e));
   return res.json({ success: true, ...out });
 }));
 

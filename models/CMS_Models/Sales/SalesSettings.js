@@ -138,6 +138,14 @@ const emailConfigSchema = new mongoose.Schema(
 const salesSettingsSchema = new mongoose.Schema(
   {
     // ── Sales Representative Profile ─────────────────────────────────────────
+    /* ── WHICH PRODUCTS THE PROFORMA INVOICE OFFERS (8 Oct 2026, owner) ──
+       "all"      every product in the register (the default)
+       "approved" only the products this customer approved in Style & Sample
+       Read by services/sales/piProductGate.js and published to the CMS as
+       flag.piAllProducts; the environment switch is the fallback when this
+       is unset. */
+    piProductScope: { type: String, enum: ["all", "approved"], default: "all" },
+
     repName:             { type: String, trim: true,    default: "Sales Team" },
     repEmail:            { type: String, trim: true, lowercase: true, default: "sales@grav.in" },
     repPhone:            { type: String, trim: true,    default: "+91 96920 90096" },
@@ -252,6 +260,12 @@ const salesSettingsSchema = new mongoose.Schema(
     // descriptions) the settings page reads.
     departmentNotifications: {
       disabledEvents: { type: [String], default: [] },
+      /* ── CC PER EVENT (4 Oct 2026, owner) ─────────────────────────────
+         "The cc input need to keep so that the employee who wants to be
+         notified for this approval, the sales person can also give access
+         to them." Event key → e-mail addresses copied on every send of
+         that event, beside the department's own recipients. */
+      ccByEvent: { type: Map, of: [String], default: {} },
     },
 
     // ── Sampling messages — the three Style & Sample hand-offs (28 Aug 2026) ──

@@ -10,6 +10,7 @@
 //   - GET /:id/measurements — MPC measurement sessions for a customer
 //   - profile.avatar field handled on create + update
 
+const requestLineStyles = require("../../../services/sales/requestLineStyles");
 const express = require("express");
 const mongoose = require("mongoose");
 const {
@@ -1037,9 +1038,25 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
           sampleStyleId = style._id;
         }
       }
+      /* ── THE LINE NAMES ITS APPROVED STYLE EVEN WHEN THE FORM DID NOT ──
+         The order form raises lines from the approved PRODUCT and sends no
+         style id, and a line with none is refused at release
+         ("names no approved style"). Resolved here from the product's own
+         settled style (7 Oct 2026) — see services/sales/requestLineStyles.js. */
+      if (!sampleStyleId) {
+        sampleStyleId = await requestLineStyles.resolveStyleForStockItem(stockItem._id, { customerId: customer._id });
+      }
+      /* The enquiry line's Job work tag and line reference travel with it
+         (7 Oct 2026) — without them every order from this form was
+         FULL_PACKAGE and Merchandising could never see a job-work order. */
+      const enquiryLine = sampleStyleId
+        ? await requestLineStyles.enquiryLineForStyle(sampleStyleId)
+        : null;
       validatedItems.push({
         stockItemId: stockItem._id,
         sampleStyleId,
+        ...(enquiryLine?.productLineRef ? { productLineRef: enquiryLine.productLineRef } : {}),
+        fulfilmentModel: enquiryLine?.fulfilmentModel || "FULL_PACKAGE",
         stockItemName: stockItem.name,
         stockItemReference: stockItem.reference,
         variants: validatedVariants,
@@ -1075,6 +1092,9 @@ router.post("/:id/create-request", salesAuth, async (req, res) => {
         preferredContactMethod: customerInfo.preferredContactMethod || "phone",
       },
       items: validatedItems,
+      // Order-level summary for older readers; the lines are the truth.
+      fulfilmentModel: validatedItems.every((l) => l.fulfilmentModel === "JOB_WORK")
+        ? "JOB_WORK" : "FULL_PACKAGE",
       status: "pending",
       priority: customerInfo.priority || "medium",
       createdBySales: true,

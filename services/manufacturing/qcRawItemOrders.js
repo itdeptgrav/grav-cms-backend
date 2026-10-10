@@ -38,6 +38,8 @@ const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkO
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const QCRawItemInspection = require("../../models/CMS_Models/Manufacturing/QC/QCRawItemInspection");
 const { CustomerMaterialLot } = require("../../models/CMS_Models/StorePurchase/CustomerMaterialLot");
+const GoodsReceipt = require("../../models/CMS_Models/StorePurchase/GoodsReceipt");
+const grns = require("./qcRawItemGrns");
 
 const oid = (v) => new mongoose.Types.ObjectId(String(v));
 const isId = (v) => mongoose.Types.ObjectId.isValid(String(v || "")) && /^[0-9a-f]{24}$/i.test(String(v));
@@ -59,6 +61,9 @@ const MO_SELECT =
 const SOURCE = Object.freeze({
   CUSTOMER: "CUSTOMER_SUPPLIED",
   FACTORY: "FACTORY_PROCURED",
+  /* Received by the Store against Merchandising's material request for an
+     order (8 Oct 2026): company stock, bought or drawn for THAT order. */
+  MATERIAL_REQUEST: "MATERIAL_REQUEST",
   OTHER: "OTHER",
   UNAVAILABLE: "UNAVAILABLE",
 });
@@ -66,6 +71,7 @@ const SOURCE = Object.freeze({
 const SOURCE_LABEL = Object.freeze({
   CUSTOMER_SUPPLIED: "Customer supplied",
   FACTORY_PROCURED: "Factory procured",
+  MATERIAL_REQUEST: "Material request",
   OTHER: "Other recorded ownership",
   UNAVAILABLE: "Unavailable",
 });
@@ -79,11 +85,16 @@ const SOURCE_LABEL = Object.freeze({
  * neither is genuinely unknown provenance and says so rather than being
  * assumed to be the factory's.
  */
-function labelSource(b) {
+function labelSource(b, receipt = null) {
   if (!b) return { source: SOURCE.UNAVAILABLE, sourceLabel: SOURCE_LABEL.UNAVAILABLE, owner: "" };
   const cm = b.customerMaterial || {};
   if (cm.lotId || cm.customerId || str(cm.customerLabel) || str(cm.orderRef)) {
     return { source: SOURCE.CUSTOMER, sourceLabel: SOURCE_LABEL.CUSTOMER_SUPPLIED, owner: str(cm.customerLabel) };
+  }
+  /* A label printed on a material-request GRN (8 Oct 2026): the receipt, when
+     the caller read it, says what the label was received against. */
+  if (receipt && receipt.kind === grns.KIND.MATERIAL) {
+    return { source: SOURCE.MATERIAL_REQUEST, sourceLabel: SOURCE_LABEL.MATERIAL_REQUEST, owner: str(receipt.order?.customerName) };
   }
   if (b.purchaseOrder || str(b.purchaseOrderNumber) || b.vendor || str(b.vendorName)) {
     return { source: SOURCE.FACTORY, sourceLabel: SOURCE_LABEL.FACTORY_PROCURED, owner: str(b.vendorName) };
@@ -176,16 +187,19 @@ async function requirementsByOrder(moIds = null) {
  * done, `received` is material sitting in the store waiting.
  */
 async function eligibleOrders({ ids = null } = {}) {
-  const [mos, reqs, checkedIds, customerLots] = await Promise.all([
+  const [mos, reqs, checkedIds, customerLots, mrGrnOrders] = await Promise.all([
     CustomerRequest.find(ids ? { ...LIVE_MO, _id: { $in: ids.map(oid) } } : LIVE_MO)
       .select(MO_SELECT).sort({ createdAt: -1 }).lean(),
     requirementsByOrder(ids),
     QCRawItemInspection.distinct("manufacturingOrderId", { superseded: { $ne: true } }).catch(() => []),
     CustomerMaterialLot.distinct("orderRef").catch(() => []),
+    /* orders the Store has received material-request GRNs for (8 Oct 2026) */
+    GoodsReceipt.distinct("materialRequest.customerRequestId", { sourceType: "MATERIAL_REQUEST", status: { $ne: "VOID" } }).catch(() => []),
   ]);
 
   const checked = new Set(checkedIds.map(idStr));
   const lotRefs = new Set(customerLots.map((r) => str(r)).filter(Boolean));
+  const grnOrders = new Set(mrGrnOrders.map(idStr).filter(Boolean));
 
   return mos.map((mo) => {
     const key = idStr(mo._id);
@@ -195,7 +209,8 @@ async function eligibleOrders({ ids = null } = {}) {
     const why = {
       requires: req.lines.size > 0,
       checked: checked.has(key),
-      received: hasCustomerMaterial,
+      received: hasCustomerMaterial || grnOrders.has(key),
+      receivedOnMaterialRequest: grnOrders.has(key),
     };
     return {
       mo,
@@ -237,13 +252,28 @@ async function eligibleOrders({ ids = null } = {}) {
  *              "choose" several — the caller must ask
  *              "none"   nothing — the caller must NOT invent one
  */
-async function resolveOrdersForLabel(b) {
-  if (!b) return { candidates: [], resolution: "none", reason: "No label was given." };
+async function resolveOrdersForLabel(b, receipt = undefined) {
+  if (!b) return { candidates: [], resolution: "none", reason: "No label was given.", receipt: null };
 
   const rawItemId = idStr(b.rawItem);
   const variantId = idStr(b.variantId);
 
-  const [byRef, priorRecords, requirementMap] = await Promise.all([
+  /* ── 0. THE GOODS RECEIPT THE LABEL WAS PRINTED ON (8 Oct 2026) ──────────
+     A label printed when the Store recorded a material-request GRN carries
+     that GRN, and the GRN names the request and the order it serves. That is
+     the strongest signal of all — stronger than "somebody needs this
+     material", which is what every such scan fell through to before, offering
+     a chooser of unrelated orders for a roll the Store had already booked in
+     against one. Read once by the caller when it has it. */
+  const grn = receipt === undefined ? await grns.receiptOfLabel(b) : receipt;
+  const grnOrderId = grn?.kind === grns.KIND.MATERIAL ? idStr(grn.customerRequestId) : "";
+  /* A label with NO receipt: the material-request GRNs that carry this material
+     are offered to the checker (8 Oct 2026, owner), and their orders are
+     candidates — a receipt recorded for an order is a far better reason than
+     "a work order allocates this item". */
+  const grnChoices = !grn && rawItemId ? await grns.grnsForMaterial({ rawItemId, variantId }) : [];
+
+  const [byRef, byGrn, priorRecords, requirementMap] = await Promise.all([
     /* 1. the label's own order reference */
     str(b.customerMaterial?.orderRef)
       ? CustomerRequest.find({
@@ -253,6 +283,10 @@ async function resolveOrdersForLabel(b) {
             { requestId: str(b.customerMaterial.orderRef).replace(/^MO-/i, "") },
           ],
         }).select(MO_SELECT).lean()
+      : Promise.resolve([]),
+    /* 1b. the order the label's GRN was recorded for */
+    isId(grnOrderId)
+      ? CustomerRequest.find({ _id: oid(grnOrderId) }).select(MO_SELECT).lean()
       : Promise.resolve([]),
     /* 2. where it has already been checked */
     QCRawItemInspection.find({ barcodeId: b._id, superseded: { $ne: true } })
@@ -287,6 +321,15 @@ async function resolveOrdersForLabel(b) {
   };
 
   for (const mo of byRef) add(mo, "label");
+  for (const mo of byGrn) add(mo, "label", { goodsReceiptNumber: grn.receiptNumber, materialRequestNumber: grn.requestNumber });
+  const choiceOrderIds = [...new Set(grnChoices.map((c) => c.manufacturingOrderId).filter(isId))];
+  if (choiceOrderIds.length) {
+    const mos = await CustomerRequest.find({ ...LIVE_MO, _id: { $in: choiceOrderIds.map(oid) } }).select(MO_SELECT).lean();
+    for (const mo of mos) {
+      const mine = grnChoices.filter((c) => c.manufacturingOrderId === idStr(mo._id));
+      add(mo, "grn-for-material", { goodsReceipts: mine.map((c) => c.receiptNumber) });
+    }
+  }
 
   /* The prior records need their orders looked up; they are few. */
   const priorIds = [...new Set(priorRecords.map((r) => idStr(r.manufacturingOrderId)))].filter(isId);
@@ -339,28 +382,52 @@ async function resolveOrdersForLabel(b) {
      it would invite somebody to overrule a recorded fact with a guess. */
   const fromLabel = candidates.filter((c) => c.matchedBy.includes("label"));
   if (fromLabel.length === 1) {
-    return { candidates: fromLabel, resolution: "auto", reason: "The label was received for this order." };
+    return {
+      candidates: fromLabel, resolution: "auto",
+      reason: grnOrderId ? `Received on ${grn.receiptNumber} against material request ${grn.requestNumber} for this order.` : "The label was received for this order.",
+      receipt: grn,
+      grnChoices,
+    };
   }
 
   /* A standing verdict is next: a recheck goes back where it came from. */
   const fromPrior = candidates.filter((c) => c.matchedBy.includes("already-checked"));
   if (fromPrior.length === 1 && fromLabel.length === 0) {
-    return { candidates: fromPrior, resolution: "auto", reason: "This label has already been checked on this order." };
+    return { candidates: fromPrior, resolution: "auto", reason: "This label has already been checked on this order.", receipt: grn, grnChoices };
   }
-
+  /* Then the orders a goods receipt for this material was recorded for. */
+  const fromGrn = candidates.filter((c) => c.matchedBy.includes("grn-for-material"));
+  /* An unknown label with receipts on record (owner, 8 Oct 2026): no order is
+     chosen first — the screen asks for the RECEIPT and the receipt decides the
+     order. `resolution: "grn"` opens the verdict with no order in hand; the
+     candidates ride along for the record. */
+  if (fromGrn.length >= 1 && fromLabel.length === 0 && fromPrior.length === 0) {
+    const carries = grnChoices.some((c) => c.carriesMaterial);
+    return {
+      candidates: fromGrn, resolution: "grn",
+      reason: carries
+        ? "This label was printed without a receipt. Choose the goods receipt it came with; the verdict is recorded against that receipt and its order."
+        : "No goods receipt carries this material. Choose the receipt it came with; the verdict is recorded against that receipt and its order.",
+      receipt: grn, grnChoices,
+    };
+  }
   if (candidates.length === 1) {
-    return { candidates, resolution: "auto", reason: "Only this order needs this material." };
+    return { candidates, resolution: "auto", reason: "Only this order needs this material.", receipt: grn, grnChoices };
   }
   if (candidates.length > 1) {
     return {
       candidates,
       resolution: "choose",
       reason: "This material is required by more than one active order.",
+      receipt: grn,
+      grnChoices,
     };
   }
   return {
     candidates: [],
     resolution: "none",
+    receipt: grn,
+    grnChoices,
     /* No invention. Naming the two reasons it can happen is what lets the
        checker fix it rather than assume the scanner is broken. */
     reason: rawItemId

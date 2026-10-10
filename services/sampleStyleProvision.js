@@ -181,6 +181,11 @@ async function provisionJourneyStyles({
             : undefined,
           techSheet: waive ? { status: "notApplicable", revisions: [] } : undefined,
           sample: waive ? { status: "notApplicable", rounds: [], revisions: [] } : undefined,
+          /* The customer's verdict is NOT waived (6 Oct 2026, owner, second
+             word: "only the 4 step need to skip … that customer approval part
+             need to keep"). Steps 1–4 are skipped for a product picked from
+             the register; the salesperson still sends it to THIS customer for
+             approval, and only that yes finishes the style. */
           // Recorded in the shared timeline, because "why was this never
           // sampled" is exactly the question somebody asks six months later —
           // and it names WHICH ground applied, so a waiver backed by a real

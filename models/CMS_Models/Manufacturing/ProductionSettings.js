@@ -74,7 +74,7 @@ const PRODUCTION_TEMPLATE_DEFAULTS = {
     subject: "New Manufacturing Order {moNumber} — {orderType} ({customer})",
     heading: "Manufacturing Order {moNumber} raised",
     bodyText:
-      "Dear Project Manager,\n\n" +
+      "Dear PPC Team,\n\n" +
       "A new Manufacturing Order has been released to production. The particulars are set out below, " +
       "and a detailed order summary is attached to this message for your records.\n\n" +
       "Order type: {orderType}\n" +
@@ -105,7 +105,7 @@ const PRODUCTION_TEMPLATE_DEFAULTS = {
       "Total quantity: {totalQty}\n" +
       "Delivery deadline: {deliveryDeadline}\n\n" +
       "The full specification, quantities and work-order breakdown are attached. If anything differs from the " +
-      "approved sample, kindly raise it with the Project Manager before production advances.\n\n" +
+      "approved sample, kindly raise it with the PPC Team before production advances.\n\n" +
       "Regards,\nGRAV Manufacturing Suite",
     ctaLabel: "View the order",
   },
@@ -145,7 +145,7 @@ const PRODUCTION_TEMPLATE_DEFAULTS = {
       "Products: {products}\n" +
       "Delivery deadline: {deliveryDeadline}\n\n" +
       "A summary of what is being made is attached, should the customer ask for confirmation in writing. " +
-      "Any change to quantity or specification from this point must go through the Project Manager.\n\n" +
+      "Any change to quantity or specification from this point must go through the PPC Team.\n\n" +
       "Regards,\nGRAV Manufacturing Suite",
     ctaLabel: "Open the order",
   },
@@ -155,7 +155,7 @@ const PRODUCTION_TEMPLATE_DEFAULTS = {
  *  audience each one addresses. Exported so the page and the routes agree on
  *  the list without either hardcoding a second copy. */
 const PRODUCTION_TEMPLATE_META = [
-  { key: "manufacturingOrder", event: "manufacturing_order_created", label: "Project Manager", audience: "projectManager",
+  { key: "manufacturingOrder", event: "manufacturing_order_created", label: "PPC Team", audience: "projectManager",
     blurb: "The production plan — quantities, work orders and deadlines." },
   { key: "researchDevelopment", event: "mo_rnd_notice", label: "R&D", audience: "rnd",
     blurb: "Confirmation that a developed style has entered production. Most useful on sampling orders." },
