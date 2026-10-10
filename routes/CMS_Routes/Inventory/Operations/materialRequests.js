@@ -41,6 +41,17 @@ router.post(
       actor: { id: req.user.id, name: req.user.name || "" },
       idempotent: req.idempotent || null,
     });
+    /* Merchandising, and whoever raised the request, are told (10 Oct 2026).
+       After the commit, fire and forget. */
+    if (!out.replayed && out.goodsReceipt?.materialRequest?.requestId) {
+      require("../../../../services/merchandising/materialRequestMail.service")
+        .notifyMaterialRequestReceived({
+          customerRequestId: out.goodsReceipt.materialRequest.customerRequestId,
+          requestId: out.goodsReceipt.materialRequest.requestId,
+          goodsReceiptId: out.goodsReceipt._id,
+          recordedBy: { name: req.user.name || "" },
+        }).catch(() => {});
+    }
     const body = {
       success: true,
       message: out.replayed ? "This goods receipt was already recorded." : `Goods receipt ${out.goodsReceipt.receiptNumber} recorded.`,

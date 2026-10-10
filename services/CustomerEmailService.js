@@ -240,6 +240,10 @@ class CustomerEmailService {
       let textItems = "";
 
       if (requestData.items && requestData.items.length > 0) {
+        /* `stockItemImages` is filled by nothing in this backend, so the
+           photo comes from the product's own variant images (9 Oct 2026). */
+        const orderLines = require("./mail/orderLinesMail");
+        const stockMap = await orderLines.loadStock(requestData.items.map((i) => i.stockItemId));
 
         requestData.items.forEach((item) => {
           const productName = item.stockItemName || "—";
@@ -248,7 +252,9 @@ class CustomerEmailService {
           totalItems += qty;
 
           // ── Product image ───────────────────────────────────────────────
-          const imgUrl = (item.stockItemImages || [])[0] || null;
+          const imgUrl = (item.stockItemImages || [])[0]
+            || orderLines.thumb(orderLines.photoFor(stockMap.get(String(item.stockItemId?._id || item.stockItemId || "")), item.variants?.[0]?.attributes))
+            || null;
           const imgHtml = imgUrl
             ? `<img src="${imgUrl}" width="56" height="56" ` +
             `style="width:56px;height:56px;object-fit:cover;border-radius:4px;` +
@@ -1019,15 +1025,23 @@ class CustomerEmailService {
         })
         : null;
 
-      // ── Items summary (brief — name + variant + qty) ──────────────────────
+      // ── Items summary (photo + name + variant + qty) ─────────────────────
+      /* The photo beside each line (9 Oct 2026, owner): from the product's
+         variant images, matched by the line's attributes. */
+      const orderLines = require("./mail/orderLinesMail");
+      const stockMap = await orderLines.loadStock((quotation?.items || []).map((i) => i.stockItemId));
       const itemsSummaryRows = (quotation?.items || [])
         .map((item) => {
           const variantStr = (item.attributes || [])
             .map(a => `${a.name}: ${a.value}`)
             .join(" · ");
+          const photo = orderLines.thumb(orderLines.photoFor(stockMap.get(String(item.stockItemId?._id || item.stockItemId || "")), item.attributes), 96);
+          const photoHtml = photo
+            ? `<img src="${photo}" width="40" height="40" alt="" style="display:inline-block;width:40px;height:40px;object-fit:cover;border-radius:4px;border:1px solid #e2e8f0;vertical-align:middle;margin-right:8px;" />`
+            : "";
           return (
             `<tr>` +
-            `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600;">${item.itemName || "—"}</td>` +
+            `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:13px;color:#0f172a;font-weight:600;">${photoHtml}${item.itemName || "—"}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;font-size:12px;color:#64748b;">${variantStr || "—"}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:center;font-size:13px;font-weight:700;color:#0f172a;">${item.quantity}</td>` +
             `<td style="padding:8px 12px;border-bottom:1px solid #f1f5f9;text-align:right;font-size:13px;font-weight:600;color:#0f172a;">₹${(item.priceIncludingGST || 0).toFixed(2)}</td>` +

@@ -191,13 +191,17 @@ async function buildManufacturingOrderPdf(request, workOrders = [], opts = {}) {
       })
       .catch(() => null),
     StockItem.find({ _id: { $in: (request.items || []).map((i) => i.stockItemId).filter(Boolean) } })
-      .select("name reference images").lean().catch(() => []),
+      .select("name reference images variants.attributes variants.images").lean().catch(() => []),
   ]);
   const stockById = new Map((stockItems || []).map((s) => [String(s._id), s]));
   const photos = new Map();
+  /* The photo lives on a VARIANT for every product in this database; the
+     root `images[]` is empty (9 Oct 2026). Same resolution as the mails. */
+  const { photoFor } = require("./mail/orderLinesMail");
   await Promise.all(
     (stockItems || []).map(async (s) => {
-      const buf = await fetchImageBuffer((s.images || [])[0]);
+      const line = (request.items || []).find((i) => String(i.stockItemId?._id || i.stockItemId) === String(s._id));
+      const buf = await fetchImageBuffer(photoFor(s, line?.variants?.[0]?.attributes));
       if (buf) photos.set(String(s._id), buf);
     }),
   );

@@ -335,6 +335,38 @@ const EVENT_REGISTRY = [
     description: "PPC is notified when the Store issues raw material against one of its requests, with requested vs issued per line.",
     departments: ["ppc"],
   },
+  /* ── MERCHANDISING'S MATERIAL REQUESTS, AND THE MRF LETTERS (10 Oct 2026, owner) ──
+     "When a merchandiser raises a material request against an order the mail
+     comes to the Store … when a GRN is made against it the merchandiser gets
+     a mail … when a PO is created against an MRF, and when a GRN is made
+     against that PO, the employee who raised the MRF gets a mail — formal,
+     informative, with a PDF attached." The two MRF letters have NO department:
+     they go to the requester alone (`alsoTo`), whatever department they are
+     in — Store raised the order and does not need telling. */
+  {
+    key: "merch_material_request_submitted",
+    label: "Material request submitted by Merchandising",
+    description: "The Store is notified when Merchandising submits a material request against an order — the order, every raw item with its variant, quantity and unit, when it is needed, and the request as a PDF.",
+    departments: ["store"],
+  },
+  {
+    key: "merch_material_request_received",
+    label: "Goods receipt recorded against a Merchandising material request",
+    description: "Merchandising — and the person who raised the request — is notified when the Store records a goods receipt against it, line by line, with the receipt as a PDF.",
+    departments: ["merchandiser"],
+  },
+  {
+    key: "po_created_for_mrf",
+    label: "Purchase order raised for an MRF — tell the requester",
+    description: "The employee who raised a material request (MRF) is told when the Store raises a purchase order against it: supplier, lines, rates, expected delivery, and the purchase order as a PDF.",
+    departments: [],
+  },
+  {
+    key: "grn_recorded_for_mrf",
+    label: "Goods receipt against an MRF's purchase order — tell the requester",
+    description: "The employee who raised a material request (MRF) is told when the Store records a goods receipt against the purchase order raised for it, with the receipt as a PDF.",
+    departments: [],
+  },
 ];
 const EVENT_BY_KEY = new Map(EVENT_REGISTRY.map((e) => [e.key, e]));
 
@@ -674,8 +706,18 @@ async function notifyEvent(eventKey, ctx = {}) {
       return { sent: 0, skipped: "disabled" };
     }
 
+    /* Who gets it: the department's primary people (DeptUser rows, employees
+       whose star-marked department it is) AND, since 9 Oct 2026, everyone
+       Access Control names as OWNER (full control) of that department,
+       whatever their primary department. The owner's rule of 7 Oct 2026 for
+       the manufacturing-order mail ("everyone holding full control of PPC
+       must know") now holds for every event: a person given full control of
+       Sales, Merchandising, R&D, PPC or the Store is told what happens
+       there. Nothing else widened: an editor or viewer grant still receives
+       nothing unless the department is their primary. */
     const lists = await Promise.all([
       ...event.departments.map(resolveDepartmentRecipients),
+      ...event.departments.map((slug) => resolveRoleRecipients(slug, "owner")),
       ...(event.roleRecipients || []).map((rr) => resolveRoleRecipients(rr.slug, rr.minRole)),
     ]);
     const recipients = new Map();
@@ -687,6 +729,13 @@ async function notifyEvent(eventKey, ctx = {}) {
       const keep = new Set(ctx.onlyTo.map((e) => String(e).toLowerCase()));
       for (const email of [...recipients.keys()]) if (!keep.has(email)) recipients.delete(email);
       for (const email of keep) if (!recipients.has(email)) recipients.set(email, email);
+    }
+    /* `alsoTo` ADDS named people to the department's list — the person who
+       raised the document this event is about (10 Oct 2026), whatever their
+       department. An event with no departments reaches them alone. */
+    for (const e of Array.isArray(ctx.alsoTo) && !(Array.isArray(ctx.onlyTo) && ctx.onlyTo.length) ? ctx.alsoTo : []) {
+      const email = String(e || "").trim().toLowerCase();
+      if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) && !recipients.has(email)) recipients.set(email, email);
     }
     if (!recipients.size) {
       // The single most likely cause of "the email never arrived": nobody

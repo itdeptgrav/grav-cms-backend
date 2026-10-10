@@ -1661,7 +1661,7 @@ async function selectableMrfs(tenant, { search = "", limit } = {}) {
      the legacy read-through, and so is the base — assigning either over the
      other would drop it (and a dropped tenancy clause reads across companies). */
   const clauses = [tenantContext.tenantFilter(tenant), base];
-  if (rx) clauses.push({ $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { "items.rawItemName": rx }] });
+  if (rx) clauses.push({ $or: [{ mrfNumber: rx }, { requestedForDept: rx }, { requestedForName: rx }, { "items.rawItemName": rx }] });
   const filter = { $and: clauses };
 
   const [storedMatchCount, docs] = await Promise.all([

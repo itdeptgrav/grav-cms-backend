@@ -35,6 +35,7 @@ const orders = require("./orders.service");
 const model = (name, path) => (mongoose.models[name] || require(path));
 const CustomerRequest = () => model("CustomerRequest", "../../models/Customer_Models/CustomerRequest");
 const RawItem = () => model("RawItem", "../../models/CMS_Models/Inventory/Products/RawItem");
+const GoodsReceipt = () => model("GoodsReceipt", "../../models/CMS_Models/StorePurchase/GoodsReceipt");
 
 const str = (v) => String(v ?? "").trim();
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v));
@@ -78,12 +79,15 @@ function statusOf(r) {
   return "open";
 }
 
-/** What the merchandiser may still do with it. */
+/** What the merchandiser may still do with it.
+    10 Oct 2026 (owner): a SUBMITTED request stays editable "till the Store
+    person makes the GRN" — once a goods receipt is recorded against it,
+    editing stops; withdrawing already did. */
 function actionsOf(r) {
   const status = statusOf(r);
-  const nothingReceived = !(r.lines || []).some((l) => (num(l.receivedQuantity) || 0) > 0);
+  const nothingReceived = !(r.lines || []).some((l) => (num(l.receivedQuantity) || 0) > 0) && !(r.receipts || []).length;
   return {
-    edit: status === "draft",
+    edit: status === "draft" || (status === "open" && nothingReceived),
     submit: status === "draft",
     withdraw: status === "draft" || (status === "open" && nothingReceived),
   };
@@ -139,7 +143,128 @@ async function listForOrder(ctx, { orderId } = {}) {
       l.onHand = item ? r4(num(v ? v.quantity : item.quantity) || 0) : null;
     }
   }
+  await attachReceiptsAndQc(requests);
   return { requests, order: requests[0]?.order || requestView({ lines: [] }, order).order };
+}
+
+/* ── WHAT THE STORE RECEIVED AND WHAT QC FOUND (10 Oct 2026, owner) ──────
+   "As per the request made by the merchandiser, he should also see the QC
+   checked status — correct, defectives and all." The goods receipts recorded
+   against each request are read with their lines, QC's standing per receipt
+   comes from the Store's own bridge (qcInspectionBridge), and both are
+   folded back onto the request: per receipt (date, warehouse, QC text) and
+   per request line (checked / passed / defective / remaining, summed over
+   every receipt line that names this request line). Never throws — a
+   failed read leaves the figures absent, not zero. */
+async function attachReceiptsAndQc(requests) {
+  const live = requests.filter((r) => (r.receipts || []).length);
+  if (!live.length) return;
+  try {
+    const ids = live.map((r) => new mongoose.Types.ObjectId(r.id));
+    const grns = await GoodsReceipt().find({ "materialRequest.requestId": { $in: ids }, status: { $ne: "VOID" } })
+      .select("receiptNumber receiptDate createdAt recordedBy warehouseName locationCode locationName sourceType materialRequest lines").lean();
+    const { qcStandingFor } = require("../storePurchase/qcInspectionBridge");
+    const standing = await qcStandingFor(grns);
+    const byRequest = new Map();
+    for (const g of grns) { const k = str(g.materialRequest?.requestId); if (!byRequest.has(k)) byRequest.set(k, []); byRequest.get(k).push(g); }
+    for (const r of live) {
+      const mine = byRequest.get(r.id) || [];
+      const grnById = new Map(mine.map((g) => [str(g._id), g]));
+      r.receipts = r.receipts.map((x) => {
+        const g = grnById.get(str(x.goodsReceiptId));
+        const s = g ? standing.get(str(g._id)) : null;
+        const p = s?.progress || null;
+        return {
+          ...x,
+          receiptDate: g?.receiptDate || g?.createdAt || x.receivedAt,
+          warehouseName: g?.warehouseName || "", location: g?.locationCode || g?.locationName || "",
+          qc: g ? {
+            state: p?.complete ? "complete" : p?.anyChecked ? "in-progress" : "not-started",
+            text: p?.text || "Not checked yet", checkers: p?.checkers || [], lastAt: p?.lastAt || null,
+          } : null,
+        };
+      });
+      /* per request line: every receipt line that names it */
+      const perLine = new Map();
+      for (const g of mine) {
+        const prog = standing.get(str(g._id))?.progress;
+        const progLine = new Map((prog?.lines || []).map((pl) => [str(pl.lineId), pl]));
+        for (const gl of g.lines || []) {
+          const key = str(gl.sourceLineId);
+          const q = progLine.get(str(gl._id));
+          const acc = perLine.get(key) || { received: 0, checked: 0, passed: 0, defective: 0, unit: gl.poUnit || "" };
+          acc.received = r4(acc.received + (num(gl.receivedQuantity) || 0));
+          acc.checked = r4(acc.checked + (num(q?.checked) || 0));
+          acc.passed = r4(acc.passed + (num(q?.passed) || 0));
+          acc.defective = r4(acc.defective + (num(q?.defective) || 0));
+          perLine.set(key, acc);
+        }
+      }
+      let tot = { received: 0, checked: 0, passed: 0, defective: 0 };
+      for (const l of r.lines) {
+        const q = perLine.get(l.lineId);
+        l.qc = q ? { ...q, remaining: Math.max(0, r4(q.received - q.checked)), state: q.checked <= 0 ? "not-started" : q.checked >= q.received ? "complete" : "in-progress" } : null;
+        if (q) tot = { received: r4(tot.received + q.received), checked: r4(tot.checked + q.checked), passed: r4(tot.passed + q.passed), defective: r4(tot.defective + q.defective) };
+      }
+      r.qc = {
+        ...tot, remaining: Math.max(0, r4(tot.received - tot.checked)),
+        state: tot.received <= 0 ? "nothing-received" : tot.checked <= 0 ? "not-started" : tot.checked >= tot.received ? "complete" : "in-progress",
+        receiptsChecked: r.receipts.filter((x) => x.qc?.state === "complete").length,
+        receipts: r.receipts.length,
+      };
+    }
+  } catch (err) {
+    console.warn("[orderMaterialRequest] receipts/QC unavailable:", err?.message || err);
+  }
+}
+
+/* ── ONE GOODS RECEIPT, AS THE MERCHANDISER MAY READ IT ──────────────────
+   The Store's GRN routes need Store access, which a merchandiser does not
+   hold; this reads the same document for a receipt recorded against one of
+   THIS order's requests, plus QC's detail of it (labels and verdicts). */
+async function receiptDocument(ctx, { orderId, requestId, grnId } = {}) {
+  const { request } = await loadRequest(ctx, orderId, requestId);
+  const mine = (request.receipts || []).some((x) => str(x.goodsReceiptId) === str(grnId));
+  if (!mine || !isId(grnId)) throw fail("NOT_FOUND", "That goods receipt was not recorded against this request.");
+  const grnDoc = require("../storePurchase/goodsReceiptDocument.service");
+  const document = await grnDoc.document({ companyId: ctx.companyId }, grnId);
+  let qc = null;
+  try { qc = await require("../manufacturing/qcRawItemGrns").grnDetail(grnId); } catch (err) { console.warn("[orderMaterialRequest] QC detail unavailable:", err?.message || err); }
+  return { document, qc };
+}
+
+/** The same receipt as a PDF (Buffer), for the merchandiser's download. */
+async function receiptPdf(ctx, args) {
+  const { document, qc } = await receiptDocument(ctx, args);
+  const { buildDocumentPdf } = require("../mail/documentPdf");
+  const fmt = (n) => (n === null || n === undefined ? "" : Number(n).toLocaleString("en-IN", { maximumFractionDigits: 4 }));
+  const qcLine = new Map((qc?.lines || []).map((l) => [str(l.goodsReceiptLineId), l]));
+  const pdf = await buildDocumentPdf({
+    title: "Goods receipt", reference: document.grn.receiptNumber,
+    subtitle: `Recorded against material request ${document.source?.requestNumber || ""} · order ${document.source?.orderRef || ""} · ${document.source?.customerName || ""}`,
+    facts: [
+      ["Receipt date", document.grn.receiptDate ? new Date(document.grn.receiptDate).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : ""],
+      ["Recorded by", document.grn.recordedBy], ["Warehouse", document.grn.warehouseName], ["Location", document.grn.location || "Put-away pending"],
+      ["Material request", document.source?.requestNumber], ["Order", document.source?.orderRef], ["Customer", document.source?.customerName],
+      ["QC standing", qc?.totals?.status ? String(qc.totals.status).replace(/-/g, " ") : "not checked yet"],
+    ],
+    sections: [{
+      heading: "Lines received, with QC's check",
+      columns: [
+        { key: "no", label: "#", width: 0.4 }, { key: "itemName", label: "Raw item", width: 2.2, bold: true }, { key: "variant", label: "Variant", width: 1.2 },
+        { key: "received", label: "Received", width: 0.9, align: "right" }, { key: "unit", label: "Unit", width: 0.6 },
+        { key: "checked", label: "Checked", width: 0.8, align: "right" }, { key: "passed", label: "Passed", width: 0.8, align: "right" }, { key: "defective", label: "Defective", width: 0.8, align: "right" },
+      ],
+      rows: (document.lines || []).map((l) => { const q = qcLine.get(str(l.id)); return { no: l.no, itemName: l.itemName, variant: l.variant || "—", received: fmt(l.received), unit: l.unit, checked: fmt(q?.checked ?? 0), passed: fmt(q?.passed ?? 0), defective: fmt(q?.defective ?? 0) }; }),
+    }, ...(qc?.labels?.length ? [{
+      heading: "Labels and verdicts",
+      columns: [{ key: "sequence", label: "Label", width: 0.6 }, { key: "rawItemName", label: "Raw item", width: 2 }, { key: "variantLabel", label: "Variant", width: 1.2 }, { key: "qty", label: "Qty", width: 0.8, align: "right" }, { key: "status", label: "Verdict", width: 0.9 }, { key: "defects", label: "Defects", width: 1.8 }],
+      rows: qc.labels.map((b) => ({ sequence: b.sequence, rawItemName: b.rawItemName, variantLabel: b.variantLabel || "—", qty: `${fmt(b.quantity)} ${b.unit || ""}`, status: b.status, defects: (b.defects || []).map((d) => d.name || d.code || d).join(", ") })),
+    }] : [])],
+    notes: document.grn.notes || "",
+    footer: "Goods receipt · Store → Merchandising",
+  });
+  return { pdf, fileName: `${str(document.grn.receiptNumber).replace(/\//g, "-")}.pdf` };
 }
 
 /** `Map<orderId, {count, draft, open, received}>` for the register rows. */
@@ -258,7 +383,7 @@ async function create(ctx, { orderId, lines: inLines, note, neededBy, submit = f
 async function update(ctx, { orderId, requestId, lines: inLines, note, neededBy, actor } = {}) {
   const { order, request } = await loadRequest(ctx, orderId, requestId);
   if (!actionsOf(request).edit) {
-    throw fail("LIFECYCLE_BLOCKED", `${request.requestNumber} is ${statusOf(request).replace(/_/g, " ")} and can no longer be edited. Only a draft can be.`);
+    throw fail("LIFECYCLE_BLOCKED", `${request.requestNumber} is ${statusOf(request).replace(/_/g, " ")} and can no longer be edited: the Store has recorded a goods receipt against it. Raise a further request for anything still missing.`);
   }
   const needed = neededBy ? new Date(neededBy) : null;
   if (needed && Number.isNaN(needed.getTime())) throw fail("VALIDATION", "The needed-by date is not valid.", { field: "neededBy" });
@@ -314,7 +439,7 @@ async function withdraw(ctx, { orderId, requestId, reason, actor } = {}) {
 }
 
 module.exports = {
-  SOURCE, listForOrder, countForOrders, create, update, submit, withdraw,
+  SOURCE, listForOrder, countForOrders, create, update, submit, withdraw, receiptDocument, receiptPdf,
   /* kept under its old name for the route that first called it */
   raise: create,
   requestView, statusOf, actionsOf, lineView, ofMerchandising, unitOptionsFor,
