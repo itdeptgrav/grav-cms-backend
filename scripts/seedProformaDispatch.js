@@ -46,7 +46,14 @@ const { dispatchRollup } = require("../services/accounting/proformaDispatch");
 const REQUEST_ID = "MO-REQ-DEMO-DISPATCH";
 const CHALLANS = ["DC-DEMO-0001", "DC-DEMO-0002"];
 const PI_NUMBERS = ["PI/DEMO/0001", "PI/DEMO/0002"];
-const CUSTOMER_MARK = "DEMO-RIVERSIDE";
+/* Customer has `customerId` (a String), NOT `customerCode` — keying on a
+   field the schema does not declare meant strict mode dropped it, so every
+   run made another customer and --undo deleted none of them. */
+const CUSTOMER_ID = "DEMO-RIVERSIDE";
+/* The email is effectively unique and is what a stray earlier row would
+   carry, so --undo matches on either. Note the TLD: Customer's validator is
+   /(\.\w{2,3})+$/, which refuses a 4-letter TLD like ".test". */
+const CUSTOMER_EMAIL = "accounts@riversidedemo.com";
 
 const arg = (name, fallback = null) => {
   const i = process.argv.indexOf(name);
@@ -120,7 +127,9 @@ async function undo() {
     challans: (await DispatchChallan.deleteMany({ challanNumber: { $in: CHALLANS } })).deletedCount,
     proformas: (await Acc_ProformaInvoice.deleteMany({ voucherNumber: { $in: PI_NUMBERS } })).deletedCount,
     orders: (await CustomerRequest.deleteMany({ requestId: REQUEST_ID })).deletedCount,
-    customers: (await Customer.deleteMany({ customerCode: CUSTOMER_MARK })).deletedCount,
+    customers: (await Customer.deleteMany({
+      $or: [{ customerId: CUSTOMER_ID }, { email: CUSTOMER_EMAIL }],
+    })).deletedCount,
   };
   console.log("\nRemoved:", r, order ? "" : "(no demo order was present)");
 }
@@ -136,13 +145,15 @@ async function seed() {
   console.log(`Company: ${company.companyName} (${company._id})`);
 
   // ── Customer ────────────────────────────────────────────────────────────
-  let customer = await Customer.findOne({ customerCode: CUSTOMER_MARK });
+  let customer =
+    (await Customer.findOne({ customerId: CUSTOMER_ID })) ||
+    (await Customer.findOne({ email: CUSTOMER_EMAIL }));
   if (!customer) {
     customer = await Customer.create({
-      customerCode: CUSTOMER_MARK,
+      customerId: CUSTOMER_ID,
       name: BUYER.name,
       companyName: BUYER.name,
-      email: "accounts@riverside-demo.test",
+      email: CUSTOMER_EMAIL,
       phone: "9000000001",
       gstin: BUYER.gstin,
     });
@@ -158,7 +169,8 @@ async function seed() {
   if (!order) order = new CustomerRequest({ requestId: REQUEST_ID });
   order.customerId = customer._id;
   order.customerName = BUYER.name;
-  order.status = "in_production";
+  /* "production" — the enum has no "in_production". */
+  order.status = "production";
   order.customerInfo = { name: BUYER.name, gstin: BUYER.gstin, deliveryDeadline: new Date(Date.now() + 20 * 864e5) };
   order.quotations = [{ items: quotationItems, grandTotal: 120900, status: "sales_approved" }];
   await order.save();
