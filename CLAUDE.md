@@ -1713,3 +1713,48 @@ on the purchase-order, customer-material and material-request receive pages)
 reads it for the session's `rawItemId` and offers the scale panel for the
 session's `variantId`. Nothing about `reserveBatch` changed: the derived
 figure arrives as the same `quantityPerLabel` a person would have typed.
+
+## Printed labels linked to a recorded GRN afterwards (11 Oct 2026, owner)
+
+Labels printed from Material labels carry no goods receipt. When their goods
+arrived on a receipt that is already recorded, Receive › Link labels to a GRN
+(grav-cms `goods-receipts/link-labels`) links them, and a scan of the label
+then names that receipt. `services/storePurchase/labelGrnLink.service.js` is
+every rule; three routes on `goodsReceipts.js`, declared above `/:grnId`:
+
+- `POST /label-links/check` (READ) `{ barcodeIds, goodsReceiptId? }` → each
+  label's standing (`refusalOf`) and `choices`: the RECORDED purchase and
+  material-request receipts whose lines carry a scanned material (never
+  CUSTOMER_MATERIAL, never VOID, company-scoped), best fit first, each with
+  `plan` (`planLinks`: which line each label goes onto, what the line then
+  carries, cautions). `goodsReceiptId` is always offered, even when nothing
+  scanned is on it.
+- `POST /label-links` (RECEIPT_RECORD) `{ goodsReceiptId, barcodeIds }` → per
+  label `linked` / `already` / `refused` with the reason. One unit of work,
+  one `LABELS_LINKED` history entry on the GRN.
+- `POST /label-links/unlink` (RECEIPT_RECORD) `{ barcodeId }` → back to exactly
+  what the label carried (`grnLink.previous`), `LABEL_UNLINKED` on the GRN.
+
+- **Nothing moves.** The receipt already booked the stock; the label was
+  printed for stock on hand. Linking writes provenance only.
+- **A link stamps what a label printed AT the receipt carries**:
+  `goodsReceiptId/Number/LineId`, and on a purchase receipt `purchaseOrder`,
+  `purchaseOrderNumber`, `purchaseOrderItemId`, `vendor`, `vendorName` and the
+  PO line's `unitPrice` — the price only when the label is in that line's unit.
+  So QC Inspect, QC's GRN book and the GRN view's label count see it unchanged.
+- **The line is found by material and variant, never a name** (`candidateLines`):
+  same raw item; exact variant first, then a line with no variant; a label with
+  no variant only where the receipt has the material on one line.
+- **Refused, left untouched:** another material/variant, already on a receipt,
+  voided, customer-owned, inside an open receiving count, another company's.
+  More on labels than the line received is a caution, never a refusal.
+- **`Barcode.grnLink`** (`{ linkedAt, linkedBy, linkedByName, previous }`,
+  default null) marks a link made later. Unlink refuses a label received at its
+  receipt or linked by QC (`NOT_LINKED_HERE`) and one QC has checked against
+  that receipt (`QC_CHECKED`).
+- `GET /api/cms/inventory/barcodes/:id` answers `goodsReceipt`
+  (`receiptOfLabel`: number, date, kind, PO + supplier or request + order, the
+  line, `linkedLater`, `href`), null for an unlinked label; customer-owned
+  labels are unchanged.
+
+Tests: `test/store-purchase/label-grn-link.route.test.js` (14).

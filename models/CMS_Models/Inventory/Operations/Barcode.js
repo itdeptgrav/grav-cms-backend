@@ -147,6 +147,35 @@ const barcodeSchema = new mongoose.Schema(
     goodsReceiptNumber: { type: String, trim: true, default: "" },
     goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
 
+    /* ── LINKED TO ITS RECEIPT AFTERWARDS (11 Oct 2026, owner) ────────────
+       A label printed from Material labels carries no receipt. When the
+       goods it is stuck to arrived on a GRN that is already recorded, the
+       Store links it on Receive › Link labels to a GRN
+       (services/storePurchase/labelGrnLink.service.js): the three receipt
+       fields above are stamped — and, on a purchase receipt, the order,
+       supplier and price — exactly as on a label printed at the receipt.
+
+       This block says it happened LATER, who did it, and what the label
+       carried before, so a wrong link can be taken back to exactly what it
+       was. Null on every label received at its receipt (and on every label
+       QC linked while checking it). Moves no stock: the receipt already did. */
+    grnLink: {
+      type: new mongoose.Schema({
+        linkedAt: { type: Date, default: null },
+        linkedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+        linkedByName: { type: String, trim: true, default: "" },
+        previous: {
+          purchaseOrder: { type: mongoose.Schema.Types.ObjectId, default: null },
+          purchaseOrderNumber: { type: String, trim: true, default: "" },
+          purchaseOrderItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          vendor: { type: mongoose.Schema.Types.ObjectId, default: null },
+          vendorName: { type: String, trim: true, default: "" },
+          unitPrice: { type: Number, default: null },
+        },
+      }, { _id: false }),
+      default: null,
+    },
+
     /* ── WHICH PRINT RUN MINTED THIS ──────────────────────────────────────
        A thermal printer that times out is the ordinary case, and the operator
        presses Print again. Without a key that second press minted a second set

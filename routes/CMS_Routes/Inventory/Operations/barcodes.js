@@ -617,9 +617,24 @@ router.get("/:id", async (req, res) => {
        `availableAsGeneralStock: false` and the reason tells them to go and
        finish the receipt instead. Do not turn this into a 404. */
     const idRefusal = identityRefusal(barcode);
+    /* ── THE RECEIPT IT ARRIVED ON (11 Oct 2026, owner) ─────────────────────
+       Printed at the receipt, or linked to it later on Receive › Link labels
+       to a GRN — either way the scan names the GRN, its source and its line,
+       and says when a link was made afterwards and by whom. Null for a label
+       printed from stock on hand that nobody has linked. A failed read is
+       null too: the label's own facts must still answer the scan. */
+    let goodsReceipt = null;
+    if (barcode.goodsReceiptId) {
+      try {
+        goodsReceipt = await require("../../../../services/storePurchase/labelGrnLink.service").receiptOfLabel(req.tenant, barcode);
+      } catch (e) {
+        console.error("Error resolving a label's goods receipt:", e);
+      }
+    }
     return res.json({
       success: true,
       barcode,
+      goodsReceipt,
       identityState: barcode.identityState || "ACTIVATED",
       ownership: {
         kind: "COMPANY_OWNED",
