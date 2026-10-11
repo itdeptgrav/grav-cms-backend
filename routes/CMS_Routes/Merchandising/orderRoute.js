@@ -28,6 +28,7 @@ const materialRequests = require("../../../services/merchandising/orderMaterialR
 /* The Store is told when a request is submitted (10 Oct 2026). Fire and
    forget: a mail must never fail the request that caused it. */
 const materialRequestMail = require("../../../services/merchandising/materialRequestMail.service");
+const orderMeetings = require("../../../services/merchandising/orderMeetings.service");
 const tellStore = (out) => {
   if (out?.replayed || !out?.request || out.request.status !== "open") return;
   materialRequestMail.notifyMaterialRequestSubmitted(out.request.order, out.request).catch(() => {});
@@ -54,6 +55,28 @@ router.get("/orders", requireCompany, canRead, handle(async (req, res) => {
 router.get("/orders/:id", requireCompany, canRead, handle(async (req, res) => {
   const out = await orders.getOrder(req.merchandising, { id: req.params.id });
   return res.json({ success: true, ...out });
+}));
+
+/* ── PPM meetings against the order (11 Oct 2026, owner) ─────────────────────
+   The meeting is a CoWork scheduled meet made by the merchandiser's own CoWork
+   identity (`orderMeetings.service`); only meets carrying this order's
+   `linkedOrder` are listed, with their recordings, summary and transcript
+   read from CoWork's own collections. Creating needs the editor's grant, the
+   same rung that raises a material request; reading, the file's. There is no
+   join / start / cancel door here — those are CoWork's. */
+router.get("/orders/:id/meetings", requireCompany, canRead, handle(async (req, res) => {
+  const out = await orderMeetings.listForOrder(req.merchandising, { orderId: req.params.id, user: req.user });
+  return res.json({ success: true, ...out });
+}));
+
+router.get("/orders/:id/meetings/people", requireCompany, canRead, handle(async (req, res) => {
+  const out = await orderMeetings.people(req.merchandising, { orderId: req.params.id, user: req.user });
+  return res.json({ success: true, ...out });
+}));
+
+router.post("/orders/:id/meetings", requireCompany, canRequest, handle(async (req, res) => {
+  const out = await orderMeetings.create(req.merchandising, { orderId: req.params.id, body: req.body || {}, user: req.user });
+  return res.status(201).json({ success: true, ...out });
 }));
 
 router.get("/orders/:id/material-requests", requireCompany, canRead, handle(async (req, res) => {

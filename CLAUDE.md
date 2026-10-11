@@ -1758,3 +1758,58 @@ every rule; three routes on `goodsReceipts.js`, declared above `/:grnId`:
   labels are unchanged.
 
 Tests: `test/store-purchase/label-grn-link.route.test.js` (14).
+
+## PPM meetings against a merchandising order are CoWork meetings (11 Oct 2026, owner)
+
+"The merchandiser will create the meeting from the CMS; it is created in
+CoWork for that user, linked to the order, and the meeting history —
+transcript, audio recording and all — shows against the order here. Only
+those meetings. No join here; everyone joins in CoWork."
+
+`services/merchandising/orderMeetings.service.js` (+ the pure
+`orderMeetings.rules.js`, tested by `npm test`) on three doors of
+`routes/CMS_Routes/Merchandising/orderRoute.js`:
+
+- `GET /api/cms/merchandising/orders/:id/meetings` (FILE_READ) → `{ order,
+  me, meetings[] }`. `me` is the session's CoWork identity or null.
+- `GET …/orders/:id/meetings/people` (FILE_READ) → every active
+  `cowork_employees` row, for the picker.
+- `POST …/orders/:id/meetings` (REQUIREMENT_WRITE) `{ title, description,
+  startsAt (ISO), durationMinutes, participants[], agenda[] }` → 201
+  `{ meeting, me }`.
+
+**The meeting IS a `cowork_scheduled_meets` document**, written by the same
+`cowork.service.scheduleCoworkMeet` the CoWork app calls (shared `meetSeq`
+counter, organiser first in `participants`, `status: scheduled`, the
+`events` audit row, the in-app notification + push + e-mail to every other
+participant). Then ONE `.update({ linkedOrder })`: `{ source:
+"cms-merchandising", kind: "ppm", customerRequestId, orderRef, customerName,
+companyId, createdByEmail, createdByName, createdByCoworkId, createdAt }`.
+Every later CoWork write is a keyed `.update()`, so the tag survives; the
+list reads `where("linkedOrder.customerRequestId", "==", id)` and keeps only
+`source === "cms-merchandising"`, so a meeting made inside CoWork is never
+shown against an order. **Nothing in CoWork changed** — the created
+document carries exactly a CoWork meet's fields plus `linkedOrder`
+(compared key for key against M096 on 11 Oct 2026).
+
+- **The organiser** is `Employee.coworkEmployeeId` (the explicit link), else
+  the `cowork_employees` row whose `email`/`legacyEmail` is the session's;
+  none → 409 CONFLICT `NO_COWORK_ACCOUNT`, nothing written. ceo@grav.in has
+  no CoWork account on the dev DB; rakesh.biswal@grav.in → GR0045 by link.
+- **Validation** (`normaliseMeeting`): a title (defaults to `PPM · <orderRef>`),
+  a start not more than 10 minutes in the past (CoWork's instant meeting is
+  "now"), 15 min–8 h, every participant a CoWork user. `dateTime`/`endsAt`
+  are UTC `toISOString()` strings — the 15-minute reminder sweep compares
+  strings, so a `datetime-local` value would be mis-compared.
+- **History is read, never copied**: `historyOf(meetId)` reads
+  `meeting_audio_recordings` (Drive view/download URLs), `meeting_summaries/
+  {meetId}`, `meeting_transcripts_gemini/{meetId}` (verbatim / translate
+  utterances) and `meeting_transcripts/{meetId}` (live captions, 24 h). A
+  missing document is `null`, never an empty shape; a failed read logs and
+  leaves `history: null`.
+- No cancel / start / join door: those are CoWork's own routes.
+
+Checked 11 Oct 2026: M097 created through the door as GR0045 with no other
+participant (0 notifications), listed against REQ-2026-0041 with an empty
+history, read back on the CMS page, then deleted (doc, events, RTDB mirror).
+`historyOf("M095")` returned 2 recordings and a 129-line verbatim transcript.
