@@ -1813,3 +1813,37 @@ Checked 11 Oct 2026: M097 created through the door as GR0045 with no other
 participant (0 notifications), listed against REQ-2026-0041 with an empty
 history, read back on the CMS page, then deleted (doc, events, RTDB mirror).
 `historyOf("M095")` returned 2 recordings and a 129-line verbatim transcript.
+
+### A label on another receipt, or in an unrecorded count, MOVES when linked (12 Oct 2026, owner)
+
+"Some barcodes were printed on the GRN page but that GRN was never marked
+done; the labels are on the raw items and we cannot remove them. Don't
+restrict this — even a label already linked to some GRN, if the user scans
+it he wants to switch it to the new GRN." So `labelGrnLink.service`:
+
+- `refusalOf` keeps only what can never be linked: unknown / another
+  company's, customer-owned, voided. `standingOf` says where a linkable label
+  stands: `free`, `linked` (`linkedTo`, with `linkedHere`), or `in-count`
+  (`inCount`: the receiving session, the PO number, the identity state).
+  `check` answers `ok: true` for all three with `standing`, and `counts` now
+  carries `inCount` beside `alreadyLinked` (both are inside `ready`).
+- `link` moves a label already on another receipt (`results[].movedFrom`) and
+  takes one out of an unrecorded count (`results[].leftCount`): the count's
+  `receivingSessionId`, `sessionSequence` and `adoptedAt` are cleared and the
+  label becomes `ACTIVATED` — a live label of the chosen receipt, as recording
+  that count would have made it. The write is guarded on what was read
+  (`goodsReceiptId` and `receivingSessionId` as they stood), never on
+  "nothing yet". A label already on the CHOSEN receipt still answers
+  `already`. The history row counts `movedFromReceipts` / `takenFromCounts`.
+- `grnLink.previous` now also carries the old `goodsReceiptId/Number/LineId`,
+  `receivingSessionId`, `sessionSequence`, `adoptedAt`, `identityState` and
+  `linkedHereBefore`, and `unlink` restores every one of them — the label goes
+  back onto the receipt it was moved from, or back into the count it left
+  (`backTo` in the answer). QC's `QC_CHECKED` refusal on unlink is unchanged.
+
+Round-tripped 12 Oct 2026 against the dev DB: the one in-count label
+(SNAP BUTTON, PRINTED, session 6aca89a6…) → linked to GRN/2026-27/0004,
+out of the count, ACTIVATED → unlinked → back in the count, PRINTED,
+sequence 1; a Waistband label on GRN/0005 → moved to GRN/0008 (`movedFrom`
+0005) → unlinked → back on 0005. `label-grn-link.route.test.js` case 9
+describes the new rule (jest; not runnable on this machine).

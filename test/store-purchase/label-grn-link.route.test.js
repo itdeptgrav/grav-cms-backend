@@ -297,7 +297,11 @@ test("8 · more on labels than the line received is said, not refused", async ()
 
 /* ═══ 3. WHAT IS REFUSED, AND STAYS AS IT WAS ═════════════════════════════ */
 
-test("9 · already linked, voided, in a count, customer-owned, unknown and another company's labels are refused", async () => {
+/* 12 Oct 2026 (owner): a label already on a receipt, or inside a count that
+   was never recorded, is NOT refused any more — linking it moves it to the
+   chosen receipt. Only voided, customer-owned, unknown and another company's
+   labels are refused. */
+test("9 · voided, customer-owned, unknown and another company's labels are refused; a linked one and one in a count MOVE", async () => {
   const s = await seed();
   const t = await seed();
   const grn = await purchaseReceipt(s, [{ item: s.fabric, qty: 100, unit: "Mtr" }]);
@@ -313,16 +317,37 @@ test("9 · already linked, voided, in a count, customer-owned, unknown and anoth
   const theirs = await label(t, t.fabric);
 
   const r = await check(s, [...ids(linked, voided, counting), String(owned), String(theirs._id), "not-a-label"]);
-  expect(r.body.labels.map((l) => l.reason)).toEqual(["ALREADY_LINKED", "LABEL_VOIDED", "LABEL_IN_COUNT", "CUSTOMER_OWNED", "LABEL_UNKNOWN", "NOT_A_LABEL"]);
+  expect(r.body.labels.map((l) => l.ok)).toEqual([true, false, true, false, false, false]);
+  expect(r.body.labels.map((l) => l.reason)).toEqual([null, "LABEL_VOIDED", null, "CUSTOMER_OWNED", "LABEL_UNKNOWN", "NOT_A_LABEL"]);
+  expect(r.body.labels[0].standing).toBe("linked");
   expect(r.body.labels[0].linkedTo).toEqual({ goodsReceiptId: String(grn._id), receiptNumber: grn.receiptNumber, linkedHere: true });
+  expect(r.body.labels[0].message).toMatch(/moves it to the receipt you choose/);
+  expect(r.body.labels[2].standing).toBe("in-count");
+  expect(r.body.labels[2].inCount.purchaseOrderNumber).toBe("PO/OPEN/1");
   expect(r.body.labels[4].message).toMatch(/not in this company's register/);   // another company's label
-  expect(r.body.counts).toEqual({ scanned: 6, ready: 0, alreadyLinked: 1, refused: 5 });
+  expect(r.body.counts).toEqual({ scanned: 6, ready: 2, alreadyLinked: 1, inCount: 1, refused: 4 });
 
   const w = await link(s, String(second._id), [...ids(linked, voided, counting), String(owned)]);
-  expect(w.body.linked).toBe(0);
-  expect(w.body.results.map((x) => x.reason)).toEqual(["ALREADY_LINKED", "LABEL_VOIDED", "LABEL_IN_COUNT", "CUSTOMER_OWNED"]);
-  expect(String((await Barcode.findById(linked._id).lean()).goodsReceiptId)).toBe(String(grn._id));   // not moved
-  expect((await Barcode.findById(counting._id).lean()).goodsReceiptId).toBeNull();
+  expect(w.body.linked).toBe(2);
+  expect(w.body.results.map((x) => x.outcome)).toEqual(["linked", "refused", "linked", "refused"]);
+  expect(w.body.results[0].movedFrom.receiptNumber).toBe(grn.receiptNumber);
+  expect(w.body.results[2].leftCount.purchaseOrderNumber).toBe("PO/OPEN/1");
+  const movedLabel = await Barcode.findById(linked._id).lean();
+  expect(String(movedLabel.goodsReceiptId)).toBe(String(second._id));                 // moved
+  expect(String(movedLabel.grnLink.previous.goodsReceiptId)).toBe(String(grn._id));   // and remembers where from
+  const freed = await Barcode.findById(counting._id).lean();
+  expect(String(freed.goodsReceiptId)).toBe(String(second._id));
+  expect(freed.receivingSessionId).toBeNull();                                        // out of the unrecorded count
+  expect(freed.identityState).toBe("ACTIVATED");                                      // and live
+
+  /* unlink puts each back where it stood */
+  await unlink(s, String(linked._id));
+  expect(String((await Barcode.findById(linked._id).lean()).goodsReceiptId)).toBe(String(grn._id));
+  await unlink(s, String(counting._id));
+  const backInCount = await Barcode.findById(counting._id).lean();
+  expect(backInCount.goodsReceiptId).toBeNull();
+  expect(backInCount.receivingSessionId).not.toBeNull();
+  expect(backInCount.identityState).toBe("PRINTED");
 });
 
 test("10 · linking a label to the receipt it is already on answers 'already', changing nothing", async () => {

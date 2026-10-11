@@ -165,6 +165,20 @@ const barcodeSchema = new mongoose.Schema(
         linkedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
         linkedByName: { type: String, trim: true, default: "" },
         previous: {
+          /* Where the label stood before it was linked here (12 Oct 2026): a
+             label may now be MOVED from another receipt, or taken out of an
+             unrecorded receiving count, and `unlink` puts it back from these.
+             The schema is strict, so a field missing here is silently dropped
+             on write — which is exactly how the first round trip lost them. */
+          goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          goodsReceiptNumber: { type: String, trim: true, default: "" },
+          goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          receivingSessionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          sessionSequence: { type: Number, default: null },
+          adoptedAt: { type: Date, default: null },
+          identityState: { type: String, trim: true, default: null },
+          quantityMeasured: { type: Boolean, default: null },
+          linkedHereBefore: { type: Boolean, default: false },
           purchaseOrder: { type: mongoose.Schema.Types.ObjectId, default: null },
           purchaseOrderNumber: { type: String, trim: true, default: "" },
           purchaseOrderItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
