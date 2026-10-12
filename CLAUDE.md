@@ -1758,3 +1758,42 @@ every rule; three routes on `goodsReceipts.js`, declared above `/:grnId`:
   labels are unchanged.
 
 Tests: `test/store-purchase/label-grn-link.route.test.js` (14).
+
+## Inactive in HR = no CoWork access, nothing deleted (12 Oct 2026, owner)
+
+`services/coworkHrAccess.service.js` is the whole rule. HR's Inactive is
+`employeeDeparture.hasLeft` (`isActive === false` or `status === "inactive"`).
+A CoWork account (`cowork_employees` doc) links to HR the way
+`/admin/hr-employees` matches: `Employee.coworkEmployeeId`, else doc id /
+`employeeId` = `biometricId`, else the account email = HR `email` or
+`personalEmail`. Access is refused only when EVERY linked HR record has left
+(a re-hire's old record must not lock out the new one); an account with no HR
+record (seeded CEO E000) is not HR's to govern.
+
+- **HR change → sync.** `routes/HrRoutes/Employee-Section.js` `syncCoworkAccess`
+  runs beside `detachIfDeparted` on the update, bulk-update and soft-delete
+  routes, on every Active↔Inactive transition. Inactive: the doc gets
+  `status: "inactive"`, `isActive: false`, `hrInactive: true`,
+  `deactivatedAt/By/Reason` (merge — nothing removed), the Firebase user is
+  disabled and its refresh tokens revoked. Active again: only what HR did is
+  undone (`firebaseDisabledByHr` remembers whether the login was already off).
+  Never fails the HR save; audited through `recordChange`.
+- **Every request.** `Middlewear/coworkAuth.js` `resolveCoworkUser` asks
+  `refusalFor` before caching: a marked doc, or an unmarked one whose HR
+  records have all left, answers 403 `{ error, code: "EMPLOYEE_INACTIVE" }`
+  (and the latter is synced in the background). HR unreachable → allowed; the
+  doc's own mark still holds.
+- **Directory.** `listCoworkEmployees` runs `markDirectory`, so the list answers
+  `status: "inactive"` (+ `deactivatedAt` via the projection) even before a
+  doc is marked. The CoWork app reads that as `exitedAt` — off pickers, still
+  named on old work. Nobody is dropped from the list.
+- **Admin.** `GET /cowork/admin/hr-employees` lists people active in HR by
+  default (`?status=inactive|all`), returns `hrStatus` per row and
+  `activeCount`/`inactiveCount`; `POST /cowork/employee/create` refuses 409
+  `EMPLOYEE_INACTIVE` when every matching HR record has left.
+- **Backfill** for people inactive before this:
+  `node -r dotenv/config scripts/cowork/sync-hr-inactive.js` (dry run) then
+  `--apply`. Dry run on 12 Oct 2026 (local HR copy): GR0025, GR0124.
+
+Tests: `services/coworkHrAccess.test.js` (13, node:test, fakes — touches no
+Firebase account).

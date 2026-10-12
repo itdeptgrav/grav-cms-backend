@@ -188,7 +188,10 @@ async function listCoworkEmployees() {
   if (_empListCache && Date.now() < _empListCacheExp) return _empListCache;
   const { directoryEntryFromSnapshot } = require("./coworkEmployeeProjection");
   const snap = await db.collection("cowork_employees").orderBy("createdAt", "desc").get();
-  const result = snap.docs.map(directoryEntryFromSnapshot);
+  /* Inactive in HR reads `status: "inactive"` here even before the record
+     was synced (12 Oct 2026, owner): the CoWork app treats that as exited —
+     off every picker and active list, still named on the work they did. */
+  const result = await require("./coworkHrAccess.service").markDirectory(snap.docs.map(directoryEntryFromSnapshot));
   _empListCache = result;
   _empListCacheExp = Date.now() + EMP_LIST_TTL;
   return result;

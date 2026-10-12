@@ -89,6 +89,42 @@ async function detachIfDeparted(req, before, after) {
     return null;
   }
 }
+/* ── INACTIVE IN HR = NO COWORK; ACTIVE AGAIN = ACCESS BACK (12 Oct 2026) ──
+   CoWork's accounts are Firestore records behind Firebase logins, and nothing
+   tied them to this status. On every transition either way the linked
+   account is marked (never deleted) and its login switched off or back on —
+   services/coworkHrAccess.service.js. Like the departure above it never fails
+   the HR save: a failure is logged, and CoWork's own token check still
+   refuses the person on their next request because it asks HR too. */
+async function syncCoworkAccess(req, before, after) {
+  const { hasLeft } = require("../../services/employeeDeparture");
+  if (!after || hasLeft(before) === hasLeft(after)) return null;
+  try {
+    const out = await require("../../services/coworkHrAccess.service").syncEmployee(after, {
+      by: req.user?.name || req.user?.email || "HR",
+    });
+    const changed = out.deactivated.length + out.reactivated.length;
+    if (changed) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:employees",
+        entity: "employee",
+        entityId: after._id,
+        entityLabel: `${after.firstName || ""} ${after.lastName || ""}`.trim(),
+        action: "update",
+        summary: out.deactivated.length
+          ? `CoWork access switched off (${out.deactivated.map((d) => d.id).join(", ")}); the CoWork record is kept.`
+          : `CoWork access switched back on (${out.reactivated.map((d) => d.id).join(", ")}).`,
+        before: { cowork: out.deactivated.length ? "active" : "inactive" },
+        after: { cowork: out.deactivated.length ? "inactive" : "active" },
+      });
+    }
+    return out;
+  } catch (err) {
+    console.error(`[cowork-hr] ${after?._id}: could not sync CoWork access — ${err.message}`);
+    return null;
+  }
+}
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
@@ -840,6 +876,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
     await detachIfDeparted(req, beforeDoc, updated.toObject());
+    await syncCoworkAccess(req, beforeDoc, updated.toObject());
 
     /* An email is the key every access record is filed under, and it is
        editable right here. Changing it without moving those records orphans
@@ -1336,6 +1373,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
         await detachIfDeparted(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
+        await syncCoworkAccess(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
         // Same reason as the single-employee update: a change of employment
         // type changes whether the app will let them in, and the answer is
         // cached for five minutes.
@@ -1825,6 +1863,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     invalidateAppAccess(req.params.id);
     dropHrAuthorizationCache("employee deactivated");
     const departure = await detachIfDeparted(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
+    const cowork = await syncCoworkAccess(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
 
     // Audit: who deactivated this employee.
     recordChange(req, {
@@ -1841,7 +1880,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     res
       .status(200)
-      .json({ success: true, message: "Employee deactivated successfully", departure });
+      .json({ success: true, message: "Employee deactivated successfully", departure, cowork });
   } catch (error) {
     console.error("Delete employee error:", error);
     if (error.name === "CastError")
