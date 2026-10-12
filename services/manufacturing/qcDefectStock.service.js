@@ -294,4 +294,8 @@ async function reverseDefectDebit({ session = null, prior, actor, replacedById }
   return { reversedAt: new Date(), reversalTransactionId: moved.txnId, reversedById: replacedById };
 }
 
-module.exports = { applyDefectDebit, reverseDefectDebit, REASON_DEBIT, REASON_CREDIT };
+/* `moveItem`, `toBaseQuantity`, `shelfOfLabel` and `ITEM_SELECT` are shared
+   with services/inventory/labelQuantityStock.service.js (12 Oct 2026): a
+   label's corrected figure moves stock through the same guarded update and
+   writes the same ledger row. */
+module.exports = { applyDefectDebit, reverseDefectDebit, REASON_DEBIT, REASON_CREDIT, moveItem, toBaseQuantity, shelfOfLabel, ITEM_SELECT };

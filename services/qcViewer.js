@@ -228,8 +228,12 @@ async function resolveViewer(req) {
     role,
     isAdmin: caller.isAdmin,
     // The owner runs the line: the customer rollup, the rework figures and the
-    // per-inspector comparison are the reason that role exists.
-    canSeeEveryone: Boolean(caller.isAdmin || role === "owner"),
+    // per-inspector comparison are the reason that role exists. An APPROVER
+    // sees the same book (12 Oct 2026, owner: "for the approver QC employees
+    // who don't have full access the Orders tab is not showing, but it needs
+    // to") — they approve the department's work, so they read all of it.
+    // Setup stays the owner's.
+    canSeeEveryone: Boolean(caller.isAdmin || role === "owner" || role === "approver"),
   };
 }
 

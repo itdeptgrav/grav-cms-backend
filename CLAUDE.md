@@ -1698,3 +1698,230 @@ Verified 10 Oct 2026 against the dev database on label
 re-check passed → all three back, credit row written; a 1000 m defect on a
 5 m label was refused with nothing moved. The test records and the two
 net-zero ledger rows were deleted afterwards.
+
+## The receive pages weigh too (11 Oct 2026, owner)
+
+"The weight-basis checkbox on the raw item barcode print page needs to be on
+the GRN / receive page as well, since labels are generated there too."
+`GET /api/cms/inventory/operations/purchase-orders/data/raw-items/:id/units`
+— the read the purchase receive page has always made for its "into stock"
+column — now also answers `weighing: { item: [...], byVariant: { <variantId>:
+[...] } }`: the conversions flagged `measureByWeight` (fromUnit, toUnit,
+quantity, tareQuantity or null). Additive; `baseUnit` and `availableUnits`
+are byte-identical. The CMS label workspace (`CountLabelWorkspace`, mounted
+on the purchase-order, customer-material and material-request receive pages)
+reads it for the session's `rawItemId` and offers the scale panel for the
+session's `variantId`. Nothing about `reserveBatch` changed: the derived
+figure arrives as the same `quantityPerLabel` a person would have typed.
+
+## Printed labels linked to a recorded GRN afterwards (11 Oct 2026, owner)
+
+Labels printed from Material labels carry no goods receipt. When their goods
+arrived on a receipt that is already recorded, Receive › Link labels to a GRN
+(grav-cms `goods-receipts/link-labels`) links them, and a scan of the label
+then names that receipt. `services/storePurchase/labelGrnLink.service.js` is
+every rule; three routes on `goodsReceipts.js`, declared above `/:grnId`:
+
+- `POST /label-links/check` (READ) `{ barcodeIds, goodsReceiptId? }` → each
+  label's standing (`refusalOf`) and `choices`: the RECORDED purchase and
+  material-request receipts whose lines carry a scanned material (never
+  CUSTOMER_MATERIAL, never VOID, company-scoped), best fit first, each with
+  `plan` (`planLinks`: which line each label goes onto, what the line then
+  carries, cautions). `goodsReceiptId` is always offered, even when nothing
+  scanned is on it.
+- `POST /label-links` (RECEIPT_RECORD) `{ goodsReceiptId, barcodeIds }` → per
+  label `linked` / `already` / `refused` with the reason. One unit of work,
+  one `LABELS_LINKED` history entry on the GRN.
+- `POST /label-links/unlink` (RECEIPT_RECORD) `{ barcodeId }` → back to exactly
+  what the label carried (`grnLink.previous`), `LABEL_UNLINKED` on the GRN.
+
+- **Nothing moves.** The receipt already booked the stock; the label was
+  printed for stock on hand. Linking writes provenance only.
+- **A link stamps what a label printed AT the receipt carries**:
+  `goodsReceiptId/Number/LineId`, and on a purchase receipt `purchaseOrder`,
+  `purchaseOrderNumber`, `purchaseOrderItemId`, `vendor`, `vendorName` and the
+  PO line's `unitPrice` — the price only when the label is in that line's unit.
+  So QC Inspect, QC's GRN book and the GRN view's label count see it unchanged.
+- **The line is found by material and variant, never a name** (`candidateLines`):
+  same raw item; exact variant first, then a line with no variant; a label with
+  no variant only where the receipt has the material on one line.
+- **Refused, left untouched:** another material/variant, already on a receipt,
+  voided, customer-owned, inside an open receiving count, another company's.
+  More on labels than the line received is a caution, never a refusal.
+- **`Barcode.grnLink`** (`{ linkedAt, linkedBy, linkedByName, previous }`,
+  default null) marks a link made later. Unlink refuses a label received at its
+  receipt or linked by QC (`NOT_LINKED_HERE`) and one QC has checked against
+  that receipt (`QC_CHECKED`).
+- `GET /api/cms/inventory/barcodes/:id` answers `goodsReceipt`
+  (`receiptOfLabel`: number, date, kind, PO + supplier or request + order, the
+  line, `linkedLater`, `href`), null for an unlinked label; customer-owned
+  labels are unchanged.
+
+Tests: `test/store-purchase/label-grn-link.route.test.js` (14).
+
+## PPM meetings against a merchandising order are CoWork meetings (11 Oct 2026, owner)
+
+"The merchandiser will create the meeting from the CMS; it is created in
+CoWork for that user, linked to the order, and the meeting history —
+transcript, audio recording and all — shows against the order here. Only
+those meetings. No join here; everyone joins in CoWork."
+
+`services/merchandising/orderMeetings.service.js` (+ the pure
+`orderMeetings.rules.js`, tested by `npm test`) on three doors of
+`routes/CMS_Routes/Merchandising/orderRoute.js`:
+
+- `GET /api/cms/merchandising/orders/:id/meetings` (FILE_READ) → `{ order,
+  me, meetings[] }`. `me` is the session's CoWork identity or null.
+- `GET …/orders/:id/meetings/people` (FILE_READ) → every active
+  `cowork_employees` row, for the picker.
+- `POST …/orders/:id/meetings` (REQUIREMENT_WRITE) `{ title, description,
+  startsAt (ISO), durationMinutes, participants[], agenda[] }` → 201
+  `{ meeting, me }`.
+
+**The meeting IS a `cowork_scheduled_meets` document**, written by the same
+`cowork.service.scheduleCoworkMeet` the CoWork app calls (shared `meetSeq`
+counter, organiser first in `participants`, `status: scheduled`, the
+`events` audit row, the in-app notification + push + e-mail to every other
+participant). Then ONE `.update({ linkedOrder })`: `{ source:
+"cms-merchandising", kind: "ppm", customerRequestId, orderRef, customerName,
+companyId, createdByEmail, createdByName, createdByCoworkId, createdAt }`.
+Every later CoWork write is a keyed `.update()`, so the tag survives; the
+list reads `where("linkedOrder.customerRequestId", "==", id)` and keeps only
+`source === "cms-merchandising"`, so a meeting made inside CoWork is never
+shown against an order. **Nothing in CoWork changed** — the created
+document carries exactly a CoWork meet's fields plus `linkedOrder`
+(compared key for key against M096 on 11 Oct 2026).
+
+- **The organiser** is `Employee.coworkEmployeeId` (the explicit link), else
+  the `cowork_employees` row whose `email`/`legacyEmail` is the session's;
+  none → 409 CONFLICT `NO_COWORK_ACCOUNT`, nothing written. ceo@grav.in has
+  no CoWork account on the dev DB; rakesh.biswal@grav.in → GR0045 by link.
+- **Validation** (`normaliseMeeting`): a title (defaults to `PPM · <orderRef>`),
+  a start not more than 10 minutes in the past (CoWork's instant meeting is
+  "now"), 15 min–8 h, every participant a CoWork user. `dateTime`/`endsAt`
+  are UTC `toISOString()` strings — the 15-minute reminder sweep compares
+  strings, so a `datetime-local` value would be mis-compared.
+- **History is read, never copied**: `historyOf(meetId)` reads
+  `meeting_audio_recordings` (Drive view/download URLs), `meeting_summaries/
+  {meetId}`, `meeting_transcripts_gemini/{meetId}` (verbatim / translate
+  utterances) and `meeting_transcripts/{meetId}` (live captions, 24 h). A
+  missing document is `null`, never an empty shape; a failed read logs and
+  leaves `history: null`.
+- No cancel / start / join door: those are CoWork's own routes.
+
+Checked 11 Oct 2026: M097 created through the door as GR0045 with no other
+participant (0 notifications), listed against REQ-2026-0041 with an empty
+history, read back on the CMS page, then deleted (doc, events, RTDB mirror).
+`historyOf("M095")` returned 2 recordings and a 129-line verbatim transcript.
+
+### A label on another receipt, or in an unrecorded count, MOVES when linked (12 Oct 2026, owner)
+
+"Some barcodes were printed on the GRN page but that GRN was never marked
+done; the labels are on the raw items and we cannot remove them. Don't
+restrict this — even a label already linked to some GRN, if the user scans
+it he wants to switch it to the new GRN." So `labelGrnLink.service`:
+
+- `refusalOf` keeps only what can never be linked: unknown / another
+  company's, customer-owned, voided. `standingOf` says where a linkable label
+  stands: `free`, `linked` (`linkedTo`, with `linkedHere`), or `in-count`
+  (`inCount`: the receiving session, the PO number, the identity state).
+  `check` answers `ok: true` for all three with `standing`, and `counts` now
+  carries `inCount` beside `alreadyLinked` (both are inside `ready`).
+- `link` moves a label already on another receipt (`results[].movedFrom`) and
+  takes one out of an unrecorded count (`results[].leftCount`): the count's
+  `receivingSessionId`, `sessionSequence` and `adoptedAt` are cleared and the
+  label becomes `ACTIVATED` — a live label of the chosen receipt, as recording
+  that count would have made it. The write is guarded on what was read
+  (`goodsReceiptId` and `receivingSessionId` as they stood), never on
+  "nothing yet". A label already on the CHOSEN receipt still answers
+  `already`. The history row counts `movedFromReceipts` / `takenFromCounts`.
+- `grnLink.previous` now also carries the old `goodsReceiptId/Number/LineId`,
+  `receivingSessionId`, `sessionSequence`, `adoptedAt`, `identityState` and
+  `linkedHereBefore`, and `unlink` restores every one of them — the label goes
+  back onto the receipt it was moved from, or back into the count it left
+  (`backTo` in the answer). QC's `QC_CHECKED` refusal on unlink is unchanged.
+
+Round-tripped 12 Oct 2026 against the dev DB: the one in-count label
+(SNAP BUTTON, PRINTED, session 6aca89a6…) → linked to GRN/2026-27/0004,
+out of the count, ACTIVATED → unlinked → back in the count, PRINTED,
+sequence 1; a Waistband label on GRN/0005 → moved to GRN/0008 (`movedFrom`
+0005) → unlinked → back on 0005. `label-grn-link.route.test.js` case 9
+describes the new rule (jest; not runnable on this machine).
+
+## A raw item's base unit may be changed (12 Oct 2026, owner)
+
+"There is a restriction that we can't edit the base unit — remove it
+immediately." `PUT /api/cms/raw-items/:id` refused a unit change with 409
+`UNIT_CHANGE_BLOCKED` whenever the item held stock, had movements, or sat on
+a purchase order or material request (the stored quantities are bare
+numbers read in that unit; nothing converts them). The refusal is now OFF
+unless `STORE_UNIT_CHANGE_STRICT=1`; the same facts are still gathered and
+written to the server log as a `console.warn` naming the item, the old and
+new unit, who changed it and what history it carries. The CMS form never
+locked the field — the refusal was the whole restriction. Round-tripped
+12 Oct 2026 on Waistband Woven: Mtr → Nos → Mtr through the route.
+
+## A label's quantity may be overwritten (12 Oct 2026, owner)
+
+Inventory › Label quantity: "scan the raw-item barcode, it shows the defined
+quantity, overwrite it by reducing or increasing, reason optional, done."
+`PATCH /api/cms/inventory/barcodes/:id/quantity` `{ quantity, reason? }`
+(barcodes.js, company-scoped like the read) sets the label's `quantity` to
+the figure given — absolute, so a repeated send is harmless and answers
+`unchanged` — marks `quantityMeasured`, and appends `{ from, to, unit,
+reason, by, byName, at }` to the new `Barcode.quantityEdits[]`. Refused:
+zero or less (`QUANTITY_INVALID` — void the label instead), a voided label
+(`LABEL_VOIDED`), a customer-owned one (`CUSTOMER_OWNED`); a concurrent
+change answers `LABEL_CHANGED`. Round-tripped 12 Oct 2026 on a Waistband
+label (25 → 11.5 → 10, then restored to 25 with the history cleared).
+
+**…and moves the stock in hand with it (same day, owner: "the corresponding
+qty also needs to reduce from the inventory in-hand qty — keep it as a
+checkbox, ticked by default").** The body takes `adjustStock` (absent = true).
+When true, `services/inventory/labelQuantityStock.service.js`
+(`applyLabelQuantityDelta`) moves `RawItem.quantity` and the variant's
+quantity by (to − from) in the item's registered unit through the QC defect
+service's own `moveItem` / `toBaseQuantity` / `shelfOfLabel` (now exported):
+ONE guarded atomic update (a reduction the balance does not cover is
+refused, never negative), a `VARIANT_REDUCE` / `REDUCE` or `VARIANT_ADD` /
+`ADD` row with reason **"Label quantity corrected"** (label id, from → to,
+the typed reason in `notes`), and the label's shelf balance when it sits on
+one (best effort, both directions). Only a label that IS stock moves it: one
+inside an unrecorded receiving count (RESERVED / PRINTED / APPLIED) answers
+`skipped: true, errorCode: NOT_STOCK` and nothing moves. The label is written
+FIRST and keeps its corrected figure even when the stock refuses; the answer
+carries `stockAdjustment` (applied / skipped / error), `warnings[]` when it
+failed, and the block is written on the edit (`quantityEdits[].stock`,
+Mixed). Round-tripped 12 Oct 2026 on label 6aba126797326bf7d6d6b643
+(Waistband Woven · Anamika Enterprisers · 37mm): 25 → 24 ticked → variant
+875 → 874, item 1000 → 999, ledger row; 24 → 25 unticked → stock unchanged;
+25 → 26 ticked → back to 875 / 1000 with an ADD row; a PRINTED in-count
+label → `NOT_STOCK`, nothing moved. Edits, flag and the net-zero rows were
+removed afterwards.
+
+## A QC approver reads the department's orders (12 Oct 2026, owner)
+
+"For the approver QC employees who don't have full access the Orders tab is
+not showing, but it needs to." `services/qcViewer.js` now answers
+`canSeeEveryone` for `role === "approver"` as well as the owner (and admins),
+so `GET /manufacturing/qc/orders`, `/orders/:moId` and `/orders/:moId/analytics`
+(`requireQcOwnerViewer`) admit an approver and their reads are unscoped like
+the owner's. On the raw-item router the order and GRN BOOKS (`/orders`,
+`/orders/:moId`, `/grns`, `/grns/:grnId`) sit behind a new
+`requireOrdersReader` (owner, approver or checker); checking, lookup and
+save keep `requireChecker` / `requireOwnerOrChecker`, and Setup keeps
+`requireOwner`. Nothing an approver may WRITE changed.
+
+## A QC defect no longer moves stock (12 Oct 2026, owner)
+
+"Upon filling the defect quantity it reduces that much from the inventory
+in-hand qty and from the sticker's qty — that shouldn't happen; the figure is
+just for information." The 10 Oct 2026 debit is OFF: `POST
+/manufacturing/qc/raw-items/save` with `status: "defective"` records
+`defectiveQuantity` and touches neither `Barcode.quantity` nor the raw item /
+variant quantities; `stockDebit` stays empty and the response carries no
+stock line or warning. `QC_DEFECT_MOVES_STOCK=1` restores it.
+`reverseDefectDebit` still runs on a re-check for a record whose earlier
+verdict DID apply a debit, so stock taken before today is put back as it was
+always meant to be. `qcDefectStock.service.js` is untouched (Label quantity
+shares its movers).

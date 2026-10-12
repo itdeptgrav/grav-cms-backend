@@ -96,6 +96,27 @@ const barcodeSchema = new mongoose.Schema(
     // ── Printed quantity ─────────────────────────────────────────────────────
     quantity: { type: Number, required: true, min: 0 },
     unit:     { type: String, required: true, trim: true },
+    /* ── OVERWRITTEN ON INVENTORY › LABEL QUANTITY (12 Oct 2026, owner) ──
+       A scanned label's figure may be corrected on that screen: the figure is
+       replaced and every change is kept here, oldest first — from, to, why,
+       who, when. Stock is not moved by it; the label's figure is what the
+       sticker says. */
+    quantityEdits: [{
+      _id: false,
+      from: { type: Number, default: null },
+      to: { type: Number, default: null },
+      unit: { type: String, trim: true, default: "" },
+      reason: { type: String, trim: true, default: "" },
+      by: { type: mongoose.Schema.Types.ObjectId, default: null },
+      byName: { type: String, trim: true, default: "" },
+      at: { type: Date, default: null },
+      /* Whether the material's in-hand quantity moved with this edit
+         (12 Oct 2026, owner — the "also adjust the stock" checkbox): the
+         block services/inventory/labelQuantityStock.service.js returned —
+         `applied`, `baseDelta`, `transactionId`, or `error` / `errorCode`
+         / `skipped`. Null when the person unticked the box. */
+      stock: { type: mongoose.Schema.Types.Mixed, default: null },
+    }],
 
     // ── Optional PO link (nullable) ──────────────────────────────────────────
     purchaseOrder: {
@@ -146,6 +167,49 @@ const barcodeSchema = new mongoose.Schema(
     goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
     goodsReceiptNumber: { type: String, trim: true, default: "" },
     goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+
+    /* ── LINKED TO ITS RECEIPT AFTERWARDS (11 Oct 2026, owner) ────────────
+       A label printed from Material labels carries no receipt. When the
+       goods it is stuck to arrived on a GRN that is already recorded, the
+       Store links it on Receive › Link labels to a GRN
+       (services/storePurchase/labelGrnLink.service.js): the three receipt
+       fields above are stamped — and, on a purchase receipt, the order,
+       supplier and price — exactly as on a label printed at the receipt.
+
+       This block says it happened LATER, who did it, and what the label
+       carried before, so a wrong link can be taken back to exactly what it
+       was. Null on every label received at its receipt (and on every label
+       QC linked while checking it). Moves no stock: the receipt already did. */
+    grnLink: {
+      type: new mongoose.Schema({
+        linkedAt: { type: Date, default: null },
+        linkedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
+        linkedByName: { type: String, trim: true, default: "" },
+        previous: {
+          /* Where the label stood before it was linked here (12 Oct 2026): a
+             label may now be MOVED from another receipt, or taken out of an
+             unrecorded receiving count, and `unlink` puts it back from these.
+             The schema is strict, so a field missing here is silently dropped
+             on write — which is exactly how the first round trip lost them. */
+          goodsReceiptId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          goodsReceiptNumber: { type: String, trim: true, default: "" },
+          goodsReceiptLineId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          receivingSessionId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          sessionSequence: { type: Number, default: null },
+          adoptedAt: { type: Date, default: null },
+          identityState: { type: String, trim: true, default: null },
+          quantityMeasured: { type: Boolean, default: null },
+          linkedHereBefore: { type: Boolean, default: false },
+          purchaseOrder: { type: mongoose.Schema.Types.ObjectId, default: null },
+          purchaseOrderNumber: { type: String, trim: true, default: "" },
+          purchaseOrderItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+          vendor: { type: mongoose.Schema.Types.ObjectId, default: null },
+          vendorName: { type: String, trim: true, default: "" },
+          unitPrice: { type: Number, default: null },
+        },
+      }, { _id: false }),
+      default: null,
+    },
 
     /* ── WHICH PRINT RUN MINTED THIS ──────────────────────────────────────
        A thermal printer that times out is the ordinary case, and the operator
