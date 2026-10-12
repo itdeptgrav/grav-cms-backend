@@ -2187,7 +2187,7 @@ async function requireQcOwnerViewer(req, res) {
   if (!viewer.canSeeEveryone) {
     res.status(403).json({
       success: false,
-      message: "Only the QC owner can see the department's orders.",
+      message: "Only the QC owner or an approver can see the department's orders.",
     });
     return null;
   }

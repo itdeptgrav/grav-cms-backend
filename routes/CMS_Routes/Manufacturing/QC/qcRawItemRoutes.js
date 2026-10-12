@@ -122,6 +122,16 @@ async function requireOwnerOrChecker(req, res, next) {
     return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "Raw material checking is for the QC owner and the assigned checkers." });
   } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
 }
+/* The order and GRN BOOKS (reads only) are open to an approver as well
+   (12 Oct 2026, owner): the Orders tab shows for approvers now, and its
+   material section reads these. Checking itself stays with the checkers. */
+async function requireOrdersReader(req, res, next) {
+  try {
+    const who = await whoAmI(req);
+    if (who.owner || who.checker || who.role === "approver") return next();
+    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "The raw-material order book is for the QC owner, approvers and the assigned checkers." });
+  } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
+}
 
 /* ── the setup ───────────────────────────────────────────────────────────── */
 
@@ -307,7 +317,7 @@ const orderRow = (mo, r) => ({
  * `source` is a FILTER, not a boundary. Narrowing to customer-supplied gives
  * exactly the old list; the difference is that it is now the reader's choice.
  */
-router.get("/orders", requireOwnerOrChecker, async (req, res) => {
+router.get("/orders", requireOrdersReader, async (req, res) => {
   try {
     const q = str(req.query.q).toLowerCase();
     const scope = str(req.query.scope) || "all"; // all | checked | requires
@@ -376,7 +386,7 @@ router.get("/orders", requireOwnerOrChecker, async (req, res) => {
  *  such an order had none at all and reported nothing to check.
  *
  *  Checked / passed / defective / remaining come from the standing records. */
-router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
+router.get("/orders/:moId", requireOrdersReader, async (req, res) => {
   try {
     if (!isId(req.params.moId)) return res.status(400).json({ success: false, message: "Not an order id." });
     const mo = await CustomerRequest.findById(req.params.moId).select(MO_SELECT).lean();
@@ -784,7 +794,7 @@ function stockDebitView(sd) {
  * QC Orders page shows beside the manufacturing orders. `q`, `status`
  * (all | not-started | in-progress | complete | defects) and `customer` narrow it.
  */
-router.get("/grns", requireOwnerOrChecker, async (req, res) => {
+router.get("/grns", requireOrdersReader, async (req, res) => {
   try {
     const out = await qcGrns.listGrns({ q: str(req.query.q), status: str(req.query.status) || "all", customer: str(req.query.customer) });
     res.json({ success: true, ...out });
@@ -792,7 +802,7 @@ router.get("/grns", requireOwnerOrChecker, async (req, res) => {
 });
 
 /** One GRN: each line's received quantity against what QC has checked, every label and its verdict, every record. */
-router.get("/grns/:grnId", requireOwnerOrChecker, async (req, res) => {
+router.get("/grns/:grnId", requireOrdersReader, async (req, res) => {
   try {
     const d = await qcGrns.grnDetail(req.params.grnId);
     if (!d) return res.status(404).json({ success: false, message: "No material-request goods receipt with that id is on record." });

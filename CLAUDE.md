@@ -1898,3 +1898,16 @@ Mixed). Round-tripped 12 Oct 2026 on label 6aba126797326bf7d6d6b643
 25 → 26 ticked → back to 875 / 1000 with an ADD row; a PRINTED in-count
 label → `NOT_STOCK`, nothing moved. Edits, flag and the net-zero rows were
 removed afterwards.
+
+## A QC approver reads the department's orders (12 Oct 2026, owner)
+
+"For the approver QC employees who don't have full access the Orders tab is
+not showing, but it needs to." `services/qcViewer.js` now answers
+`canSeeEveryone` for `role === "approver"` as well as the owner (and admins),
+so `GET /manufacturing/qc/orders`, `/orders/:moId` and `/orders/:moId/analytics`
+(`requireQcOwnerViewer`) admit an approver and their reads are unscoped like
+the owner's. On the raw-item router the order and GRN BOOKS (`/orders`,
+`/orders/:moId`, `/grns`, `/grns/:grnId`) sit behind a new
+`requireOrdersReader` (owner, approver or checker); checking, lookup and
+save keep `requireChecker` / `requireOwnerOrChecker`, and Setup keeps
+`requireOwner`. Nothing an approver may WRITE changed.
