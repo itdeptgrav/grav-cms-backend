@@ -1860,3 +1860,41 @@ written to the server log as a `console.warn` naming the item, the old and
 new unit, who changed it and what history it carries. The CMS form never
 locked the field — the refusal was the whole restriction. Round-tripped
 12 Oct 2026 on Waistband Woven: Mtr → Nos → Mtr through the route.
+
+## A label's quantity may be overwritten (12 Oct 2026, owner)
+
+Inventory › Label quantity: "scan the raw-item barcode, it shows the defined
+quantity, overwrite it by reducing or increasing, reason optional, done."
+`PATCH /api/cms/inventory/barcodes/:id/quantity` `{ quantity, reason? }`
+(barcodes.js, company-scoped like the read) sets the label's `quantity` to
+the figure given — absolute, so a repeated send is harmless and answers
+`unchanged` — marks `quantityMeasured`, and appends `{ from, to, unit,
+reason, by, byName, at }` to the new `Barcode.quantityEdits[]`. Refused:
+zero or less (`QUANTITY_INVALID` — void the label instead), a voided label
+(`LABEL_VOIDED`), a customer-owned one (`CUSTOMER_OWNED`); a concurrent
+change answers `LABEL_CHANGED`. Round-tripped 12 Oct 2026 on a Waistband
+label (25 → 11.5 → 10, then restored to 25 with the history cleared).
+
+**…and moves the stock in hand with it (same day, owner: "the corresponding
+qty also needs to reduce from the inventory in-hand qty — keep it as a
+checkbox, ticked by default").** The body takes `adjustStock` (absent = true).
+When true, `services/inventory/labelQuantityStock.service.js`
+(`applyLabelQuantityDelta`) moves `RawItem.quantity` and the variant's
+quantity by (to − from) in the item's registered unit through the QC defect
+service's own `moveItem` / `toBaseQuantity` / `shelfOfLabel` (now exported):
+ONE guarded atomic update (a reduction the balance does not cover is
+refused, never negative), a `VARIANT_REDUCE` / `REDUCE` or `VARIANT_ADD` /
+`ADD` row with reason **"Label quantity corrected"** (label id, from → to,
+the typed reason in `notes`), and the label's shelf balance when it sits on
+one (best effort, both directions). Only a label that IS stock moves it: one
+inside an unrecorded receiving count (RESERVED / PRINTED / APPLIED) answers
+`skipped: true, errorCode: NOT_STOCK` and nothing moves. The label is written
+FIRST and keeps its corrected figure even when the stock refuses; the answer
+carries `stockAdjustment` (applied / skipped / error), `warnings[]` when it
+failed, and the block is written on the edit (`quantityEdits[].stock`,
+Mixed). Round-tripped 12 Oct 2026 on label 6aba126797326bf7d6d6b643
+(Waistband Woven · Anamika Enterprisers · 37mm): 25 → 24 ticked → variant
+875 → 874, item 1000 → 999, ledger row; 24 → 25 unticked → stock unchanged;
+25 → 26 ticked → back to 875 / 1000 with an ADD row; a PRINTED in-count
+label → `NOT_STOCK`, nothing moved. Edits, flag and the net-zero rows were
+removed afterwards.

@@ -96,6 +96,27 @@ const barcodeSchema = new mongoose.Schema(
     // ── Printed quantity ─────────────────────────────────────────────────────
     quantity: { type: Number, required: true, min: 0 },
     unit:     { type: String, required: true, trim: true },
+    /* ── OVERWRITTEN ON INVENTORY › LABEL QUANTITY (12 Oct 2026, owner) ──
+       A scanned label's figure may be corrected on that screen: the figure is
+       replaced and every change is kept here, oldest first — from, to, why,
+       who, when. Stock is not moved by it; the label's figure is what the
+       sticker says. */
+    quantityEdits: [{
+      _id: false,
+      from: { type: Number, default: null },
+      to: { type: Number, default: null },
+      unit: { type: String, trim: true, default: "" },
+      reason: { type: String, trim: true, default: "" },
+      by: { type: mongoose.Schema.Types.ObjectId, default: null },
+      byName: { type: String, trim: true, default: "" },
+      at: { type: Date, default: null },
+      /* Whether the material's in-hand quantity moved with this edit
+         (12 Oct 2026, owner — the "also adjust the stock" checkbox): the
+         block services/inventory/labelQuantityStock.service.js returned —
+         `applied`, `baseDelta`, `transactionId`, or `error` / `errorCode`
+         / `skipped`. Null when the person unticked the box. */
+      stock: { type: mongoose.Schema.Types.Mixed, default: null },
+    }],
 
     // ── Optional PO link (nullable) ──────────────────────────────────────────
     purchaseOrder: {
