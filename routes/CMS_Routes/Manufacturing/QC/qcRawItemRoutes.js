@@ -63,6 +63,16 @@ const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarc
 const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
 const qcGrns = require("../../../../services/manufacturing/qcRawItemGrns");
 const qcDefectStock = require("../../../../services/manufacturing/qcDefectStock.service");
+/* ── THE DEFECTIVE QUANTITY IS INFORMATION, NOT A STOCK MOVEMENT (12 Oct 2026, owner) ──
+   "Upon filling the defect quantity it reduces that much from the inventory
+   in-hand qty and from the sticker's qty — that shouldn't happen. The figure
+   is just for information." So a defective verdict no longer calls
+   `applyDefectDebit`: the record keeps `defectiveQuantity`, the label and the
+   raw item's quantities are untouched, and `stockDebit` stays empty.
+   `QC_DEFECT_MOVES_STOCK=1` restores the 10 Oct 2026 behaviour. A debit an
+   EARLIER verdict did apply is still put back on re-check (`reverseDefectDebit`
+   acts only on `stockDebit.applied`), so nothing taken before stays taken. */
+const DEFECT_MOVES_STOCK = process.env.QC_DEFECT_MOVES_STOCK === "1";
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 
 const SLUG = "qc";
@@ -727,7 +737,7 @@ router.post("/save", requireChecker, async (req, res) => {
         }
         await prior.save(sopt);
       }
-      if (status === "defective") {
+      if (status === "defective" && DEFECT_MOVES_STOCK) {
         doc.stockDebit = await qcDefectStock.applyDefectDebit({ session, inspection: doc, barcode: b, actor, labelQuantity: defQty, labelUnit: b.unit || "" });
         await doc.save(sopt);
       }
@@ -741,7 +751,7 @@ router.post("/save", requireChecker, async (req, res) => {
     const sd = doc.stockDebit;
     const warnings = [];
     let stockLine = "";
-    if (status === "defective") {
+    if (status === "defective" && DEFECT_MOVES_STOCK) {
       if (sd?.applied) {
         const scope = sd.variantId != null && sd.variantNewQuantity != null ? `variant now ${sd.variantNewQuantity} ${sd.baseUnit}` : `item now ${sd.newQuantity} ${sd.baseUnit}`;
         stockLine = ` Stock reduced by ${sd.baseQuantity} ${sd.baseUnit} (${scope}); the label now reads ${sd.labelAfter} ${b.unit || ""}.`.replace(/\s+\./g, ".");

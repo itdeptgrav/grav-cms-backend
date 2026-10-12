@@ -1911,3 +1911,17 @@ the owner's. On the raw-item router the order and GRN BOOKS (`/orders`,
 `requireOrdersReader` (owner, approver or checker); checking, lookup and
 save keep `requireChecker` / `requireOwnerOrChecker`, and Setup keeps
 `requireOwner`. Nothing an approver may WRITE changed.
+
+## A QC defect no longer moves stock (12 Oct 2026, owner)
+
+"Upon filling the defect quantity it reduces that much from the inventory
+in-hand qty and from the sticker's qty — that shouldn't happen; the figure is
+just for information." The 10 Oct 2026 debit is OFF: `POST
+/manufacturing/qc/raw-items/save` with `status: "defective"` records
+`defectiveQuantity` and touches neither `Barcode.quantity` nor the raw item /
+variant quantities; `stockDebit` stays empty and the response carries no
+stock line or warning. `QC_DEFECT_MOVES_STOCK=1` restores it.
+`reverseDefectDebit` still runs on a re-check for a record whose earlier
+verdict DID apply a debit, so stock taken before today is put back as it was
+always meant to be. `qcDefectStock.service.js` is untouched (Label quantity
+shares its movers).
