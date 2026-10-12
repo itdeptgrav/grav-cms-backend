@@ -319,6 +319,14 @@ function requireApproval(departmentSlug, opts = {}) {
          set. An approver normally commits directly; this one is held like an
          editor's, and only the owner may decide it. */
       const forOwner = Boolean(req.holdForOwner) && !roleAtLeast(role, "owner");
+      /* ADDING AN EMPLOYEE NEVER WAITS (owner, 12 Oct 2026). When the new
+         record carries pay that only the owner may set, the employee is
+         created at once and ONLY the pay is filed for the owner — by the
+         create route itself (fileOwnerFollowUp below). */
+      if (forOwner && req.method === "POST" && /\/api\/employees\/?(\?|$)/i.test(req.originalUrl || "")) {
+        req.splitPayForOwner = true;
+        return next();
+      }
       if (!forOwner && roleAtLeast(role, "approver")) return next();
       if (!roleAtLeast(role, "editor")) {
         return res.status(403).json({
@@ -370,8 +378,12 @@ function requireApproval(departmentSlug, opts = {}) {
         path: req.originalUrl || req.url || "",
         method: req.method,
         changes: described.changes,
+        body,
       });
-      if (!verdict.hold && !forOwner) {
+      /* An editor's write that only an approver may make directly is always
+         held — that is the only reason the HR contract let it this far
+         (`holdForApprover`, 12 Oct 2026). */
+      if (!verdict.hold && !forOwner && !req.holdForApprover) {
         /* Left for the route's own logging and for auditTrail: this is now an
            ordinary write, and it should read as one in the history. Recorded
            on the request so a route that wants to say "committed directly,
@@ -462,6 +474,36 @@ function requireApproval(departmentSlug, opts = {}) {
       });
     }
   };
+}
+
+/**
+ * File a change for the OWNER to decide, after the caller's own write has
+ * already gone through — e.g. the pay of an employee who was just created
+ * (`splitPayForOwner`). The replay is an ordinary PUT made as the requester,
+ * which the HR contract marks `holdForOwner` and the queue lets through only
+ * as the approved replay.
+ */
+async function fileOwnerFollowUp(req, { departmentSlug = "hr", path, method = "PUT", body, entity = "employee", entityId = "", entityLabel = "", summary = "", fields = [] }) {
+  const resolved = sectionForPath(path);
+  const cr = await ChangeRequest.create({
+    departmentSlug,
+    section: resolved?.section || "",
+    sectionLabel: resolved?.section ? sectionLabel(resolved.section) : "",
+    entity,
+    entityId: String(entityId || ""),
+    entityLabel,
+    action: "update",
+    summary,
+    changes: fields.map((f) => ({ field: f, path: f })),
+    intent: { method, path, body, contentType: "application/json" },
+    requestedBy: actorFrom(req),
+    status: "pending",
+    requiredRole: "owner",
+    requiredRoleReason: `Sets ${fields.join(", ") || "pay"}, which only the owner may set.`,
+  });
+  await recordSubmission(req, cr).catch(() => {});
+  notify(cr, "held");
+  return cr;
 }
 
 /* ------------------------------------------------------------------ */
@@ -741,6 +783,7 @@ module.exports = {
   validatedReplayOf,
   isApprovalReplay,
   requireApproval,
+  fileOwnerFollowUp,
   applyChangeRequest,
   decideChangeRequest,
   actorFrom,

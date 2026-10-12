@@ -78,9 +78,18 @@ async function send(method, path, token, body = {}) {
 }
 
 describe("the contract and the approval queue compose", () => {
-  test("an editor's permitted write is HELD for an approver, not refused and not committed", async () => {
+  test("an editor ADDING an employee (no pay) commits directly — no approval", async () => {
+    /* 12 Oct 2026, owner: adding an employee does not ask. */
     const token = await hrUser("editor");
     const r = await send("POST", "/api/employees", token, { firstName: "New", lastName: "Joiner" });
+    expect(r.status).toBe(200);
+    expect(r.body.committed).toBe(true);
+    expect(await ChangeRequest.countDocuments({})).toBe(0);
+  });
+
+  test("an editor's attendance override is HELD for an approver, not refused and not committed", async () => {
+    const token = await hrUser("editor");
+    const r = await send("PUT", "/hr/attendance/day-override", token, { dateStr: "2026-09-01", biometricId: "GR0001", hrFinalStatus: "P" });
 
     expect(r.status).toBe(202);
     expect(r.body.committed).toBeUndefined();
@@ -89,8 +98,8 @@ describe("the contract and the approval queue compose", () => {
     expect(held).toHaveLength(1);
     /* The held request stores the write verbatim, so replaying an approval
        reissues exactly what was submitted. */
-    expect(held[0].intent.method).toBe("POST");
-    expect(held[0].intent.path).toContain("/api/employees");
+    expect(held[0].intent.method).toBe("PUT");
+    expect(held[0].intent.path).toContain("/day-override");
   });
 
   test("an approver's write commits directly", async () => {
@@ -113,13 +122,17 @@ describe("the contract and the approval queue compose", () => {
     expect(await ChangeRequest.countDocuments({})).toBe(0);
   });
 
-  test("an operation the editor lacks the capability for never reaches the queue either", async () => {
+  test("an operation only an approver may do is SENT FOR APPROVAL, never applied by the editor", async () => {
+    /* 12 Oct 2026, owner: "editor needed approval but the approval isn't
+       sending" — this used to be refused and reached nobody. */
     const token = await hrUser("editor");
     const r = await send("PATCH", "/api/hr/payroll/mark-paid", token, { runId: "x" });
 
-    expect(r.status).toBe(403);
-    expect(r.body.code).toBe("HR_MISSING_CAPABILITY");
-    expect(await ChangeRequest.countDocuments({})).toBe(0);
+    expect(r.status).toBe(202);
+    expect(r.body.committed).toBeUndefined();
+    const held = await ChangeRequest.find({ departmentSlug: "hr" }).lean();
+    expect(held).toHaveLength(1);
+    expect(held[0].intent.path).toContain("/payroll/mark-paid");
   });
 });
 

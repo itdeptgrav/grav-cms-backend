@@ -17,7 +17,9 @@
 //
 // A successful match on (2), (3) or (4) UPGRADES the stored value to a bcrypt
 // hash, so each account converts the first time its owner signs in and the
-// legacy paths quietly drain away rather than living forever.
+// legacy paths quietly drain away rather than living forever — but (3) and (4)
+// only when no real (bcrypt) password is stored: a default sign-in never
+// replaces a password HR or the person set (12 Oct 2026).
 
 "use strict";
 
@@ -71,16 +73,25 @@ async function matchesEmployeePassword(employee, plain) {
     return { ok: true, via: "plaintext", needsUpgrade: true };
   }
 
+  /* A default may still sign somebody in, but it must NEVER replace a real
+     password that is stored (12 Oct 2026). "Upgrading" on a default match
+     overwrote the password HR had just set through "forgot password"
+     whenever anybody — or an app holding old credentials — signed in with a
+     default, so HR had to set it again several times a day. A default
+     upgrades only an account with no real password: nothing stored, or the
+     legacy plain text. */
+  const hasRealPassword = stored.startsWith("$2");
+
   // 3. Firstname@MMDDYYYY
   const nameDefault = defaultFromNameAndDob(employee.firstName, employee.dateOfBirth);
   if (nameDefault && submitted === nameDefault) {
-    return { ok: true, via: "default-name-dob", needsUpgrade: true };
+    return { ok: true, via: "default-name-dob", needsUpgrade: !hasRealPassword };
   }
 
   // 4. Phone default
   const phoneDefault = defaultFromPhone(employee.phone);
   if (phoneDefault && submitted === phoneDefault) {
-    return { ok: true, via: "default-phone", needsUpgrade: true };
+    return { ok: true, via: "default-phone", needsUpgrade: !hasRealPassword };
   }
 
   return { ok: false, via: null, needsUpgrade: false };
