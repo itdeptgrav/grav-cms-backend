@@ -1847,3 +1847,16 @@ out of the count, ACTIVATED → unlinked → back in the count, PRINTED,
 sequence 1; a Waistband label on GRN/0005 → moved to GRN/0008 (`movedFrom`
 0005) → unlinked → back on 0005. `label-grn-link.route.test.js` case 9
 describes the new rule (jest; not runnable on this machine).
+
+## A raw item's base unit may be changed (12 Oct 2026, owner)
+
+"There is a restriction that we can't edit the base unit — remove it
+immediately." `PUT /api/cms/raw-items/:id` refused a unit change with 409
+`UNIT_CHANGE_BLOCKED` whenever the item held stock, had movements, or sat on
+a purchase order or material request (the stored quantities are bare
+numbers read in that unit; nothing converts them). The refusal is now OFF
+unless `STORE_UNIT_CHANGE_STRICT=1`; the same facts are still gathered and
+written to the server log as a `console.warn` naming the item, the old and
+new unit, who changed it and what history it carries. The CMS form never
+locked the field — the refusal was the whole restriction. Round-tripped
+12 Oct 2026 on Waistband Woven: Mtr → Nos → Mtr through the route.
