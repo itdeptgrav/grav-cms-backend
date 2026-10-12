@@ -152,6 +152,9 @@ const SENSITIVE_PATHS = [
   "/bulk-day-override",
   "/punch-correction",
   "/remove-from-month",
+  // Moves a time-office code's punches onto an employee: a punch correction
+  // for a run of days at once (12 Oct 2026).
+  "/link-device-code",
   "/leave",
   "/password-management",
   "/access",

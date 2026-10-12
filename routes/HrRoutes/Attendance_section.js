@@ -570,7 +570,8 @@ async function buildEmployeeMap() {
       .lean();
   const byBiometric = new Map(),
     byName = new Map(),
-    bySorted = new Map();
+    bySorted = new Map(),
+    byDeviceCode = new Map();
   let skippedNoId = 0,
     skippedNoName = 0;
   for (const e of employees) {
@@ -584,6 +585,15 @@ async function buildEmployeeMap() {
         if (!byBiometric.has(nk)) byBiometric.set(nk, e);
       }
     } else skippedNoId++;
+    /* Codes HR linked from a ghost row (the time office records this person
+       under another code). Never over a real biometricId: an ID somebody
+       holds is theirs. */
+    for (const code of e.attendanceDeviceCodes || []) {
+      const k = String(code || "").trim().toUpperCase();
+      if (k && !byDeviceCode.has(k)) byDeviceCode.set(k, e);
+      const num = numericOf(k);
+      if (num != null && !byDeviceCode.has(String(num))) byDeviceCode.set(String(num), e);
+    }
     const name = extractName(e);
     if (!name) {
       skippedNoName++;
@@ -599,7 +609,7 @@ async function buildEmployeeMap() {
   console.log(
     `[MAP] ${employees.length} emps → bioKeys=${byBiometric.size} nameKeys=${byName.size} sortedKeys=${bySorted.size} (noId:${skippedNoId}, noName:${skippedNoName})`,
   );
-  return { byBiometric, byName, bySorted, employees };
+  return { byBiometric, byName, bySorted, byDeviceCode, employees };
 }
 
 function providerKeys(empcode) {
@@ -629,6 +639,11 @@ function matchEmployee({ Name, Empcode }, empMap) {
       employee: empMap.byBiometric.get(keys.raw),
       method: "biometric-raw",
     };
+  const linked = empMap.byDeviceCode || new Map();
+  for (const k of [keys.padded, keys.raw, keys.numeric]) {
+    if (k && linked.has(k))
+      return { employee: linked.get(k), method: "biometric-linked" };
+  }
   if (Name) {
     const k1 = normalizeName(Name);
     if (k1 && empMap.byName.has(k1))
@@ -869,6 +884,19 @@ function graceAppliesTo(employeeType, settings) {
   return applyTo === employeeType;
 }
 
+/* A finished day is skipped on resync — but a ghost on it may since have
+   become somebody (HR linked its code, or corrected a name or an ID). Such a
+   day is re-read, or the ghost would stand for ever: that is what kept RAHUL
+   a ghost on every resync (12 Oct 2026). */
+async function ghostWouldNowMatch(existingDoc) {
+  const ghosts = (existingDoc?.employees || []).filter((e) => e.isGhost);
+  if (!ghosts.length) return false;
+  const empMap = await buildEmployeeMap();
+  return ghosts.some((g) =>
+    matchEmployee({ Name: g.providerName || g.employeeName, Empcode: g.biometricId }, empMap),
+  );
+}
+
 function canSkipDeviceFetch(dateStr, todayStr, existingDoc) {
   if (!existingDoc || dateStr === todayStr) return false;
   if ((existingDoc.syncCount || 0) === 0) return false;
@@ -1075,8 +1103,18 @@ async function smartSaveDay(
     return mergeEmployeeEntry(fresh, old, shift, isToday);
   });
   const freshBids = new Set(freshEmployees.map((e) => e.biometricId));
+  /* A ghost the device reported again under a code that is now matched to an
+     employee (a linked code, or a name that now matches) is that employee's
+     row now — carrying the old ghost forward too is how one person showed
+     twice, once as a ghost. */
+  const resolvedCodes = new Set(
+    freshEmployees
+      .filter((e) => !e.isGhost && e.deviceCode)
+      .map((e) => String(e.deviceCode).toUpperCase()),
+  );
   for (const old of existingDoc.employees) {
     if (!onRoll(old)) continue; // removed from this month — see above
+    if (old.isGhost && resolvedCodes.has(String(old.biometricId || "").toUpperCase())) continue;
     if (!freshBids.has(old.biometricId))
       mergedEmployees.push(old.toObject ? old.toObject() : { ...old });
   }
@@ -1106,7 +1144,10 @@ async function syncDay(dateStr, empCode = "ALL") {
   const isToday = dateStr === todayStr;
   const settings = await AttendanceSettings.getConfig();
   const existingDoc = await DailyAttendance.findOne({ dateStr }).lean();
-  if (canSkipDeviceFetch(dateStr, todayStr, existingDoc)) {
+  if (
+    canSkipDeviceFetch(dateStr, todayStr, existingDoc) &&
+    !(await ghostWouldNowMatch(existingDoc))
+  ) {
     console.log(
       `[SYNC] ${dateStr}: skipping device fetch (all employees have complete/HR-overridden punches)`,
     );
@@ -1140,6 +1181,7 @@ async function syncDay(dateStr, empCode = "ALL") {
     "biometric-exact": 0,
     "biometric-numeric": 0,
     "biometric-raw": 0,
+    "biometric-linked": 0,
     "name-exact": 0,
     "name-first-last": 0,
     "name-sorted": 0,
@@ -1181,7 +1223,11 @@ async function syncDay(dateStr, empCode = "ALL") {
       grouped.set(groupKey, {
         employee,
         isGhost,
-        biometricId: keys.padded,
+        biometricId:
+          method === "biometric-linked"
+            ? String(extractBiometricId(employee) || keys.padded).toUpperCase()
+            : keys.padded,
+        deviceCode: keys.padded,
         providerName: p.Name,
         providerEmpcode: p.Empcode,
         method,
@@ -1247,6 +1293,7 @@ async function syncDay(dateStr, empCode = "ALL") {
           isGhost: g.isGhost,
           matchMethod: g.method,
           providerName: g.providerName,
+          deviceCode: g.deviceCode,
           ...computed,
           lateDisplay: computed.lateDisplay || "",
           attendanceValue:
@@ -1465,6 +1512,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
     "biometric-exact": 0,
     "biometric-numeric": 0,
     "biometric-raw": 0,
+    "biometric-linked": 0,
     "name-exact": 0,
     "name-first-last": 0,
     "name-sorted": 0,
@@ -1505,7 +1553,11 @@ async function syncDayForce(dateStr, empCode = "ALL") {
       grouped.set(groupKey, {
         employee,
         isGhost,
-        biometricId: keys.padded,
+        biometricId:
+          method === "biometric-linked"
+            ? String(extractBiometricId(employee) || keys.padded).toUpperCase()
+            : keys.padded,
+        deviceCode: keys.padded,
         providerName: p.Name,
         providerEmpcode: p.Empcode,
         method,
@@ -1571,6 +1623,7 @@ async function syncDayForce(dateStr, empCode = "ALL") {
           isGhost: g.isGhost,
           matchMethod: g.method,
           providerName: g.providerName,
+          deviceCode: g.deviceCode,
           ...computed,
           lateDisplay: computed.lateDisplay || "",
           attendanceValue:
@@ -4982,6 +5035,224 @@ router.post("/restore-to-month", EmployeeAuthMiddlewear, async (req, res) => {
     });
   } catch (err) {
     console.error("[RESTORE-TO-MONTH]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Link a ghost's device code to an employee (12 Oct 2026).
+//
+//  The time office can record a person under a code that is not their
+//  biometricId in the CMS. Their punches then arrive as a ghost, and no resync
+//  can fix it: the sync only matches an ID or a name. Linking stores the code
+//  on the employee (attendanceDeviceCodes); the sync counts those punches as
+//  theirs, on their OWN biometricId, and the days the ghost stood on are
+//  re-synced so the ghost rows become theirs.
+// ─────────────────────────────────────────────────────────────────────────────
+const deviceCodeOf = (v) => String(v || "").trim().toUpperCase();
+const fullNameOf = (e) =>
+  [e?.firstName, e?.middleName, e?.lastName].filter(Boolean).join(" ").trim();
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/** Re-sync the given days as one job; answered inline when it finishes fast. */
+async function resyncDays(dates) {
+  if (!dates.length) return null;
+  pruneSyncJobs();
+  const job = startSyncJob({
+    from: dates[0],
+    to: dates[dates.length - 1],
+    datesToSync: dates,
+    force: true,
+  });
+  await Promise.race([
+    job.promise,
+    new Promise((resolve) => setTimeout(resolve, SYNC_INLINE_WAIT_MS)),
+  ]);
+  return job;
+}
+
+router.post("/link-device-code", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const code = deviceCodeOf(req.body?.deviceCode);
+    const employeeId = String(req.body?.employeeId || "");
+    if (!code || !/^[0-9a-f]{24}$/i.test(employeeId))
+      return res
+        .status(400)
+        .json({ success: false, message: "deviceCode and employeeId required" });
+
+    const emp = await Employee.findById(employeeId)
+      .select("firstName middleName lastName biometricId attendanceDeviceCodes")
+      .lean();
+    if (!emp)
+      return res.status(404).json({ success: false, message: "Employee not found" });
+    const name = fullNameOf(emp);
+    const ownId = deviceCodeOf(emp.biometricId);
+    if (!ownId)
+      return res.status(400).json({
+        success: false,
+        message: `${name} has no biometric ID in the CMS. Set it to ${code} on their Work Details instead — that is the same thing, done once.`,
+      });
+    if (ownId === code)
+      return res.status(400).json({
+        success: false,
+        message: `${code} is already ${name}'s biometric ID — re-sync the month and their punches land on their row.`,
+      });
+
+    const holder = await Employee.findOne({
+      _id: { $ne: emp._id },
+      biometricId: { $regex: `^${escapeRegex(code)}$`, $options: "i" },
+    })
+      .select("firstName middleName lastName")
+      .lean();
+    if (holder)
+      return res.status(409).json({
+        success: false,
+        message: `${code} is the biometric ID of ${fullNameOf(holder)}. It cannot also be somebody else's.`,
+      });
+    const linkedElsewhere = await Employee.findOne({
+      _id: { $ne: emp._id },
+      attendanceDeviceCodes: code,
+    })
+      .select("firstName middleName lastName")
+      .lean();
+    if (linkedElsewhere)
+      return res.status(409).json({
+        success: false,
+        message: `${code} is already linked to ${fullNameOf(linkedElsewhere)}. Unlink it there first.`,
+      });
+
+    await Employee.updateOne(
+      { _id: emp._id },
+      { $addToSet: { attendanceDeviceCodes: code } },
+    );
+
+    const days = await DailyAttendance.find({
+      employees: { $elemMatch: { biometricId: code, isGhost: true } },
+    })
+      .select("dateStr yearMonth")
+      .sort({ dateStr: 1 })
+      .lean();
+    const dates = days.map((d) => d.dateStr);
+    const months = [
+      ...new Set(days.map((d) => d.yearMonth || d.dateStr.slice(0, 7))),
+    ];
+    /* Their OWN id held off a month (the old remove-from-month took the real
+       person with the ghost) would still drop these days. Say so — lifting a
+       hold is HR's decision, made with Restore on that month. */
+    const held = months.length
+      ? await AttendanceExclusion.find({
+          biometricId: ownId,
+          yearMonth: { $in: months },
+        })
+          .select("yearMonth")
+          .lean()
+      : [];
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "employee",
+      entityId: String(emp._id),
+      entityLabel: `${name} (${ownId})`,
+      action: "update",
+      summary: `Linked time-office code ${code} to ${name} (${ownId}). ${dates.length} day(s) re-synced.`,
+      before: { attendanceDeviceCodes: emp.attendanceDeviceCodes || [] },
+      after: {
+        attendanceDeviceCodes: [
+          ...new Set([...(emp.attendanceDeviceCodes || []), code]),
+        ],
+      },
+    });
+
+    const job = await resyncDays(dates);
+    const heldNote = held.length
+      ? ` ${ownId} is still removed from ${held.map((h) => h.yearMonth).join(", ")} — use Restore on that month, or those days stay off the register.`
+      : "";
+    const message =
+      (dates.length
+        ? `${code} now counts as ${name} (${ownId}). ${dates.length} day(s) re-synced from the device.`
+        : `${code} now counts as ${name} (${ownId}). Their next punches under it land on their row.`) +
+      heldNote;
+    const base = {
+      success: true,
+      linked: { deviceCode: code, employeeId: String(emp._id), biometricId: ownId, name },
+      days: dates.length,
+      heldMonths: held.map((h) => h.yearMonth),
+    };
+    if (!job || job.finishedAt) return res.json({ ...base, message });
+    return res.status(202).json({ ...base, ...syncJobView(job), message });
+  } catch (err) {
+    console.error("[LINK-DEVICE-CODE]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.delete("/link-device-code", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const code = deviceCodeOf(req.body?.deviceCode || req.query.deviceCode);
+    const employeeId = String(req.body?.employeeId || req.query.employeeId || "");
+    if (!code || !/^[0-9a-f]{24}$/i.test(employeeId))
+      return res
+        .status(400)
+        .json({ success: false, message: "deviceCode and employeeId required" });
+    const emp = await Employee.findById(employeeId)
+      .select("firstName middleName lastName biometricId attendanceDeviceCodes")
+      .lean();
+    if (!emp || !(emp.attendanceDeviceCodes || []).includes(code))
+      return res
+        .status(404)
+        .json({ success: false, message: `${code} is not linked to that employee` });
+    const name = fullNameOf(emp);
+
+    await Employee.updateOne(
+      { _id: emp._id },
+      { $pull: { attendanceDeviceCodes: code } },
+    );
+    /* The rows the link made carry this employee; a resync would keep them
+       (an old row the device "no longer reports" is carried forward). Take
+       them off first, then let the device say what those days were. */
+    const days = await DailyAttendance.find({
+      employees: {
+        $elemMatch: { employeeDbId: emp._id, matchMethod: "biometric-linked" },
+      },
+    })
+      .select("dateStr")
+      .sort({ dateStr: 1 })
+      .lean();
+    const dates = days.map((d) => d.dateStr);
+    if (dates.length)
+      await DailyAttendance.updateMany(
+        { dateStr: { $in: dates } },
+        {
+          $pull: {
+            employees: { employeeDbId: emp._id, matchMethod: "biometric-linked" },
+          },
+        },
+      );
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "employee",
+      entityId: String(emp._id),
+      entityLabel: `${name} (${deviceCodeOf(emp.biometricId)})`,
+      action: "update",
+      summary: `Unlinked time-office code ${code} from ${name}. ${dates.length} day(s) re-synced.`,
+      before: { attendanceDeviceCodes: emp.attendanceDeviceCodes },
+      after: {
+        attendanceDeviceCodes: emp.attendanceDeviceCodes.filter((c) => c !== code),
+      },
+    });
+
+    const job = await resyncDays(dates);
+    const message = `${code} no longer counts as ${name}. ${dates.length} day(s) re-synced.`;
+    if (!job || job.finishedAt)
+      return res.json({ success: true, days: dates.length, message });
+    return res
+      .status(202)
+      .json({ success: true, days: dates.length, ...syncJobView(job), message });
+  } catch (err) {
+    console.error("[UNLINK-DEVICE-CODE]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });

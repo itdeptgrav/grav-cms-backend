@@ -269,6 +269,14 @@ const DECLARATIONS = [
     persona: "attendance approver",
     note: "The undo of remove-from-month, and declared to match it: same month-shaped effect on the roster, so the same CLOSE capability. It shipped undeclared, which meant the contract refused it for everybody — the door out of an accidental removal was the one door that did not open.",
   }),
+  D("POST", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Counts a time-office code that is not the employee's biometricId as theirs (a ghost that is really them), then re-syncs the ghost's days. It moves punches onto a person, so it takes the correction capability, like a punch correction.",
+  }),
+  D("DELETE", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "The undo of link-device-code, declared to match it.",
+  }),
   D("GET", "/hr/attendance/roster-exclusions", [C.HR_ACCESS, C.ATTENDANCE_READ], {
     persona: "time office",
     note: "Who is held off which month. A read of the same roster the two routes above write, so it takes the READ capability. Also shipped undeclared.",

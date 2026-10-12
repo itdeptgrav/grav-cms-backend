@@ -102,6 +102,11 @@ const employeeSchema = new mongoose.Schema({
   // ─── WORK INFORMATION ────────────────────────────────────────────────────────
   biometricId: { type: String, sparse: true },
   identityId: { type: String, sparse: true },
+  // Other codes the time office (eTimeOffice) records this person under, when
+  // its code differs from biometricId. HR links a ghost to the employee on the
+  // attendance page; the sync then counts those punches as this employee's,
+  // on their own biometricId. Upper-case, as the sync compares them.
+  attendanceDeviceCodes: { type: [String], default: [] },
   needsToOperate: { type: Boolean, default: false },
 
   // The explicit link to a Firestore cowork_employees doc, set by an admin
