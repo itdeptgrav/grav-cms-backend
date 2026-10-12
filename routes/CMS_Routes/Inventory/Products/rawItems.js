@@ -1083,13 +1083,21 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
             detail: `${onRequests} material request line(s) were raised in ${currentUnit}.` });
         }
 
-        if (blockedBy.length) {
+        /* ── THE REFUSAL IS OFF UNLESS ASKED FOR (12 Oct 2026, owner: "there
+           is a restriction that we can't edit the base unit — remove it
+           immediately"). The facts above are still gathered and LOGGED, so a
+           change on an item with history is on record; the change itself goes
+           through. STORE_UNIT_CHANGE_STRICT=1 restores the 409. */
+        if (blockedBy.length && process.env.STORE_UNIT_CHANGE_STRICT === "1") {
           return res.status(409).json({
             success: false,
             code: "UNIT_CHANGE_BLOCKED",
             message: `This item's stock unit cannot be changed from "${currentUnit}" — existing quantities and records would silently mean something different.`,
             blockedBy,
           });
+        }
+        if (blockedBy.length) {
+          console.warn(`[raw-items] unit of ${rawItem.sku || rawItem._id} changed "${currentUnit}" → "${nextUnit.customUnit || nextUnit.unit}" by ${req.user?.email || req.user?.id || "?"} with history: ${blockedBy.map((b) => b.detail).join(" ")}`);
         }
       }
 

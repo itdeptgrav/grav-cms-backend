@@ -4795,6 +4795,58 @@ router.delete(
           .status(400)
           .json({ success: false, message: "yearMonth must be YYYY-MM" });
       const bid = String(biometricId).toUpperCase();
+
+      /* REMOVING A GHOST MUST NOT REMOVE THE REAL PERSON (12 Oct 2026).
+         A ghost row is punches the sync could not match to an employee —
+         typically days synced before HR created the person's record, under
+         the SAME biometric ID the real person now holds. Removing "the ghost"
+         used to pull every row with that ID and hold the ID off the month, so
+         the real employee vanished too and no resync brought them back (the
+         RAHUL report). With ghostOnly, only ghost rows go; and when a current
+         employee holds this ID there is no hold at all — the next resync
+         matches those punches to that employee, so the ghost cannot return. */
+      const ghostOnly = ["1", "true"].includes(String(req.query.ghostOnly || req.body?.ghostOnly || ""));
+      if (ghostOnly) {
+        const ghostResult = await DailyAttendance.updateMany(
+          { yearMonth, employees: { $elemMatch: { biometricId: bid, isGhost: true } } },
+          { $pull: { employees: { biometricId: bid, isGhost: true } } },
+        );
+        const holder = await Employee.findOne({
+          biometricId: bid,
+          isActive: { $ne: false },
+          status: { $ne: "inactive" },
+        })
+          .select("firstName lastName name")
+          .lean();
+        if (holder) {
+          const holderName = holder.name || `${holder.firstName || ""} ${holder.lastName || ""}`.trim();
+          recordChange(req, {
+            departmentSlug: "hr",
+            section: "hr:attendance-daily",
+            entity: "attendance-day",
+            entityId: `${bid}:${yearMonth}`,
+            entityLabel: `${bid} · ${yearMonth}`,
+            action: "delete",
+            summary:
+              `Removed the ghost rows of ${bid} for ${yearMonth} (${ghostResult.modifiedCount} day record(s)). ` +
+              `${holderName || bid} holds this ID, so they stay on the register and no hold was placed — ` +
+              `the next sync matches those punches to them.`,
+            before: { biometricId: bid, yearMonth, ghostDays: ghostResult.modifiedCount },
+            after: { ghostDays: 0 },
+          });
+          return res.json({
+            success: true,
+            message:
+              `Ghost rows for ${bid} removed (${ghostResult.modifiedCount} day record(s)). ` +
+              `${holderName || "The employee"} keeps this ID and stays on the register; re-sync ${yearMonth} to put their punches on their own row.`,
+            daysModified: ghostResult.modifiedCount,
+            excluded: false,
+          });
+        }
+        /* Nobody holds this ID: it is a stray device ID, so it is held off
+           the month as before, or every sync would bring it back. */
+      }
+
       const result = await DailyAttendance.updateMany(
         { yearMonth, "employees.biometricId": bid },
         { $pull: { employees: { biometricId: bid } } },

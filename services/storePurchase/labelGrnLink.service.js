@@ -97,23 +97,41 @@ function refusalOf(b) {
   if (str(b.identityState) === IDENTITY_STATE.VOIDED || b.voidedAt) {
     return { reason: "LABEL_VOIDED", message: `This label was voided${str(b.voidReason) ? ` — ${str(b.voidReason)}` : ""}. It names nothing and cannot be linked.` };
   }
+  return null;
+}
+
+/* ── WHERE A LINKABLE LABEL STANDS NOW (12 Oct 2026, owner) ────────────────
+   "Some barcodes were printed on the GRN page but that GRN was never marked
+   done; the labels are on the raw items and we cannot remove them. Don't
+   restrict this — even a label already linked to some GRN, if the user scans
+   it he wants to switch it to the new GRN."
+
+   So neither of these is a refusal any more. A label already on a receipt
+   MOVES to the chosen one; a label inside a receiving count that was never
+   recorded LEAVES that count and becomes a live label on the chosen
+   receipt. The screen says which, before anything is written, and `unlink`
+   puts the label back exactly where it stood (`grnLink.previous` carries the
+   old receipt and count). */
+function standingOf(b) {
+  if (!b) return null;
   if (b.goodsReceiptId) {
     const number = str(b.goodsReceiptNumber) || "a goods receipt";
     return {
-      reason: "ALREADY_LINKED",
-      message: b.grnLink?.linkedAt
-        ? `Already linked to ${number}.`
-        : `Already on ${number} — it was received on that receipt.`,
+      kind: "linked",
       linkedTo: { goodsReceiptId: idStr(b.goodsReceiptId), receiptNumber: str(b.goodsReceiptNumber), linkedHere: Boolean(b.grnLink?.linkedAt) },
+      message: b.grnLink?.linkedAt
+        ? `Linked to ${number} earlier — linking it here moves it to the receipt you choose.`
+        : `On ${number} — it was received on that receipt. Linking it here moves it to the receipt you choose.`,
     };
   }
   if (b.receivingSessionId || !isUsableIdentity(b)) {
     return {
-      reason: "LABEL_IN_COUNT",
-      message: `This label is in a receiving count${str(b.purchaseOrderNumber) ? ` on ${str(b.purchaseOrderNumber)}` : ""} that has not been recorded. Recording that receipt links it — it cannot be linked here.`,
+      kind: "in-count",
+      inCount: { receivingSessionId: idStr(b.receivingSessionId) || null, purchaseOrderNumber: str(b.purchaseOrderNumber), identityState: str(b.identityState) },
+      message: `In a receiving count${str(b.purchaseOrderNumber) ? ` on ${str(b.purchaseOrderNumber)}` : ""} that was never recorded. Linking it here takes it out of that count and puts it on the receipt you choose.`,
     };
   }
-  return null;
+  return { kind: "free", message: "" };
 }
 
 /**
@@ -284,12 +302,15 @@ async function check(ctx, { barcodeIds, goodsReceiptId = null } = {}) {
     if (!isId(id)) return { id, ok: false, reason: "NOT_A_LABEL", message: "That is not a raw-item label printed by GRAV.", label: null };
     const b = docs.get(id);
     const refusal = refusalOf(b);
+    const standing = refusal ? null : standingOf(b);
     return {
       id,
       ok: !refusal,
       reason: refusal?.reason || null,
-      message: refusal?.message || "",
-      linkedTo: refusal?.linkedTo || null,
+      message: refusal?.message || standing?.message || "",
+      standing: standing?.kind || null,
+      linkedTo: standing?.linkedTo || null,
+      inCount: standing?.inCount || null,
       label: b ? labelFacts(b) : null,
     };
   });
@@ -301,8 +322,11 @@ async function check(ctx, { barcodeIds, goodsReceiptId = null } = {}) {
     counts: {
       scanned: labels.length,
       ready: linkable.length,
-      alreadyLinked: labels.filter((l) => l.reason === "ALREADY_LINKED").length,
-      refused: labels.filter((l) => !l.ok && l.reason !== "ALREADY_LINKED").length,
+      /* on another receipt, or inside an unrecorded count — both READY, and
+         said apart so the screen can name what a link will move */
+      alreadyLinked: labels.filter((l) => l.standing === "linked").length,
+      inCount: labels.filter((l) => l.standing === "in-count").length,
+      refused: labels.filter((l) => !l.ok).length,
     },
     choices,
     limit: MAX_LABELS,
@@ -369,11 +393,11 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
     if (!isId(id)) { results.push({ id, outcome: "refused", reason: "NOT_A_LABEL", message: "That is not a raw-item label printed by GRAV." }); continue; }
     const b = docs.get(id);
     const refusal = refusalOf(b);
-    if (refusal?.reason === "ALREADY_LINKED" && refusal.linkedTo?.goodsReceiptId === idStr(grn._id)) {
+    if (refusal) { results.push({ id, outcome: "refused", ...refusal, label: b ? labelFacts(b) : null }); continue; }
+    if (idStr(b.goodsReceiptId) === idStr(grn._id)) {
       results.push({ id, outcome: "already", reason: "ALREADY_ON_THIS_RECEIPT", message: `Already on ${str(grn.receiptNumber)}.`, label: labelFacts(b) });
       continue;
     }
-    if (refusal) { results.push({ id, outcome: "refused", ...refusal, label: b ? labelFacts(b) : null }); continue; }
     linkable.push(b);
   }
 
@@ -394,6 +418,7 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
     const b = byId.get(row.labelId);
     if (!row.lineId) { results.push({ id: row.labelId, outcome: "refused", reason: row.reason, message: row.message, label: labelFacts(b) }); continue; }
     const line = lineById.get(row.lineId);
+    const standing = standingOf(b);
     const set = {
       goodsReceiptId: grn._id,
       goodsReceiptNumber: str(grn.receiptNumber),
@@ -402,7 +427,18 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
         linkedAt: now,
         linkedBy: isId(actor.id) ? oid(actor.id) : null,
         linkedByName: str(actor.name),
+        /* everything the label carried, so `unlink` can put it back — the
+           receipt it was on, the count it sat in, and its identity state */
         previous: {
+          goodsReceiptId: b.goodsReceiptId || null,
+          goodsReceiptNumber: str(b.goodsReceiptNumber),
+          goodsReceiptLineId: b.goodsReceiptLineId || null,
+          receivingSessionId: b.receivingSessionId || null,
+          sessionSequence: b.sessionSequence ?? null,
+          adoptedAt: b.adoptedAt || null,
+          identityState: str(b.identityState) || null,
+          quantityMeasured: typeof b.quantityMeasured === "boolean" ? b.quantityMeasured : null,
+          linkedHereBefore: Boolean(b.grnLink?.linkedAt),
           purchaseOrder: b.purchaseOrder || null,
           purchaseOrderNumber: str(b.purchaseOrderNumber),
           purchaseOrderItemId: b.purchaseOrderItemId || null,
@@ -412,6 +448,15 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
         },
       },
     };
+    /* A label leaving an unrecorded count becomes a live label of the chosen
+       receipt: out of the count, activated, as recording a receipt would do. */
+    if (standing?.kind === "in-count") {
+      set.receivingSessionId = null;
+      set.sessionSequence = null;
+      set.adoptedAt = null;
+      set.identityState = IDENTITY_STATE.ACTIVATED;
+      set.quantityMeasured = true;
+    }
     /* A label that predates company stamping takes this company now, as
        adoption does — it is this company's receipt it is joining. */
     if (!b.companyId) set.companyId = ctx.companyId;
@@ -431,7 +476,7 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
         set.unitPrice = Number(poLine.unitPrice);
       }
     }
-    toWrite.push({ b, line, row, set });
+    toWrite.push({ b, line, row, set, standing });
   }
 
   let linked = [];
@@ -443,11 +488,15 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
         const done = [];
         const opts = session ? { session } : {};
         for (const w of toWrite) {
+          /* Guarded on what was READ, not on "nothing yet": a label on another
+             receipt or in a count is moved only while it still stands exactly
+             there. */
           const r = await Barcode.updateOne(
-            { $and: [
-              { _id: w.b._id, goodsReceiptId: null, receivingSessionId: null, voidedAt: null, "customerMaterial.lotId": null },
-              usableIdentity(),
-            ] },
+            {
+              _id: w.b._id, voidedAt: null, "customerMaterial.lotId": null,
+              goodsReceiptId: w.b.goodsReceiptId || null,
+              receivingSessionId: w.b.receivingSessionId || null,
+            },
             { $set: w.set },
             opts,
           );
@@ -463,6 +512,8 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
               labels: written.length,
               barcodeIds: written.map((d) => idStr(d.w.b._id)),
               lines: [...new Set(written.map((d) => idStr(d.w.line._id)))].length,
+              movedFromReceipts: written.filter((d) => d.w.standing?.kind === "linked").length,
+              takenFromCounts: written.filter((d) => d.w.standing?.kind === "in-count").length,
               note: "Printed labels linked to this recorded receipt afterwards. No stock moved.",
             },
           },
@@ -476,7 +527,13 @@ async function link(ctx, { goodsReceiptId, barcodeIds } = {}, actor = {}) {
         results.push({
           id: label.id, outcome: "linked", label,
           line: { lineId: idStr(d.w.line._id), itemName: str(d.w.line.itemName), variant: variantText(d.w.line.variantCombination), unit: str(d.w.line.poUnit) },
-          message: d.w.row.message || "",
+          movedFrom: d.w.standing?.kind === "linked" ? d.w.standing.linkedTo : null,
+          leftCount: d.w.standing?.kind === "in-count" ? d.w.standing.inCount : null,
+          message: [
+            d.w.standing?.kind === "linked" ? `moved from ${d.w.standing.linkedTo.receiptNumber || "its earlier receipt"}` : "",
+            d.w.standing?.kind === "in-count" ? `taken out of the unrecorded count${d.w.standing.inCount.purchaseOrderNumber ? ` on ${d.w.standing.inCount.purchaseOrderNumber}` : ""}` : "",
+            d.w.row.message || "",
+          ].filter(Boolean).join(" · "),
         });
       } else {
         results.push({ id: label.id, outcome: "refused", reason: "LABEL_CHANGED", message: "That label changed a moment ago (linked, voided or counted elsewhere). Scan it again to see where it stands.", label });
@@ -525,18 +582,31 @@ async function unlink(ctx, { barcodeId } = {}, actor = {}) {
   const prev = b.grnLink.previous || {};
   const grnId = b.goodsReceiptId;
   const number = str(b.goodsReceiptNumber);
+  /* Back to where it stood: the receipt it was moved from (with the link it
+     had there, if that was one made here), or the unrecorded count it was
+     taken out of, or — the common case — no receipt at all. */
+  const back = {
+    goodsReceiptId: prev.goodsReceiptId || null,
+    goodsReceiptNumber: str(prev.goodsReceiptNumber),
+    goodsReceiptLineId: prev.goodsReceiptLineId || null,
+    receivingSessionId: prev.receivingSessionId || null,
+    purchaseOrder: prev.purchaseOrder || null, purchaseOrderNumber: str(prev.purchaseOrderNumber),
+    purchaseOrderItemId: prev.purchaseOrderItemId || null,
+    vendor: prev.vendor || null, vendorName: str(prev.vendorName),
+    unitPrice: prev.unitPrice ?? null,
+    grnLink: null,
+  };
+  if (prev.receivingSessionId) {
+    back.sessionSequence = prev.sessionSequence ?? null;
+    back.adoptedAt = prev.adoptedAt || null;
+    if (prev.identityState) back.identityState = prev.identityState;
+    if (typeof prev.quantityMeasured === "boolean") back.quantityMeasured = prev.quantityMeasured;
+  }
   await unitOfWork.run(ctx, {
     mutate: async (session) => {
       const r = await Barcode.updateOne(
         { _id: b._id, goodsReceiptId: grnId, "grnLink.linkedAt": b.grnLink.linkedAt },
-        { $set: {
-          goodsReceiptId: null, goodsReceiptNumber: "", goodsReceiptLineId: null,
-          purchaseOrder: prev.purchaseOrder || null, purchaseOrderNumber: str(prev.purchaseOrderNumber),
-          purchaseOrderItemId: prev.purchaseOrderItemId || null,
-          vendor: prev.vendor || null, vendorName: str(prev.vendorName),
-          unitPrice: prev.unitPrice ?? null,
-          grnLink: null,
-        } },
+        { $set: back },
         session ? { session } : {},
       );
       if (r.modifiedCount !== 1) throw fail("CONFLICT", "That label changed a moment ago. Scan it again to see where it stands.", { reason: "LABEL_CHANGED" });
@@ -550,7 +620,11 @@ async function unlink(ctx, { barcodeId } = {}, actor = {}) {
     },
   });
   const after = await Barcode.findById(b._id).lean();
-  return { label: labelFacts(after), unlinkedFrom: { goodsReceiptId: idStr(grnId), receiptNumber: number } };
+  return {
+    label: labelFacts(after),
+    unlinkedFrom: { goodsReceiptId: idStr(grnId), receiptNumber: number },
+    backTo: prev.goodsReceiptId ? { goodsReceiptId: idStr(prev.goodsReceiptId), receiptNumber: str(prev.goodsReceiptNumber) } : (prev.receivingSessionId ? { count: str(prev.purchaseOrderNumber) || "its receiving count" } : null),
+  };
 }
 
 /**
@@ -578,6 +652,7 @@ module.exports = {
   MAX_LABELS,
   LINKABLE_SOURCES,
   refusalOf,
+  standingOf,
   candidateLines,
   planLinks,
   check,

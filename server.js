@@ -1335,6 +1335,26 @@ app.use("/api/hr", hrWrites);
 app.use("/hr", hrWrites);
 app.use("/api/employees", hrWrites);
 
+/* BACKSTOP for `holdForApprover` (Middlewear/hrContract.js). The contract lets
+   an editor's approver-level write through ONLY so the queue above can hold it.
+   A held write is answered 202 there and never arrives here; an approved
+   replay arrives carrying its signed claim. Anything else still marked — a
+   path the queue exempts (sync, backfill, imports…) — would otherwise run
+   with an editor's rights, so it is refused exactly as it was before. */
+const { isApprovalReplay: _isHrReplay } = require("./services/changeRequests");
+const hrApproverBackstop = (req, res, next) => {
+  if (!req.holdForApprover || _isHrReplay(req)) return next();
+  return res.status(403).json({
+    success: false,
+    code: "HR_MISSING_CAPABILITY",
+    message: "You do not have permission to perform this action.",
+    requiredCapability: req.holdForApprover.capability || undefined,
+  });
+};
+app.use("/api/hr", hrApproverBackstop);
+app.use("/hr", hrApproverBackstop);
+app.use("/api/employees", hrApproverBackstop);
+
 /* Two employee-app prefixes, named individually rather than mounting the trail
    on all of /api/employee. Overtime and regularisations are HR facts raised
    from the phone — both change what a day of attendance says, and the person

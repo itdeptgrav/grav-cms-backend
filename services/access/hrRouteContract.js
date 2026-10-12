@@ -139,6 +139,11 @@ const DECLARATIONS = [
   D("PUT", "/api/employees/:id", [C.HR_ACCESS, C.PEOPLE_WRITE], {
     persona: "HR editor",
     writePolicy: "employee",
+    /* Pay changed by an approver or editor goes to the OWNER to accept
+       instead of being refused (12 Oct 2026, owner: approvals are for what
+       is connected to pay). This is also how a new employee's pay — split
+       off the create — is applied once the owner approves it. */
+    holdForOwnerOn: [C.COMPENSATION_WRITE],
     ...P,
   }),
   D("PATCH", "/api/employees/bulk-update", [C.HR_ACCESS, C.PEOPLE_WRITE], {

@@ -130,7 +130,13 @@ const ROUTINE_FIELDS = new Set([
  * Shift work: a swap between two people, a change request, an assignment or
  * rotation. None of it overwrites what a day of attendance says.
  */
-const EXEMPT_PATHS = ["/swap", "/shift-swap", "/shift-change-request", "/exchange", "/shift"];
+const EXEMPT_PATHS = [
+  "/swap", "/shift-swap", "/shift-change-request", "/exchange", "/shift",
+  /* Attaching the supporting document to a leave (a sick note) changes no pay
+     and decides nothing — it was held only because its path contains
+     "/leave" (12 Oct 2026). */
+  "/upload-document",
+];
 
 /**
  * Paths that always need an approver, whatever fields they carry.
@@ -192,7 +198,7 @@ function isEmployeeRecord(path) {
  * @param {Array}  args.changes  [{ field, path }] from the describe step
  * @returns {{hold: boolean, reason: string, sensitive: string[]}}
  */
-function decideApproval({ path = "", method = "", changes = null } = {}) {
+function decideApproval({ path = "", method = "", changes = null, body = null } = {}) {
   const p = String(path).toLowerCase().split("?")[0];
 
   if (EXEMPT_PATHS.some((frag) => p.includes(frag))) {
@@ -207,19 +213,34 @@ function decideApproval({ path = "", method = "", changes = null } = {}) {
   /* Creating or deleting an EMPLOYEE is the whole record: a new employee
      carries a salary from the moment they exist, and a deletion cannot be
      reviewed after the fact. Any other create or delete is ordinary work. */
+  /* ADDING an employee no longer asks (owner, 12 Oct 2026: "the employee add
+     we don't need to ask for approvals"). Pay set on a new employee by
+     somebody other than the owner is still the owner's — the HR contract
+     marks it `holdForOwner` and that hold is decided before this rule.
+     REMOVING an employee still asks: it cannot be reviewed afterwards. */
   if (method === "POST" || method === "DELETE") {
-    if (isEmployeeRecord(p)) {
-      return { hold: true, reason: "creating or removing an employee", sensitive: [] };
+    if (method === "DELETE" && isEmployeeRecord(p)) {
+      return { hold: true, reason: "removing an employee", sensitive: [] };
     }
-    return { hold: false, reason: "not the employee record", sensitive: [] };
+    return { hold: false, reason: method === "POST" && isEmployeeRecord(p) ? "adding an employee" : "not the employee record", sensitive: [] };
   }
 
   /* No diff at all means the describe step could not read the request — a
      route it has not been taught. Ask, rather than guess. An EMPTY diff is
      different: the body matched what is stored, and there is nothing to
      approve. */
+  /* A route the describe step has not been taught used to be held whatever
+     it carried — which is how a designation or a name changed from some
+     screens still asked (owner, 12 Oct 2026: only what is connected to pay
+     should ask). Now its BODY decides: pay or access in it holds; anything
+     else is ordinary work, recorded in the change history like any edit. */
   if (!Array.isArray(changes)) {
-    return { hold: true, reason: "the change could not be described", sensitive: [] };
+    const keys = body && typeof body === "object" && !Array.isArray(body) ? Object.keys(body) : [];
+    const touches = keys.filter((k) => k === "salary" || SENSITIVE_PREFIXES.some((pre) => k.startsWith(pre)) || SENSITIVE_FIELDS.has(k));
+    if (touches.length) {
+      return { hold: true, reason: `${touches.join(", ")} need${touches.length === 1 ? "s" : ""} an approver`, sensitive: touches };
+    }
+    return { hold: false, reason: "no pay or access in the change", sensitive: [] };
   }
   if (changes.length === 0) {
     return { hold: false, reason: "nothing changed", sensitive: [] };

@@ -361,7 +361,20 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
        handler only as the owner-approved replay. If it ever arrives any other
        way — a mount reordered, a path exempted — refuse, rather than create
        somebody with pay nobody allowed to be set. */
-    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+    /* SPLIT (owner, 12 Oct 2026: adding an employee never waits). The pay
+       fields the caller may not set are taken out here; the employee is
+       created now without them, and they are filed for the owner below. */
+    let deferredPay = null;
+    if (req.holdForOwner && req.splitPayForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      deferredPay = {};
+      for (const f of req.holdForOwner.fields || []) {
+        const top = String(f).split(".")[0];
+        if (req.body && req.body[top] !== undefined) {
+          deferredPay[top] = req.body[top];
+          delete req.body[top];
+        }
+      }
+    } else if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
       return res.status(403).json({
         success: false,
         code: "OWNER_APPROVAL_REQUIRED",
@@ -582,10 +595,41 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Decrypt salary in the response so the client gets plain numbers back
     if (resp.salary) resp.salary = decryptSalaryFields(resp.salary);
 
+    /* The pay that was taken out goes to the owner as a change to THIS new
+       employee. If filing fails the employee still exists — say so plainly
+       rather than pretend the pay was saved. */
+    let payPendingOwner = false;
+    if (deferredPay && Object.keys(deferredPay).length) {
+      try {
+        await require("../../services/changeRequests").fileOwnerFollowUp(req, {
+          path: `/api/employees/${newEmployee._id}`,
+          method: "PUT",
+          body: deferredPay,
+          entity: "employee",
+          entityId: newEmployee._id,
+          entityLabel: createdName,
+          summary: `Pay for new employee ${createdName}`,
+          fields: Object.keys(deferredPay),
+        });
+        payPendingOwner = true;
+      } catch (e) {
+        console.error("[employees] could not file pay for the owner:", e.message);
+        return res.status(201).json({
+          success: true,
+          message: `${createdName} was added, but their pay could not be sent to the owner for approval. Enter it again from Salary & Bank.`,
+          data: resp,
+          payPendingOwner: false,
+        });
+      }
+    }
+
     res.status(201).json({
       success: true,
-      message: "Employee created successfully",
+      message: payPendingOwner
+        ? `${createdName} was added. Their pay and bank details were sent to the HR owner for approval.`
+        : "Employee created successfully",
       data: resp,
+      payPendingOwner,
     });
   } catch (error) {
     console.error("Create employee error:", error);
@@ -679,6 +723,16 @@ function employeeAuditSnapshot(doc, decryptedSalary) {
 // ─── UPDATE employee ──────────────────────────────────────────────────────────
 router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    /* BACKSTOP, as on create: pay from somebody who may not set it is held
+       for the owner by the department guard and reaches here only as the
+       owner-approved replay. */
+    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      return res.status(403).json({
+        success: false,
+        code: "OWNER_APPROVAL_REQUIRED",
+        message: "Pay is set by the HR owner — this should have been sent to them for approval. Nothing was saved.",
+      });
+    }
     const { user } = req;
     const { id } = req.params;
     const updateData = req.body;

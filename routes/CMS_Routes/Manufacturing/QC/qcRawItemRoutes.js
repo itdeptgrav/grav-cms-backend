@@ -63,6 +63,16 @@ const { classifyQcBarcode } = require("../../../../services/manufacturing/qcBarc
 const qcOrders = require("../../../../services/manufacturing/qcRawItemOrders");
 const qcGrns = require("../../../../services/manufacturing/qcRawItemGrns");
 const qcDefectStock = require("../../../../services/manufacturing/qcDefectStock.service");
+/* ── THE DEFECTIVE QUANTITY IS INFORMATION, NOT A STOCK MOVEMENT (12 Oct 2026, owner) ──
+   "Upon filling the defect quantity it reduces that much from the inventory
+   in-hand qty and from the sticker's qty — that shouldn't happen. The figure
+   is just for information." So a defective verdict no longer calls
+   `applyDefectDebit`: the record keeps `defectiveQuantity`, the label and the
+   raw item's quantities are untouched, and `stockDebit` stays empty.
+   `QC_DEFECT_MOVES_STOCK=1` restores the 10 Oct 2026 behaviour. A debit an
+   EARLIER verdict did apply is still put back on re-check (`reverseDefectDebit`
+   acts only on `stockDebit.applied`), so nothing taken before stays taken. */
+const DEFECT_MOVES_STOCK = process.env.QC_DEFECT_MOVES_STOCK === "1";
 const unitOfWork = require("../../../../services/storePurchase/unitOfWork.service");
 
 const SLUG = "qc";
@@ -120,6 +130,16 @@ async function requireOwnerOrChecker(req, res, next) {
     const who = await whoAmI(req);
     if (who.owner || who.checker) return next();
     return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "Raw material checking is for the QC owner and the assigned checkers." });
+  } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
+}
+/* The order and GRN BOOKS (reads only) are open to an approver as well
+   (12 Oct 2026, owner): the Orders tab shows for approvers now, and its
+   material section reads these. Checking itself stays with the checkers. */
+async function requireOrdersReader(req, res, next) {
+  try {
+    const who = await whoAmI(req);
+    if (who.owner || who.checker || who.role === "approver") return next();
+    return res.status(403).json({ success: false, code: "NOT_A_RAW_ITEM_CHECKER", message: "The raw-material order book is for the QC owner, approvers and the assigned checkers." });
   } catch (err) { res.status(500).json({ success: false, message: "Could not check your access." }); }
 }
 
@@ -307,7 +327,7 @@ const orderRow = (mo, r) => ({
  * `source` is a FILTER, not a boundary. Narrowing to customer-supplied gives
  * exactly the old list; the difference is that it is now the reader's choice.
  */
-router.get("/orders", requireOwnerOrChecker, async (req, res) => {
+router.get("/orders", requireOrdersReader, async (req, res) => {
   try {
     const q = str(req.query.q).toLowerCase();
     const scope = str(req.query.scope) || "all"; // all | checked | requires
@@ -376,7 +396,7 @@ router.get("/orders", requireOwnerOrChecker, async (req, res) => {
  *  such an order had none at all and reported nothing to check.
  *
  *  Checked / passed / defective / remaining come from the standing records. */
-router.get("/orders/:moId", requireOwnerOrChecker, async (req, res) => {
+router.get("/orders/:moId", requireOrdersReader, async (req, res) => {
   try {
     if (!isId(req.params.moId)) return res.status(400).json({ success: false, message: "Not an order id." });
     const mo = await CustomerRequest.findById(req.params.moId).select(MO_SELECT).lean();
@@ -717,7 +737,7 @@ router.post("/save", requireChecker, async (req, res) => {
         }
         await prior.save(sopt);
       }
-      if (status === "defective") {
+      if (status === "defective" && DEFECT_MOVES_STOCK) {
         doc.stockDebit = await qcDefectStock.applyDefectDebit({ session, inspection: doc, barcode: b, actor, labelQuantity: defQty, labelUnit: b.unit || "" });
         await doc.save(sopt);
       }
@@ -731,7 +751,7 @@ router.post("/save", requireChecker, async (req, res) => {
     const sd = doc.stockDebit;
     const warnings = [];
     let stockLine = "";
-    if (status === "defective") {
+    if (status === "defective" && DEFECT_MOVES_STOCK) {
       if (sd?.applied) {
         const scope = sd.variantId != null && sd.variantNewQuantity != null ? `variant now ${sd.variantNewQuantity} ${sd.baseUnit}` : `item now ${sd.newQuantity} ${sd.baseUnit}`;
         stockLine = ` Stock reduced by ${sd.baseQuantity} ${sd.baseUnit} (${scope}); the label now reads ${sd.labelAfter} ${b.unit || ""}.`.replace(/\s+\./g, ".");
@@ -784,7 +804,7 @@ function stockDebitView(sd) {
  * QC Orders page shows beside the manufacturing orders. `q`, `status`
  * (all | not-started | in-progress | complete | defects) and `customer` narrow it.
  */
-router.get("/grns", requireOwnerOrChecker, async (req, res) => {
+router.get("/grns", requireOrdersReader, async (req, res) => {
   try {
     const out = await qcGrns.listGrns({ q: str(req.query.q), status: str(req.query.status) || "all", customer: str(req.query.customer) });
     res.json({ success: true, ...out });
@@ -792,7 +812,7 @@ router.get("/grns", requireOwnerOrChecker, async (req, res) => {
 });
 
 /** One GRN: each line's received quantity against what QC has checked, every label and its verdict, every record. */
-router.get("/grns/:grnId", requireOwnerOrChecker, async (req, res) => {
+router.get("/grns/:grnId", requireOrdersReader, async (req, res) => {
   try {
     const d = await qcGrns.grnDetail(req.params.grnId);
     if (!d) return res.status(404).json({ success: false, message: "No material-request goods receipt with that id is on record." });
