@@ -155,6 +155,7 @@ const SENSITIVE_PATHS = [
   // Moves a time-office code's punches onto an employee: a punch correction
   // for a run of days at once (12 Oct 2026).
   "/link-device-code",
+  "/attendance/rekey",
   "/leave",
   "/password-management",
   "/access",

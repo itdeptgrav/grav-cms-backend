@@ -277,6 +277,14 @@ const DECLARATIONS = [
     persona: "time office",
     note: "The undo of link-device-code, declared to match it.",
   }),
+  D("GET", "/hr/attendance/rekey-preview", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "time office",
+    note: "What moving an employee's rows from an old biometric ID to their current one would do. A read.",
+  }),
+  D("POST", "/hr/attendance/rekey", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Moves an employee's attendance rows from an old biometric ID to their current one and re-syncs the days; may lift a hold on the new ID that HR ticked. Moves punches onto a person, so the correction capability.",
+  }),
   D("GET", "/hr/attendance/roster-exclusions", [C.HR_ACCESS, C.ATTENDANCE_READ], {
     persona: "time office",
     note: "Who is held off which month. A read of the same roster the two routes above write, so it takes the READ capability. Also shipped undeclared.",

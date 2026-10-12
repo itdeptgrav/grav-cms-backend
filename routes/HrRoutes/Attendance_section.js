@@ -28,6 +28,7 @@ const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear"
 
 const mongoose = require("mongoose");
 const { recordChange } = require("../../services/changeLog");
+const { previewRekey, rekeyAttendanceRows, liftHolds } = require("../../services/attendanceRekey");
 const AttendanceExclusion = require("../../models/HR_Models/AttendanceExclusion");
 const {
   loadExclusionMap,
@@ -5253,6 +5254,93 @@ router.delete("/link-device-code", EmployeeAuthMiddlewear, async (req, res) => {
       .json({ success: true, days: dates.length, ...syncJobView(job), message });
   } catch (err) {
     console.error("[UNLINK-DEVICE-CODE]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  An employee's rows left under an OLD biometric ID (12 Oct 2026).
+//
+//  Changing an employee's ID left their written rows under the old one; with
+//  nobody holding it, the register showed them as a ghost carrying the
+//  person's own name and department. These two routes say what a move would
+//  do, and do it: the rows go to the employee's current ID, any hold HR
+//  chooses to lift on the new ID is lifted, and the days are re-synced.
+// ─────────────────────────────────────────────────────────────────────────────
+async function rekeySubject(req) {
+  const fromId = deviceCodeOf(req.body?.fromId || req.query.fromId);
+  const employeeId = String(req.body?.employeeId || req.query.employeeId || "");
+  if (!fromId || !/^[0-9a-f]{24}$/i.test(employeeId))
+    return { error: [400, "fromId and employeeId required"] };
+  const emp = await Employee.findById(employeeId)
+    .select("firstName middleName lastName biometricId status isActive")
+    .lean();
+  if (!emp)
+    return {
+      error: [404, `The employee record behind ${fromId} no longer exists. Remove the row from the month instead.`],
+    };
+  const name = fullNameOf(emp);
+  const toId = deviceCodeOf(emp.biometricId);
+  const active = emp.status === "active" || (emp.status == null && emp.isActive !== false) || emp.isActive === true;
+  if (!active)
+    return { error: [409, `${name} is not active in the CMS (status: ${emp.status || "inactive"}). Make them active on their profile — then their rows count again.`] };
+  if (!toId)
+    return { error: [409, `${name} has no biometric ID now. Set it on their Work Details to the code the time office uses.`] };
+  if (toId === fromId)
+    return { error: [409, `${fromId} is still ${name}'s ID. Re-sync the month.`] };
+  return { emp, name, fromId, toId };
+}
+
+router.get("/rekey-preview", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const s = await rekeySubject(req);
+    if (s.error) return res.status(s.error[0]).json({ success: false, message: s.error[1] });
+    const p = await previewRekey({ employeeId: s.emp._id, fromId: s.fromId, toId: s.toId });
+    res.json({ success: true, employee: { _id: s.emp._id, name: s.name, biometricId: s.toId }, ...p });
+  } catch (err) {
+    console.error("[REKEY-PREVIEW]", err.message);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+router.post("/rekey", EmployeeAuthMiddlewear, async (req, res) => {
+  try {
+    const s = await rekeySubject(req);
+    if (s.error) return res.status(s.error[0]).json({ success: false, message: s.error[1] });
+    const before = await previewRekey({ employeeId: s.emp._id, fromId: s.fromId, toId: s.toId });
+    const wanted = Array.isArray(req.body?.restoreMonths) ? req.body.restoreMonths.map(String) : [];
+    const restoreMonths = before.held.map((h) => h.yearMonth).filter((m) => wanted.includes(m));
+    const lifted = await liftHolds({ toId: s.toId, months: restoreMonths });
+    const r = await rekeyAttendanceRows({ employeeId: s.emp._id, fromId: s.fromId, toId: s.toId, buildSummary });
+
+    recordChange(req, {
+      departmentSlug: "hr",
+      section: "hr:attendance-daily",
+      entity: "employee",
+      entityId: String(s.emp._id),
+      entityLabel: `${s.name} (${s.toId})`,
+      action: "update",
+      summary:
+        `Moved ${s.name}'s attendance from old ID ${s.fromId} to ${s.toId}: ${r.dates.length} day(s)` +
+        (restoreMonths.length ? `; brought ${s.toId} back on ${restoreMonths.join(", ")}` : "") + ".",
+      before: { biometricId: s.fromId, held: before.held.map((h) => h.yearMonth) },
+      after: { biometricId: s.toId, lifted: restoreMonths },
+    });
+
+    const dates = [...new Set([...r.dates, ...before.ghostDaysOnNewId])].sort();
+    const job = await resyncDays(dates);
+    const stillHeld = before.held.map((h) => h.yearMonth).filter((m) => !restoreMonths.includes(m));
+    const message =
+      `${s.name}'s attendance is on ${s.toId} now: ${r.dates.length} day(s) moved from ${s.fromId}` +
+      (before.ghostDaysOnNewId.length ? `, and ${before.ghostDaysOnNewId.length} day(s) of ${s.toId}'s punches re-synced onto them` : "") +
+      "." +
+      (lifted ? ` Brought back on ${restoreMonths.join(", ")}.` : "") +
+      (stillHeld.length ? ` ${s.toId} is still removed from ${stillHeld.join(", ")}.` : "");
+    const base = { success: true, ...r, lifted: restoreMonths, stillHeld, days: dates.length };
+    if (!job || job.finishedAt) return res.json({ ...base, message });
+    return res.status(202).json({ ...base, ...syncJobView(job), message });
+  } catch (err) {
+    console.error("[REKEY]", err.message);
     res.status(500).json({ success: false, message: err.message });
   }
 });

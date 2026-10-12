@@ -135,6 +135,30 @@ const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
 const { recordChange } = require("../../services/changeLog");
+const { rekeyAttendanceRows } = require("../../services/attendanceRekey");
+
+/* The ACTIVE employee already holding a biometric ID, if any (12 Oct 2026).
+   The schema says biometricId is unique, but the index on it was built
+   non-unique, so nothing enforced it and two people could share an ID — the
+   sync then gives every punch to whichever it reads first. An inactive holder
+   is allowed: the sync ignores inactive people, and the time office reuses a
+   leaver's code. */
+async function activeBiometricHolder(biometricId, exceptId) {
+  const bid = String(biometricId || "").trim();
+  if (!bid) return null;
+  const q = {
+    biometricId: { $regex: `^${bid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+    $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
+  };
+  if (exceptId) q._id = { $ne: exceptId };
+  return Employee.findOne(q).select("firstName lastName biometricId").lean();
+}
+const holderRefusal = (bid, h) => ({
+  success: false,
+  code: "BIOMETRIC_ID_IN_USE",
+  field: "biometricId",
+  message: `${String(bid).toUpperCase()} is already the biometric ID of ${[h.firstName, h.lastName].filter(Boolean).join(" ")}, who is active. Two people on one ID would put all the punches on one of them — change it there first.`,
+});
 const {
   invalidateAppAccess,
 } = require("../../Middlewear/AllEmployeeAppMiddleware");
@@ -509,6 +533,11 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
        that was moved is a decision, not a value to recompute. */
     fillConfirmationDate(employeeData);
 
+    if (employeeData.biometricId) {
+      const holder = await activeBiometricHolder(employeeData.biometricId);
+      if (holder) return res.status(400).json(holderRefusal(employeeData.biometricId, holder));
+    }
+
     const newEmployee = new Employee({
       ...employeeData,
       password: temporaryPassword,
@@ -808,6 +837,10 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         delete updateData.biometricId;
       }
     }
+    if (updateData.biometricId) {
+      const holder = await activeBiometricHolder(updateData.biometricId, beforeDoc?._id || req.params.id);
+      if (holder) return res.status(400).json(holderRefusal(updateData.biometricId, holder));
+    }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
     if (
@@ -987,6 +1020,22 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       ),
       after: employeeAuditSnapshot(updated, decryptedDoc?.salary || {}),
     });
+    /* Their attendance follows the new ID (12 Oct 2026). Left behind, the rows
+       under the old ID showed as a ghost with the person's own name, and the
+       new ID's days stayed the device's ghost. Only rows carrying THIS
+       employee's _id move. Never fails the save — the rename is done. */
+    if (biometricIdRenamed) {
+      try {
+        biometricIdRenamed.attendance = await rekeyAttendanceRows({
+          employeeId: updated._id,
+          fromId: biometricIdRenamed.from,
+          toId: biometricIdRenamed.to,
+        });
+      } catch (e) {
+        console.error("[EMPLOYEE] attendance re-key after ID change failed:", e.message);
+        biometricIdRenamed.attendanceError = e.message;
+      }
+    }
     res.status(200).json({
       success: true,
       message: "Employee updated successfully",
@@ -1000,10 +1049,28 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     });
   } catch (error) {
     console.error("Update employee error:", error);
-    if (error.code === 11000)
-      return res
-        .status(400)
-        .json({ success: false, message: "Duplicate value error" });
+    if (error.code === 11000) {
+      /* Name the field and who already holds it — "Duplicate value error" left
+         HR unable to give an employee the ID the time office really uses. */
+      const field = Object.keys(error.keyPattern || error.keyValue || {})[0];
+      const value = field ? (error.keyValue || {})[field] : null;
+      let holder = null;
+      if (field && value != null)
+        holder = await Employee.findOne({ [field]: value, _id: { $ne: req.params.id } })
+          .select("firstName lastName status")
+          .lean()
+          .catch(() => null);
+      return res.status(400).json({
+        success: false,
+        code: "DUPLICATE_VALUE",
+        field,
+        message: holder
+          ? `${value} is already the ${field} of ${[holder.firstName, holder.lastName].filter(Boolean).join(" ")} (${holder.status || "no status"}). Change or clear it there first.`
+          : field
+            ? `${value} is already used as ${field} by another record.`
+            : "Duplicate value error",
+      });
+    }
     if (error.name === "CastError")
       return res
         .status(400)
