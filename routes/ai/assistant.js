@@ -24,7 +24,8 @@ const gravAssistant = require("../../services/ai/gravAssistant");
 const convo = require("../../services/ai/conversationStore");
 const { getHotwords } = require("../../services/ai/sttVocab");
 const { correctTranscript } = require("../../services/ai/transcriptCorrect");
-const { ensureSttServer, STT_URL } = require("../../services/ai/sttSidecar");
+const { ensureSttServer } = require("../../services/ai/sttSidecar");
+const { transcribeAudio } = require("../../services/ai/sttEngines");
 const { sendOllamaError } = require("../../services/hrAiShared");
 const { maySeePilotDiagnostics } = require("../../services/ai/openJev/diagnosticsVisibility");
 const { OLLAMA_ERROR_CODES, warmup } = require("../../services/ollamaClient");
@@ -79,7 +80,7 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
 
   try {
     const history = convo.getHistory(user.id);
-    const { reply, model, toolsUsed, pilotDiagnostics, contextState } = await gravAssistant.chat({
+    const { reply, model, toolsUsed, links, choices, pilotDiagnostics, contextState } = await gravAssistant.chat({
       user,
       message,
       routeContext,
@@ -88,7 +89,7 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
 
     // Persist the exchange for this user (not the route).
     convo.append(user.id, { role: "user", content: message });
-    convo.append(user.id, { role: "assistant", content: reply, toolsUsed, contextState });
+    convo.append(user.id, { role: "assistant", content: reply, toolsUsed, links, choices, contextState });
 
     return res.json({
       success: true,
@@ -96,6 +97,8 @@ router.post("/assistant/message", EmployeeAuthMiddlewear, async (req, res) => {
       meta: {
         model,
         toolsUsed, // which authorised tools contributed data, if any
+        links,
+        choices,
         routeAware: Boolean(routeContext),
         assistant: "grav",
         generatedAt: new Date().toISOString(),
@@ -195,7 +198,7 @@ router.post("/assistant/stream", EmployeeAuthMiddlewear, async (req, res) => {
 
   try {
     const history = convo.getHistory(user.id);
-    const { reply, model, toolsUsed, contextState } = await gravAssistant.chatStreaming({
+    const { reply, model, toolsUsed, links, choices, contextState } = await gravAssistant.chatStreaming({
       user,
       message,
       routeContext,
@@ -205,16 +208,29 @@ router.post("/assistant/stream", EmployeeAuthMiddlewear, async (req, res) => {
       signal: ac.signal,
     });
 
+    if (process.env.NODE_ENV !== "production") {
+      console.info("[AI] assistant selection", {
+        model,
+        toolsUsed,
+        selection: contextState?.selection || null,
+        tool: contextState?.tool || null,
+        offeredTools: contextState?.offeredTools || null,
+        detectedDomains: contextState?.detectedDomains || null,
+      });
+    }
+
     // Persist only once we have a real reply (matches /message).
     if (reply) {
       convo.append(user.id, { role: "user", content: message });
-      convo.append(user.id, { role: "assistant", content: reply, toolsUsed, contextState });
+      convo.append(user.id, { role: "assistant", content: reply, toolsUsed, links, choices, contextState });
     }
     sse("reply", {
       reply,
       meta: {
         model,
         toolsUsed,
+        links,
+        choices,
         routeAware: Boolean(routeContext),
         assistant: "grav",
         generatedAt: new Date().toISOString(),
@@ -231,7 +247,9 @@ router.post("/assistant/stream", EmployeeAuthMiddlewear, async (req, res) => {
 });
 
 // Speech-to-text: the browser records the spoken command and POSTs the raw audio
-// here; we transcribe it with the local Whisper sidecar, biased by the live DB
+// here; we transcribe it — with Indic-Transcribe on the RunPod GPU when
+// GRAV_INDIC_STT_URL is set, else (or on any failure) the local Whisper sidecar,
+// biased by the live DB
 // vocabulary (party / customer / employee names), and return the text. This
 // REPLACES the browser's Web Speech API, which mangled Indian-accented English +
 // business jargon. Audio stays on this host end to end.
@@ -249,34 +267,15 @@ router.post(
     }
     try {
       const hotwords = await getHotwords().catch(() => "");
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 30000);
-      let sttRes;
-      try {
-        sttRes = await fetch(`${STT_URL}/transcribe`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/octet-stream",
-            "X-Hotwords": hotwords.replace(/[\r\n]+/g, " ").slice(0, 900),
-          },
-          body: audio,
-          signal: ctrl.signal,
-        });
-      } finally {
-        clearTimeout(timer);
-      }
-      if (!sttRes.ok) {
-        const detail = await sttRes.text().catch(() => "");
-        console.error("[AI] STT sidecar error:", sttRes.status, detail);
-        return res
-          .status(503)
-          .json({ success: false, message: "Speech recognition is unavailable right now." });
-      }
-      const data = await sttRes.json();
+      /* The RunPod Indic model first when configured, local Whisper as the
+         fallback — services/ai/sttEngines.js. */
+      const { text: raw, original, lang } = await transcribeAudio(audio, { hotwords });
       // Fix the handful of domain terms Whisper reliably mis-hears (e.g. "ledger"
       // -> "leisure") before the assistant ever sees the text.
-      const text = correctTranscript(typeof data.text === "string" ? data.text.trim() : "");
-      return res.json({ success: true, text });
+      const text = correctTranscript(raw);
+      /* A Hindi or Odia command: `text` is its English translation, `original`
+         what was said, in its own script, for the palette to show. */
+      return res.json({ success: true, text, original: original || null, lang: lang || "en" });
     } catch (err) {
       const offline = err?.name === "AbortError" || err?.cause?.code === "ECONNREFUSED";
       console.error("[AI] transcribe error:", err?.message || err, "| cause:", err?.cause?.code || err?.cause?.message || "");

@@ -73,6 +73,27 @@ function fakeEngine() {
   return {
     isConfigured: () => true,
     previewDeadlineMs: 20_000,
+
+    /* The heading budget counts a layout's real width before it runs
+       (services/reporting/headingBudget.js), which needs the view resolved and
+       one bounded query. The real engine has both. Three headings is well
+       inside the maximum, so these gate tests keep testing the gate they are
+       about rather than this one. */
+    async resolveView() {
+      return {
+        databaseId: 2,
+        tableId: 200,
+        fieldIds: Object.fromEntries(
+          [...require("../../services/reporting/fieldCatalogue").allColumns(),
+           "organization_id", "company_id"].map((c, i) => [c, 1000 + i]),
+        ),
+      };
+    },
+    async runQuery(payload) {
+      const limit = payload?.query?.limit ?? 3;
+      return Array.from({ length: Math.min(3, limit) }, (_, i) => [`H${i}`, 1]);
+    },
+
     async runPreview(args) {
       engineCalls.push({ kind: "preview", ...args });
       if (engineBehaviour === "deadline") {

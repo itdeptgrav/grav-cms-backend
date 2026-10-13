@@ -1329,6 +1329,12 @@ const hrWrites = departmentWrites("hr", {
     "/backfill",
     "/day-range",
     "/notification-",
+    /* Stateless prototype inference: the HR capability contract above still
+       requires recruitment.manage, but there is no HR record mutation to put
+       through the department approval queue. Without this exemption the
+       VoiceStudio, Qwen and transcription POSTs are incorrectly rejected as
+       department writes before their router runs. */
+    "/api/hr/ai-interview-lab",
   ],
 });
 app.use("/api/hr", hrWrites);
@@ -1390,6 +1396,12 @@ app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_sect
 // service. Conversation is keyed by user, not route.
 const gravAssistantRoutes = require("./routes/ai/assistant");
 app.use("/api/ai", gravAssistantRoutes);
+
+/* The command palette's Store search. A SEPARATE door from the assistant
+   above, and deliberately so: this one cannot reach a language model, which
+   is the whole reason Cmd/Ctrl K can answer without one. */
+app.use("/api/ai", require("./routes/ai/storeCommandSearch"));
+app.use("/api/ai", require("./routes/ai/commandSearchMisses"));
 
 // PersonalCallRecorder Android app → call recording sync (metadata → Mongo, audio → Drive)
 app.use("/api/recordings", require("./routes/callRecordings"));
@@ -1462,6 +1474,14 @@ app.use("/api/change-requests", require("./routes/Access/changeRequests"));
    manages, reached by that department's OWNER instead of a platform admin. See
    the header of the router for what it refuses and why. */
 app.use("/api/department-team", require("./routes/Access/departmentTeam"));
+
+/* The /onboarding dashboard's to-do counts across every application the
+   caller holds (10 Oct 2026). Reads its own session, like the two routers
+   above — see routes/Access/actionables.js. */
+app.use("/api/me", require("./routes/Access/actionables"));
+/* The employee home on /onboarding: the person's own day and a minimal
+   colleague search (10 Oct 2026) — see routes/Access/meHome.js. */
+app.use("/api/me", require("./routes/Access/meHome"));
 
 /* The developer side: cross-department history, anomaly alerts, live
    settings, job heartbeats. Access = platform admin or a role in the
@@ -1679,6 +1699,17 @@ app.use(
   "/api/cms/production/barcode_punchings",
   require("./routes/Barcode_Scan_Punchings/scannerIngestRoutes.js"),
 );
+
+// Music includes a short-lived signed stream URL used by HTMLAudioElement,
+// which cannot attach the CMS Bearer header. Mount before the broad /api/cms
+// auth router; search and resolve still enforce EmployeeAuthMiddleware inside.
+app.use("/api/cms/music", require("./routes/music/webPlayer.routes"));
+
+// GRAV Voice authenticates every employee endpoint inside its own router. Its
+// Plivo answer URL is intentionally public (and validates Plivo's V3 signature
+// when the carrier token is configured), so this mount must stay above the
+// broad /api/cms employee-auth router just like the signed Music stream route.
+app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
 
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
@@ -1961,10 +1992,6 @@ app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/customerMaterialRoute")
    nothing here, and Sales has no handle on the Development File. */
 app.use("/api/cms/sales/development-requests", require("./routes/CMS_Routes/Sales/developmentRequests"));
 
-/* R&D's interactive 3D garment workspace. Models and annotations stay behind
-   the live R&D grant and private, signed asset delivery. */
-app.use("/api/cms/rnd", require("./routes/CMS_Routes/RnD/garmentModelRoute"));
-
 /* ── SALES ISSUES THE MERCHANDISING HANDOVER ─────────────────────────────
    The producer's door: issuance, supersession and cancellation of the
    versioned confirmed requirement, on the proven order line, behind Sales'
@@ -2116,6 +2143,12 @@ app.use("/api/cms/employees/operators", operatorsRoutes);
 
 const machinesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/machines");
 app.use("/api/cms/machines", machinesRoutes);
+
+/* Maintenance (3 Oct 2026): the sewing machines the Maintenance team looks
+   after — a permanent tag on each existing machine, scan → that machine, and
+   an append-only maintenance history. Reads the Machine register; never
+   creates a machine. Its own auth and `maintenance` department guard. */
+app.use("/api/cms/maintenance", require("./routes/CMS_Routes/Maintenance/maintenanceRoutes"));
 
 const warehousesRoutes = require("./routes/CMS_Routes/Inventory/Configurations/warehouses");
 app.use("/api/cms/warehouses", warehousesRoutes);
@@ -2592,8 +2625,21 @@ const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", salesWrites("quotation"), quotationRoutes);
 
 // ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
+const mailRoutes = require("./routes/mail/mailRoutes");
+// The current Google OAuth client already allows this callback for Cowork.
+// Claim only Mail's namespaced, database-backed state here; every legacy state
+// falls through to the existing Google router unchanged.
+app.get("/api/google/employee-gmail/callback", (req, res, next) => {
+  if (!String(req.query.state || "").startsWith("mail_")) return next();
+  return mailRoutes.googleOAuthCallback(req, res);
+});
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
+
+// Standalone Mail application. This is intentionally mounted beside, not
+// inside, the legacy Google/Cowork router so its app grant and OAuth boundary
+// cannot widen access to Cowork's employee-id endpoints.
+app.use("/api/cms/mail", mailRoutes);
 
 // HR Department Routes
 const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");
@@ -2604,6 +2650,9 @@ app.use("/api/hr/departments", hrDepartmentRoutes);
 
 const jobPostingsRouter = require("./routes/HrRoutes/JobPosting_Section");
 app.use("/api/hr/job-postings", jobPostingsRouter);
+
+const aiInterviewLabRouter = require("./routes/HrRoutes/AiInterviewLab");
+app.use("/api/hr/ai-interview-lab", aiInterviewLabRouter);
 
 const CandidatesRouter = require("./routes/HrRoutes/Candidates_section");
 app.use("/api/hr/candidates", CandidatesRouter);
@@ -2647,6 +2696,8 @@ app.use("/api/hr/sop", require("./routes/HrRoutes/hrSopRoutes"));
 // explicitly RELEASES a row — the employee half lives at
 // /api/employee/documents and never projects an unreleased row.
 app.use("/api/hr/documents", require("./routes/HrRoutes/EmployeeDocuments_section"));
+/* Cmd/Ctrl K for HR — behind hrContract like every /api/hr route; read-only. */
+app.use("/api/hr/command-search", require("./routes/HrRoutes/HrCommandSearch"));
 
 app.use("/hr/reports", require("./routes/HrRoutes/Reports_section.js"));
 
@@ -2972,6 +3023,8 @@ app.use(
 
 const searchRoute = require("./routes/Accountant_Routes/Acc_search");
 app.use("/api/accountant/search", searchRoute);
+// Cmd/Ctrl K for the books, on the shared palette (read-only; see the route header).
+app.use("/api/accountant/command-search", require("./routes/Accountant_Routes/Acc_commandSearch"));
 
 // ── Health probe (open in browser to verify mounting) ────────────────
 // http://localhost:5000/api/accountant/_health

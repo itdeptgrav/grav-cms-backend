@@ -309,7 +309,7 @@ describe("sessions", () => {
 /* ══ The administrator migration ═════════════════════════════════════════ */
 
 describe("gac-ar2-canonical-admin migration", () => {
-  const models = () => ({ DeptUser, AccessDepartment, Acc_User });
+  const models = () => ({ DeptUser, AccessDepartment, Acc_User, Employee });
 
   async function world() {
     await seed();
@@ -352,6 +352,34 @@ describe("gac-ar2-canonical-admin migration", () => {
     expect(res.body).toMatchObject({ subject: "dept_user", identityId: String(canonical._id) });
     expect(res.body.user.isAdmin).toBe(true);
     expect(res.body.departments.map((d) => d.slug).sort()).toEqual(await activeAppSlugs());
+  });
+
+  test("a restored Employee-only identity becomes the canonical admin without changing its credential", async () => {
+    await seed();
+    await deptUser({ email: "ceo@grav.in", isAdmin: true });
+    const employee = await Employee.create({
+      firstName: "RISHEE", lastName: "RAY", email: "ray@grav.in",
+      biometricId: `RAY${++n}`, isActive: true, status: "active", gender: "Other",
+      department: "Executive", accessDepartmentId: (await dept("ceo"))._id,
+      password: PASSWORD,
+    });
+    const employeeHash = (await Employee.findById(employee._id).lean()).password;
+
+    const plan = await migration.planMigration(models());
+    expect(plan.blockers).toEqual([]);
+    expect(plan.actions).toContain("CREATE_CANONICAL_DEPT_USER_REUSING_EMPLOYEE_BCRYPT");
+    expect(migration.publicView(plan).counts).toMatchObject({
+      targetActiveEmployees: 1, targetActiveAccUsers: 0,
+    });
+    expect(JSON.stringify(migration.publicView(plan))).not.toMatch(/\$2[aby]\$/);
+
+    await migration.applyMigration(models(), plan);
+    const canonical = await DeptUser.findOne({ email: "ray@grav.in" }).lean();
+    expect(canonical).toMatchObject({ isAdmin: true, isActive: true, name: "RISHEE RAY" });
+    expect(canonical.passwordHash).toBe(employeeHash);
+    const res = await login(browser(), "ray@grav.in");
+    expect(res).toMatchObject({ status: 200, body: { subject: "dept_user" } });
+    expect(res.body.user.isAdmin).toBe(true);
   });
 
   test("last-admin protection: the duplicate cannot be deactivated until ray is verified AND another admin remains", async () => {

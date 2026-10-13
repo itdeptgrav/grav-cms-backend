@@ -91,4 +91,48 @@ describe("accounting entity-first catalogue claims", () => {
     const data = await tool.provideContext({ message: "balance of Debidutt Mangilall", args: { account: "Debidutt Mangilall" } });
     expect(tool.renderAnswer({ data })).toMatch(/^Debidutt Mangilall \(Sundry Creditors\): ₹18,99,243\.00 Cr,/);
   });
+
+  test.each([
+    ["expenses for this yr", "expenses", "Total expenses for FY 2026-27: ₹6,14,204.00."],
+    ["what is our gross profit?", "gross_profit", "Gross profit for FY 2026-27: ₹58,01,101.00."],
+    ["what is the gross margin", "gross_profit_margin", "Gross profit margin for FY 2026-27: 91.47%."],
+  ])("claims and renders one exact financial concept: %s", async (message, metric, expected) => {
+    const tool = registry.getTool("acc_financials");
+    expect(tool.modelSelectable).toBe(false);
+    expect(await tool.claim({ message, history: [] })).toEqual({ metric });
+    accounting.buildFinancials.mockResolvedValue({
+      baseCurrency: "INR",
+      financialYear: "2026-27",
+      profitAndLoss: {
+        totalRevenue: 6538193,
+        totalExpenses: 614204,
+        directRevenue: 6342120,
+        directExpenses: 541019,
+        grossProfit: 5801101,
+        grossProfitMargin: 91.47,
+        netProfit: 5923989,
+        netProfitMargin: 90.61,
+      },
+      balanceSheet: { totalAssets: 21567511, totalLiabilities: 4301502, equity: 0 },
+      readable: "full summary",
+    });
+    const args = await tool.claim({ message, history: [] });
+    const data = await tool.provideContext({ message, args });
+    expect(tool.renderAnswer({ data, args, message })).toBe(expected);
+  });
+
+  test("returns the full packet only for an explicit financial-summary concept", async () => {
+    const tool = registry.getTool("acc_financials");
+    expect(await tool.claim({ message: "show the p&l", history: [] })).toEqual({ metric: "summary" });
+    accounting.buildFinancials.mockResolvedValue({ readable: "Verified P&L and balance sheet summary." });
+    const args = { metric: "summary" };
+    const data = await tool.provideContext({ message: "show the p&l", args });
+    expect(tool.renderAnswer({ data, args })).toBe("Verified P&L and balance sheet summary.");
+  });
+
+  test("does not claim unrelated accounting or HR questions", async () => {
+    const tool = registry.getTool("acc_financials");
+    expect(await tool.claim({ message: "balance of Salary Payable", history: [] })).toBeNull();
+    expect(await tool.claim({ message: "what is Arpita's salary", history: [] })).toBeNull();
+  });
 });

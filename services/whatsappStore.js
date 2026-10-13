@@ -45,6 +45,18 @@ async function matchCrmRecords(waId, ctx) {
 
 async function upsertConversation({ waId, phone, name, at, inbound }) {
   let conv = await WhatsAppConversation.findOne({ waId });
+  // WhatsApp's newer multi-device events may identify a chat by LID while the
+  // contact itself still has a normal phone JID. Reuse an existing local or
+  // country-coded conversation with the same last 10 digits, then canonicalise
+  // it to the full phone id so replies do not split into a second thread.
+  const tail = last10(waId);
+  if (!conv && tail.length === 10) {
+    conv = await WhatsAppConversation.findOne({ waId: { $regex: `${tail}$` } });
+    if (conv && conv.waId !== waId) {
+      conv.waId = waId;
+      conv.phone = phone || `+${waId}`;
+    }
+  }
   if (!conv) {
     const links = await matchCrmRecords(waId);
     conv = new WhatsAppConversation({ waId, phone: phone || `+${waId}`, displayName: name, ...links });
@@ -159,6 +171,121 @@ async function ingestWebhook(body) {
   return result;
 }
 
+// OpenWA v5 emits { event, sessionId, payload: { message } }; stable v4
+// installations commonly emit { event, data }. Accept both so the CMS-side
+// contract does not force an unsafe runtime upgrade. Groups and messages sent
+// by the linked account are ignored here: outbound CMS sends are already
+// stored synchronously by whatsappSend.js.
+const openWaMessage = (body) => body?.payload?.message || body?.data?.message || body?.data || body?.message;
+const openWaEvent = (body) => String(body?.event || body?.eventName || "").toLowerCase();
+const waIdFromChat = (value) => String(value || "").split("@")[0].replace(/\D/g, "");
+
+function parseOpenWaInbound(body) {
+  const message = openWaMessage(body);
+  if (!message || typeof message !== "object") return null;
+  const event = openWaEvent(body);
+  if (event && !["message.received", "message.any", "onmessage", "message"].includes(event)) return null;
+  if (message.fromMe === true || message.id?.fromMe === true || message.isGroupMsg === true) return null;
+
+  const rawFrom = typeof message.from === "string"
+    ? message.from
+    : message.from?._serialized || message.chatId || message.author;
+  const phoneJid = [
+    message.sender?.phoneNumber,
+    message.chat?.contact?.phoneNumber,
+    message.chat?.historyChatId,
+    message.sender?.id,
+  ].find((value) => String(value || "").endsWith("@c.us"));
+  // `@lid` is a private WhatsApp multi-device routing id, not a phone number.
+  // Prefer the sender/contact phone JID included in the same OpenWA event.
+  const from = String(rawFrom || "").endsWith("@lid") && phoneJid ? phoneJid : rawFrom;
+  if (String(from || "").endsWith("@g.us")) return null;
+  const waId = waIdFromChat(from);
+  if (!waId) return null;
+
+  const rawId = typeof message.id === "string"
+    ? message.id
+    : message.id?._serialized || message._serialized;
+  const timestampValue = Number(message.timestamp || body?.timestamp || Date.now());
+  const timestamp = new Date(timestampValue < 1e12 ? timestampValue * 1000 : timestampValue);
+  const rawType = String(message.type || "chat").toLowerCase();
+  const typeMap = { chat: "text", ptt: "audio", vcard: "contacts", multi_vcard: "contacts" };
+  const type = typeMap[rawType] || (rawType === "text" ? "text" : rawType);
+  const supported = ["text", "image", "document", "audio", "video", "sticker", "location", "contacts", "reaction"];
+  const safeType = supported.includes(type) ? type : "unsupported";
+  const isMedia = message.isMedia || ["image", "document", "audio", "video", "sticker"].includes(safeType);
+  // OpenWA's `body` means two different things: chat text for a normal message,
+  // but a base64 thumbnail for media. Never persist that thumbnail as message
+  // copy (it produced enormous `/9j/...` strings in Contact Logs). Media bytes
+  // are decrypted on demand through the protected OpenWA media endpoint.
+  const text = isMedia
+    ? (message.caption || "")
+    : (message.text || message.body || (safeType === "unsupported" ? `[${rawType} message]` : ""));
+  const media = isMedia
+    ? {
+        id: rawId,
+        mimeType: message.mimetype || message.mimeType,
+        filename: message.filename,
+        caption: message.caption,
+      }
+    : undefined;
+
+  return {
+    waId,
+    name: message.sender?.formattedName || message.sender?.name || message.sender?.pushname || message.notifyName || message.senderName,
+    sessionId: body?.sessionId,
+    parsed: {
+      waMessageId: rawId || `openwa:${body?.sessionId || "sales"}:${waId}:${timestamp.getTime()}`,
+      type: safeType,
+      timestamp,
+      contextId: message.quotedMsgId || message.quotedStanzaID || undefined,
+      text,
+      ...(media ? { media } : {}),
+    },
+  };
+}
+
+async function ingestOpenWaWebhook(body) {
+  const result = { messages: 0, statuses: 0, ignored: 0 };
+  const normalised = parseOpenWaInbound(body);
+  if (!normalised) {
+    result.ignored += 1;
+    return result;
+  }
+
+  const { waId, name, sessionId, parsed } = normalised;
+  // Webhook delivery is at-least-once. Check before incrementing the
+  // conversation's unread count so a retry is truly idempotent in the inbox,
+  // not merely idempotent in the message collection.
+  if (await WhatsAppMessage.exists({ waMessageId: parsed.waMessageId })) {
+    result.ignored += 1;
+    return result;
+  }
+
+  const conv = await upsertConversation({
+    waId,
+    phone: `+${waId}`,
+    name,
+    at: parsed.timestamp.getTime(),
+    inbound: true,
+  });
+  await WhatsAppMessage.create({
+    conversationId: conv._id,
+    waId,
+    direction: "incoming",
+    ...parsed,
+    provider: "openwa",
+    providerSessionId: sessionId,
+    status: "received",
+  });
+  conv.lastMessageAt = parsed.timestamp;
+  conv.lastMessagePreview = previewOf(parsed);
+  conv.lastDirection = "incoming";
+  await conv.save();
+  result.messages = 1;
+  return result;
+}
+
 // Find (or create) the conversation for a phone number — powers the "Message"
 // button on a Lead/Account: given a customer's phone (and optionally the record
 // to link), return the conversation to open. No message is sent here.
@@ -186,4 +313,12 @@ async function findOrCreateByPhone({ phone, accountId, leadId, contactId, name }
   return conv;
 }
 
-module.exports = { ingestWebhook, matchCrmRecords, parseInbound, upsertConversation, findOrCreateByPhone };
+module.exports = {
+  ingestWebhook,
+  ingestOpenWaWebhook,
+  parseOpenWaInbound,
+  matchCrmRecords,
+  parseInbound,
+  upsertConversation,
+  findOrCreateByPhone,
+};

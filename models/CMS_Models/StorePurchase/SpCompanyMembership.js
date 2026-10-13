@@ -58,6 +58,15 @@ const membershipSchema = new mongoose.Schema(
     grantedByName: { type: String, trim: true, default: "" },
     grantedAt: { type: Date, default: Date.now },
     note: { type: String, trim: true, default: "" },
+
+    /* GRAV Voice belongs to an authenticated company member, not only to a
+       Sales Person roster row. This permits executive/admin identities that
+       intentionally have no Employee document to own a DID. */
+    voiceNumber: { type: String, default: null, trim: true },
+    voiceOutboundTrunkId: { type: String, default: null, trim: true },
+    voiceInboundTrunkId: { type: String, default: null, trim: true },
+    voiceInboundRoomName: { type: String, default: null, trim: true },
+    voiceEnabled: { type: Boolean, default: false },
   },
   { timestamps: true, collection: "sp_company_memberships" },
 );
@@ -66,6 +75,10 @@ const membershipSchema = new mongoose.Schema(
    carrying only an email does not collide with every other email-less row. */
 membershipSchema.index({ companyId: 1, email: 1 }, { unique: true, sparse: true });
 membershipSchema.index({ companyId: 1, employeeRef: 1 }, { unique: true, sparse: true });
+membershipSchema.index(
+  { voiceNumber: 1 },
+  { unique: true, partialFilterExpression: { voiceNumber: { $type: "string" } } },
+);
 
 membershipSchema.pre("validate", function (next) {
   if (!this.email && !this.employeeRef) {

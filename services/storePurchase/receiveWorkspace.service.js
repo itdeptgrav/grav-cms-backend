@@ -431,14 +431,31 @@ async function readRecordedReceipts(tenant, { source, search, dateFrom, dateTo }
  * kilograms have no total, and printing one invites somebody to divide by it.
  * The row carries a COUNT of outstanding lines.
  */
-async function readExpectedPurchased(tenant, { search }) {
+async function readExpectedPurchased(tenant, { search, dateFrom, dateTo } = {}) {
   const extra = { status: { $in: ["ISSUED", "PARTIALLY_RECEIVED"] } };
+  const clauses = [];
   if (search) {
     const rx = rxOf(search);
     // Folded under $and with the tenant scope (see scoped) — a search $or must
     // never widen the company boundary.
-    extra.$or = [{ poNumber: rx }, { vendorName: rx }, { supplierName: rx }];
+    clauses.push({ $or: [{ poNumber: rx }, { vendorName: rx }, { supplierName: rx }] });
   }
+  const { from, to } = dateBoundaries(dateFrom, dateTo);
+  if (from || to) {
+    const range = {};
+    if (from) range.$gte = from;
+    if (to) range.$lte = to;
+    // The screen's expected date is the header date, falling back to the
+    // earliest outstanding line date. Query both stored authorities so a
+    // question about a month cannot silently omit line-dated orders.
+    clauses.push({
+      $or: [
+        { expectedDeliveryDate: range },
+        { "items.expectedDeliveryDate": range },
+      ],
+    });
+  }
+  if (clauses.length) extra.$and = clauses;
   const filter = scoped(tenant, extra);
 
   const cap = EXPECTED_CAP();
@@ -502,7 +519,7 @@ async function readExpectedPurchased(tenant, { search }) {
  * document's per-line standing. This adapter only asks "does any line still
  * expect something" and never recomputes a pending quantity.
  */
-async function readExpectedCustomer(ctx, { search }) {
+async function readExpectedCustomer(ctx, { search, dateFrom, dateTo } = {}) {
   /* Required lazily: the Merchandising service pulls a wide model graph, and a
      top-level require would load it for every Store request. */
   const customerMaterial = require("../merchandising/customerMaterial.service");
@@ -512,10 +529,16 @@ async function readExpectedCustomer(ctx, { search }) {
   });
 
   const rows = [];
+  const { from, to } = dateBoundaries(dateFrom, dateTo);
   for (const row of out.rows || []) {
     const lines = row.standing?.lines || [];
     const outstanding = lines.filter((l) => num(l.pendingQuantity) > 0);
     if (!outstanding.length) continue;
+    const expectedDate = row.requiredBy || row.expectedAt || null;
+    const expectedInstant = expectedDate ? new Date(expectedDate) : null;
+    if ((from || to) && (!expectedInstant || Number.isNaN(expectedInstant.getTime()))) continue;
+    if (from && expectedInstant < from) continue;
+    if (to && expectedInstant > to) continue;
     rows.push({
       id: String(row.id || row.documentRef || ""),
       sourceType: SOURCE.CUSTOMER,
@@ -538,7 +561,7 @@ async function readExpectedCustomer(ctx, { search }) {
       expectedQuantity: outstanding.reduce((t, l) => t + num(l.requiredQuantity), 0),
       receivedQuantity: outstanding.reduce((t, l) => t + num(l.receivedQuantity), 0),
       remainingQuantity: outstanding.reduce((t, l) => t + num(l.pendingQuantity), 0),
-      expectedDate: row.requiredBy || row.expectedAt || null,
+      expectedDate,
       recordedDate: null,
       lineCount: outstanding.length,
       warehouseName: "",

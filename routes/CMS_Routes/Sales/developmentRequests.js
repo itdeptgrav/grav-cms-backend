@@ -31,6 +31,12 @@ const {
   merchandisingCompanyMiddleware,
 } = require("../../../services/companyContext/merchandisingScope.service");
 const requests = require("../../../services/sales/developmentRequest.service");
+const {
+  VOCABULARY, REFERENCE_TYPE_LABEL,
+} = require("../../../services/sales/developmentBriefVocabulary");
+const {
+  MATERIAL_CATEGORY,
+} = require("../../../models/CMS_Models/Sales/DevelopmentRequest");
 /* What Merchandising has chosen to say about the asks on this Journey. A
    projection of statements — no file id, no revision handle, no write. See the
    module header for why the query does not live on this side. */
@@ -93,6 +99,29 @@ async function announce(scope, correlationId) {
  * row, so a reader of this response can always tell which department is
  * asserting which fact.
  */
+/**
+ * THE CONTROLLED CHOICES THE BUYER BRIEF IS BUILT FROM.
+ *
+ * ── WHY THIS IS AN ENDPOINT AND NOT A CONSTANT IN THE FORM ────────────────
+ * Each option has a key, which the versioned request stores and every report
+ * counts, and a label, which is the plain words a person picks. Kept in the
+ * React form, those two can drift: the Sales screen offers "Relaxed fit" while
+ * the stored key is something else, or an option is removed from the backend
+ * and the form keeps offering it. Nobody finds out until a brief reads wrong.
+ *
+ * So the server owns both halves and hands them over. Declared ABOVE
+ * `/journeys/:journeyId` so "vocabulary" is never read as a journey id.
+ *
+ * `canInspect` rather than `canIssue`: a Sales viewer reading a request needs
+ * the same labels to read it by.
+ */
+router.get("/vocabulary", requireCompany, canInspect, handle(async (req, res) => res.json({
+  success: true,
+  vocabulary: VOCABULARY,
+  referenceTypes: REFERENCE_TYPE_LABEL,
+  materialCategories: Object.values(MATERIAL_CATEGORY),
+})));
+
 router.get("/journeys/:journeyId", requireCompany, canInspect, handle(async (req, res) => {
   const out = await requests.listForJourney(req.merchandising, {
     journeyId: req.params.journeyId, limit: req.query.limit,

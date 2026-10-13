@@ -113,6 +113,7 @@ async function chatJson({
   system,
   prompt,
   schema,
+  think = false,
   temperature = 0.2,
   numPredict,
   timeoutMs,
@@ -145,7 +146,9 @@ async function chatJson({
         // A JSON Schema constrains the model to the exact shape (structured
         // outputs); plain "json" only guarantees valid-but-arbitrary JSON.
         format: schema || "json",
-        think: false, // qwen3: suppress the <think> preamble at the source
+        // Most callers prefer speed. Evidence evaluation can opt into Qwen's
+        // private reasoning channel; only message.content is returned below.
+        think,
         options: { temperature, ...(numPredict ? { num_predict: numPredict } : {}) },
         messages: [
           { role: "system", content: system || "" },

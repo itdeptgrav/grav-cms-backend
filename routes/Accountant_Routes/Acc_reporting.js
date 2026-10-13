@@ -67,6 +67,7 @@ const { VizError, validateVisualization } = require("../../services/reporting/vi
 const freshness = require("../../services/reporting/martFreshness.service");
 const { writeWorkbook } = require("../../services/reporting/workbook");
 const budget = require("../../services/reporting/previewBudget");
+const headingBudget = require("../../services/reporting/headingBudget");
 const { createDeadline } = require("../../services/reporting/deadline");
 const { Acc_CustomReport } = require("../../models/Accountant_model/Acc_CustomReport");
 const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
@@ -149,7 +150,15 @@ function onError(res, err, where) {
   if (err instanceof ReportingError) {
     if (err.cause) console.error(`[reporting/${where}] ${err.message}:`, err.cause.message);
     else console.error(`[reporting/${where}]`, err.message);
-    return refuse(res, err.code, err.status || 502, { message: err.message });
+    /* `details` is carried when the error has a public contract of its own —
+       REPORTING_TOO_MANY_HEADINGS names the field, the count and the maximum,
+       and a caller that reaches it through the export or a chart must be told
+       the same thing the preview tells it. Anything without details is
+       unchanged. */
+    return refuse(res, err.code, err.status || 502, {
+      message: err.message,
+      ...(err.details ? err.details : {}),
+    });
   }
   console.error(`[reporting/${where}]`, err && err.message ? err.message : err);
   return refuse(res, CODES.UNAVAILABLE, 503);
@@ -338,6 +347,37 @@ router.post("/preview", ...guard, requirePermission("canView"), async (req, res)
       signal: gone.signal,
     });
 
+    /* ── HOW WIDE WILL IT ACTUALLY BE ──────────────────────────────────────
+     * The complexity gate above counts FIELDS; it says so itself. One field
+     * across the top is one field whether it holds twelve months or nine
+     * thousand voucher numbers. This counts the headings the data will really
+     * produce, under the same company scope and the same filters, with the
+     * count limited to one more than the maximum so it can never be the
+     * expensive question it is asking about.
+     *
+     * It runs after the scope guard, so an unowned company has already been
+     * refused 403 without a single query. */
+    if (layout.columns.length) {
+      const resolved = await engine().resolveView(layout);
+      const headings = await headingBudget.countHeadings({
+        layout,
+        resolved,
+        organizationId: String(req.organization._id),
+        companyIds: req.companyIds,
+        runQuery: engine().runQuery,
+        deadline,
+      });
+      telemetry.headings = headings;
+      if (!headings.allowed) {
+        telemetry.outcome = "refused";
+        telemetry.refusedBy = "headings";
+        return refuse(
+          res, CODES.TOO_MANY_HEADINGS, 422,
+          headingBudget.refusalDetails(layout, headings),
+        );
+      }
+    }
+
     const matrix = await engine().runPreview({
       layout,
       organizationId: String(req.organization._id),
@@ -451,6 +491,21 @@ router.post("/export/xlsx", ...guard, requirePermission("canView"), async (req, 
        proves nothing: it may have run under a different catalogue, a different
        role, or not at all. */
     spec = validateLayout(params, { approvedCompanyIds: req.companyIds, mode: "export" });
+
+    /* THE SAME BOUND AS THE PREVIEW, FOR THE SAME REASON.
+       The workbook is the flat aggregation behind the report, so a sheet the
+       preview refused as unreadably wide is a file with the same headings in
+       it. A layout that cannot be previewed must not be downloadable instead —
+       that would make the gate an inconvenience rather than a rule. */
+    if (spec.columns.length) {
+      await headingBudget.assertWithinBudget({
+        layout: spec,
+        resolved: await engine().resolveView(spec),
+        organizationId: String(req.organization._id),
+        companyIds: req.companyIds,
+        runQuery: engine().runQuery,
+      });
+    }
 
     const { rows, pivoted } = await engine().runExport({
       layout: spec,
@@ -632,6 +687,21 @@ router.post(
       );
 
       const resolved = await engine().resolveView(layout);
+
+      /* A chart breaks out on the same column fields the sheet does
+         (`compileChartQuery`), so the same bound applies. Refused here rather
+         than after a Metabase card has been created for a series nobody can
+         read — and with the same code and details the preview answers. */
+      if (layout.columns.length) {
+        await headingBudget.assertWithinBudget({
+          layout,
+          resolved,
+          organizationId: String(req.organization._id),
+          companyIds,
+          runQuery: engine().runQuery,
+        });
+      }
+
       const bridge = charts();
 
       const card = reportId

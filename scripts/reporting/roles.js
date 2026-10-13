@@ -3,6 +3,11 @@
 //
 //   npm run reporting:roles -- --apply
 //
+// Building a FRESH mart? Use `npm run reporting:setup -- --apply`, which runs
+// this TWICE on purpose: once to create the roles, and again after the
+// migrations so the relations they created are granted too. Running it once on
+// an empty database leaves metabase_reader unable to read the curated views.
+//
 // Runs migrations/reporting/roles/R__roles.sql as the owner, binding both
 // passwords at run time from the environment:
 //

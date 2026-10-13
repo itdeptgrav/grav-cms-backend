@@ -39,6 +39,8 @@ const Enquiry = require("../../models/CMS_Models/Sales/Enquiry");
 const SalesJourney = require("../../models/CMS_Models/Sales/SalesJourney");
 const Account = require("../../models/CMS_Models/Sales/Account");
 const SampleStyle = require("../../models/CMS_Models/Sales/SampleStyle");
+const brief = require("./developmentBriefCarryForward");
+const { VOCABULARY } = require("./developmentBriefVocabulary");
 const {
   SalesDevelopmentRequest, REQUEST_STATE, MATERIAL_CATEGORY, FORBIDDEN_FIELDS,
   REFERENCE_TYPE,
@@ -95,6 +97,9 @@ function assertNoMaterialFields(body) {
 const ISSUE_FIELDS = Object.freeze([
   "requirementSummary", "requestedCategories", "requiredByDate",
   "referenceImages", "styleRef", "sampleStyleId", "stockItemId", "targetPriceCeiling",
+  /* The buyer's brief. Grouped, typed, and carried forward on a correction —
+     see `developmentBriefCarryForward.js` for the rule. */
+  "customerDirection", "productDirection", "developmentNeed",
   "expectedCurrentVersionNo", "idempotencyKey",
 ]);
 
@@ -308,6 +313,93 @@ async function resolveProductLine(companyId, { journeyId, productLineRef }) {
 /* ═══ ISSUE ════════════════════════════════════════════════════════════════ */
 
 /**
+ * ── WHAT THIS VERSION SAYS, GIVEN WHAT THE LAST ONE SAID ──────────────────
+ * Every value-level check happens HERE rather than at the top of `issue`,
+ * because a correction that omits a field is keeping it, not clearing it — so
+ * the thing to validate is the MERGED value, and the merge needs the version
+ * in force. Checking the posted body instead is what made an omitted summary
+ * read as an empty one.
+ */
+function shapeIssueBody(body, previousDoc) {
+  /* ── A PLAIN OBJECT, NOT A MONGOOSE DOCUMENT ───────────────────────────
+     Two reasons, both of which bit. A subdocument SPREADS its internals
+     (`$__parent`, `$isNew`) into the successor, and an unset subdocument
+     MATERIALISES with its declared defaults — so `targetPriceCeiling` read
+     back as `{amount: null, currency: ""}` rather than absent, and every
+     reissue was refused as partial money. */
+  const previous = typeof previousDoc?.toObject === "function"
+    ? previousDoc.toObject({ depopulate: true })
+    : previousDoc;
+
+  /* An empty stored ceiling is NO ceiling. A stored one is only a ceiling
+     when it carries an amount; anything less was never a buyer constraint. */
+  const previousCeiling = Number.isFinite(previous?.targetPriceCeiling?.amount)
+    ? previous.targetPriceCeiling
+    : undefined;
+
+  const carried = brief.carryForwardFlat(
+    { ...previous, targetPriceCeiling: previousCeiling },
+    body,
+    {
+      only: ["requirementSummary", "requestedCategories", "requiredByDate",
+        "styleRef", "referenceImages", "targetPriceCeiling"],
+    },
+  );
+
+  const summary = str(carried.requirementSummary);
+  if (summary.length < 15) {
+    throw fail("VALIDATION",
+      "A merchandiser has to select materials from this, so say what is wanted.",
+      { field: "requirementSummary", minimum: 15 });
+  }
+
+  const categories = (Array.isArray(carried.requestedCategories) ? carried.requestedCategories : [])
+    .map((c) => str(c).toUpperCase());
+  if (!categories.length) {
+    throw fail("VALIDATION", "Say which categories this request covers.",
+      { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
+  }
+  for (const c of categories) {
+    if (!Object.values(MATERIAL_CATEGORY).includes(c)) {
+      throw fail("VALIDATION", `"${c}" is not a material category.`,
+        { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
+    }
+  }
+
+  /* ── THE BUYER'S CEILING, WHOLE OR ABSENT ───────────────────────────────
+     Carried forward like everything else, so an unrelated correction can no
+     longer drop it. Partial money is refused: an amount with no currency is
+     a number nobody can act on. */
+  let targetPriceCeiling;
+  const ceiling = carried.targetPriceCeiling;
+  if (ceiling !== undefined && ceiling !== null) {
+    const amount = Number(ceiling?.amount);
+    const currency = str(ceiling?.currency).toUpperCase();
+    const basis = str(ceiling?.basis).toUpperCase() || "PER_PIECE";
+    if (!Number.isFinite(amount) || amount < 0 || !currency || basis !== "PER_PIECE") {
+      throw fail("VALIDATION",
+        "A target price needs a non-negative amount, a currency, and the per-piece basis.",
+        { field: "targetPriceCeiling" });
+    }
+    targetPriceCeiling = { amount, currency: currency.slice(0, 8), basis };
+  }
+
+  /* The three grouped brief sections, merged then checked against the one
+     vocabulary the Sales form is served from. */
+  const groups = brief.validateBrief(
+    brief.carryForwardBrief(previous, body),
+    { vocabulary: VOCABULARY, fail },
+  );
+
+  return {
+    summary, categories, targetPriceCeiling, groups,
+    requiredByDate: str(carried.requiredByDate) || null,
+    styleRef: str(carried.styleRef),
+    referenceImages: normaliseReferenceImages(carried.referenceImages),
+  };
+}
+
+/**
  * Ask Merchandising to select materials for one Journey product line.
  *
  * A second request against a line that already has an open one is a NEW
@@ -321,38 +413,6 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
   }
   assertShape(body);
   assertNoForbiddenFields(body);
-
-  const summary = str(body.requirementSummary);
-  if (summary.length < 15) {
-    throw fail("VALIDATION",
-      "A merchandiser has to select materials from this, so say what is wanted.",
-      { field: "requirementSummary", minimum: 15 });
-  }
-
-  const categories = (Array.isArray(body.requestedCategories) ? body.requestedCategories : [])
-    .map((c) => str(c).toUpperCase());
-  if (!categories.length) {
-    throw fail("VALIDATION", "Say which materials Merchandising should select.",
-      { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
-  }
-  const badCategory = categories.find((c) => !Object.values(MATERIAL_CATEGORY).includes(c));
-  if (badCategory) {
-    throw fail("VALIDATION", `"${badCategory}" is not a material category.`,
-      { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
-  }
-
-  let targetPriceCeiling;
-  if (body.targetPriceCeiling !== undefined && body.targetPriceCeiling !== null) {
-    const amount = Number(body.targetPriceCeiling?.amount);
-    const currency = str(body.targetPriceCeiling?.currency).toUpperCase();
-    const basis = str(body.targetPriceCeiling?.basis).toUpperCase();
-    if (!Number.isFinite(amount) || amount < 0 || !currency || basis !== "PER_PIECE") {
-      throw fail("VALIDATION",
-        "A target-price ceiling needs a non-negative amount, currency and PER_PIECE basis.",
-        { field: "targetPriceCeiling" });
-    }
-    targetPriceCeiling = { amount, currency: currency.slice(0, 8), basis };
-  }
 
   /* ── AN IN-HOUSE SAMPLE HAS NO JOURNEY (6 Oct 2026, owner: "the sampling
      section works without a customer; the industry samples in its free time").
@@ -398,6 +458,9 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
     }).session(session);
 
     const requestRef = open?.requestRef || `DRQ-${crypto.randomBytes(6).toString("hex")}`;
+
+    /* Validated against the version in force, so an omitted field is kept. */
+    const shaped = shapeIssueBody(body, open);
 
     if (body.expectedCurrentVersionNo !== undefined) {
       const expected = Number(body.expectedCurrentVersionNo);
@@ -452,14 +515,17 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
       buyerDisplayLabel,
       accountRef: str(journey.accountId),
       productName: str(line.product) || "Unnamed product",
-      styleRef: str(body.styleRef) || str(sampleStyle?.styleCode),
-      sampleStyleId: sampleStyle?._id || null,
-      stockItemId: isId(body.stockItemId) ? body.stockItemId : (line.stockItemId || null),
-      referenceImages: normaliseReferenceImages(body.referenceImages),
-      requirementSummary: summary.slice(0, 4000),
-      requestedCategories: [...new Set(categories)],
-      requiredByDate: str(body.requiredByDate) || null,
-      targetPriceCeiling,
+      styleRef: shaped.styleRef || str(sampleStyle?.styleCode),
+      sampleStyleId: sampleStyle?._id || (open?.sampleStyleId || null),
+      stockItemId: isId(body.stockItemId)
+        ? body.stockItemId
+        : (open?.stockItemId || line.stockItemId || null),
+      referenceImages: shaped.referenceImages,
+      requirementSummary: shaped.summary.slice(0, 4000),
+      requestedCategories: [...new Set(shaped.categories)],
+      requiredByDate: shaped.requiredByDate,
+      targetPriceCeiling: shaped.targetPriceCeiling,
+      ...shaped.groups,
       /* Sales' own authority, stamped from the resolved actor. Never
          body-authored — the field is not in ISSUE_FIELDS. */
       requestedBy: actor || undefined,
@@ -494,7 +560,7 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
       action: DEVELOPMENT_EVENT_KINDS.ISSUED,
       actor: actor || undefined,
       at,
-      reason: summary.slice(0, 1000),
+      reason: shaped.summary.slice(0, 1000),
       correlationId,
       changeRef: requestRef,
       noticeId: request._id,
@@ -1060,6 +1126,13 @@ async function requestMaterialChanges(scope, { requestRef, body = {}, actor = nu
 
 /* ═══ READS ════════════════════════════════════════════════════════════════ */
 
+/* A stored subdocument as a plain object, so a Mongoose document's internals
+   never reach a response. `lean()` reads are already plain; both go through
+   this so the view does not depend on which. */
+const plainGroup = (g) => (g && typeof g.toObject === "function"
+  ? g.toObject({ depopulate: true })
+  : (g || {}));
+
 const requestView = (r) => (r ? {
   id: str(r._id),
   requestRef: str(r.requestRef),
@@ -1088,6 +1161,15 @@ const requestView = (r) => (r ? {
       basis: str(r.targetPriceCeiling.basis),
     }
     : null,
+  /* ── THE BUYER'S BRIEF, AS STORED ─────────────────────────────────────
+     Projected raw (keys, not labels) because this view's reader is SALES' own
+     form, which seeds a correction from it — see `draftFromRequest`. The
+     labelled, sentence-per-absence version is Merchandising's
+     `buyerBrief.projection.js`, and the two are deliberately different jobs:
+     one is for editing, the other for reading. */
+  customerDirection: plainGroup(r.customerDirection),
+  productDirection: plainGroup(r.productDirection),
+  developmentNeed: plainGroup(r.developmentNeed),
   requestedByName: str(r.requestedBy?.name),
   requestedAt: r.requestedAt || null,
   supersededAt: r.supersededAt || null,

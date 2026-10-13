@@ -1,24 +1,31 @@
 // services/whatsappSend.js
 //
-// Sends messages via Meta's WhatsApp Cloud API and records the outbound row.
-// The only place that ever talks OUT to Meta. The access token is read from
-// config (env) and never leaves the backend.
+// Sends messages through the explicitly selected WhatsApp provider and records
+// the outbound row. OpenWA is the default; Meta is retained as a dormant
+// adapter and is never used as an automatic fallback.
+const crypto = require("crypto");
 const { cfg, canSend, messagesUrl } = require("../config/whatsapp");
+const { cfg: providerCfg, isOpenWaActive, isMetaActive } = require("../config/whatsappProvider");
+const openwa = require("./openwaClient");
 const { WhatsAppMessage } = require("../models/CMS_Models/Sales/WhatsAppMessage");
 
 class WhatsAppError extends Error {
-  constructor(message, status = 400) {
+  constructor(message, status = 400, code = "whatsapp_error") {
     super(message);
     this.name = "WhatsAppError";
     this.status = status;
+    this.code = code;
   }
 }
 
 // POST one message to Meta, then persist it as an outgoing row with the id Meta
 // hands back (so later delivery/read webhooks can find it).
 async function sendMessage({ conv, payload, previewText, actor }) {
+  if (!isMetaActive()) {
+    throw new WhatsAppError("The official WhatsApp API is dormant. OpenWA only supports this action as plain text.", 409, "provider_capability_unavailable");
+  }
   if (!canSend()) {
-    throw new WhatsAppError("WhatsApp sending isn't configured (set WHATSAPP_ACCESS_TOKEN and WHATSAPP_PHONE_NUMBER_ID).", 503);
+    throw new WhatsAppError("The official WhatsApp API is selected but not configured.", 503, "provider_not_configured");
   }
   const res = await fetch(messagesUrl(), {
     method: "POST",
@@ -34,6 +41,7 @@ async function sendMessage({ conv, payload, previewText, actor }) {
     conversationId: conv._id,
     waId: conv.waId,
     waMessageId: data?.messages?.[0]?.id,
+    provider: "meta",
     direction: "outgoing",
     type: payload.type || "text",
     text: previewText,
@@ -52,7 +60,33 @@ async function sendMessage({ conv, payload, previewText, actor }) {
 // Free-form text — only valid inside the 24-hour customer-service window (the
 // route enforces that and returns a clear 409 otherwise).
 function sendText(conv, text, actor) {
+  if (isOpenWaActive()) return sendOpenWaText(conv, text, actor);
   return sendMessage({ conv, payload: { type: "text", text: { body: text } }, previewText: text, actor });
+}
+
+async function sendOpenWaText(conv, text, actor) {
+  const result = await openwa.sendText(conv.waId, text);
+  const providerId = typeof result === "string"
+    ? result
+    : result?._serialized || result?.id?._serialized || result?.id;
+  const stored = await WhatsAppMessage.create({
+    conversationId: conv._id,
+    waId: conv.waId,
+    waMessageId: providerId || `openwa:${providerCfg.openwaSessionId}:${crypto.randomUUID()}`,
+    provider: "openwa",
+    providerSessionId: providerCfg.openwaSessionId,
+    direction: "outgoing",
+    type: "text",
+    text,
+    timestamp: new Date(),
+    status: "sent",
+    sentBy: actor?.id ? { id: actor.id, name: actor.name } : undefined,
+  });
+  conv.lastMessageAt = stored.timestamp;
+  conv.lastMessagePreview = text;
+  conv.lastDirection = "outgoing";
+  await conv.save();
+  return stored;
 }
 
 // Render an approved template's body into the actual text that was sent, by
@@ -80,6 +114,13 @@ function renderTemplateText(name, bodyText, components) {
 // in place of the message — and this is the send-side half of making sure no
 // new row is ever written that way. The read side is `withReadableText()`.
 async function sendTemplate(conv, { name, language = "en_US", components, bodyText } = {}, actor) {
+  if (isOpenWaActive()) {
+    throw new WhatsAppError(
+      "Approved Meta templates are unavailable while OpenWA is active. Send a normal message instead.",
+      409,
+      "templates_unavailable",
+    );
+  }
   if (!name) throw new WhatsAppError("A template name is required.", 400);
   const body = bodyText || (await require("./whatsappTemplates").resolveBody(name));
   return sendMessage({
@@ -90,4 +131,4 @@ async function sendTemplate(conv, { name, language = "en_US", components, bodyTe
   });
 }
 
-module.exports = { sendText, sendTemplate, sendMessage, WhatsAppError };
+module.exports = { sendText, sendTemplate, sendMessage, sendOpenWaText, WhatsAppError };

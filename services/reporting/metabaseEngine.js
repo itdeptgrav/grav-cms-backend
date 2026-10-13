@@ -45,6 +45,11 @@ const CODES = Object.freeze({
   UNAUTHORISED: "REPORTING_UNAUTHORISED",
   FORBIDDEN: "REPORTING_FORBIDDEN",
   INVALID_SPEC: "REPORTING_INVALID_SPEC",
+  /* The report is legal but would be too wide once the data is counted. It is
+     its own code, not INVALID_SPEC, because the layout is NOT invalid: the
+     same layout with a narrower filter is accepted, so a client can tell
+     "fix the report" from "fix the filter". See headingBudget.js. */
+  TOO_MANY_HEADINGS: "REPORTING_TOO_MANY_HEADINGS",
 });
 
 class ReportingError extends Error {
