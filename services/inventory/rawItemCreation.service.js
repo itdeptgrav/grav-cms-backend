@@ -431,6 +431,7 @@ async function createRawItem({
     customCategory: str(payload.customCategory) || "",
     usedAs: usedAsValue,
     productType: str(payload.productType).slice(0, 80),
+    maxDefectPoints: (() => { const v = Number(payload.maxDefectPoints); return payload.maxDefectPoints === null || payload.maxDefectPoints === undefined || str(payload.maxDefectPoints) === "" || !Number.isFinite(v) || v < 0 ? null : Math.round(v); })(),
     /* A property of the GOODS, recorded once here rather than on every
        quotation. Distinct from the supplier's GST HSN — see the model. */
     customsTariffCode: tariffCode(payload.customsTariffCode),
