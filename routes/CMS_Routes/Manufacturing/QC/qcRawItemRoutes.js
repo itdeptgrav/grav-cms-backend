@@ -590,10 +590,10 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
          one for this label alone, so a re-check replaces it rather than
          stacking a second. The ceiling travels too, as on the order path. */
       const labelPrior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: null, superseded: { $ne: true } });
-      const ceiling0 = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints").lean().catch(() => null) : null;
+      const ceiling0 = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints unit customUnit").lean().catch(() => null) : null;
       return res.json({
         success: true,
-        sticker: { ...stickerView(b), ...src, maxDefectPoints: ceiling0?.maxDefectPoints ?? null },
+        sticker: { ...stickerView(b), ...src, maxDefectPoints: ceiling0?.maxDefectPoints ?? null, rawItemUnit: ceiling0?.customUnit || ceiling0?.unit || b.unit || "" },
         goodsReceipt: receipt,
         grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
         order: null,
@@ -623,10 +623,11 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
     if (restoring) warnings.push(`The label reads ${r4(b.quantity)} ${b.unit || ""} because ${restoring} ${b.unit || ""} was taken off the Store's stock for the standing defect. A re-check puts it back first and judges the full ${shownQty} ${b.unit || ""}.`.replace(/\s+([.,])/g, "$1"));
     if (elsewhere.length) warnings.push(`Already checked on ${elsewhere.map((e) => e.moNumber).join(", ")}.`);
 
-    const ceiling = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints").lean().catch(() => null) : null;
+    const ceiling = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints unit customUnit").lean().catch(() => null) : null;
     res.json({
       success: true,
-      sticker: { ...stickerView(b), ...src, ...(restoring ? { quantity: shownQty, labelReads: r4(b.quantity), restoringDebit: restoring } : {}), maxDefectPoints: ceiling?.maxDefectPoints ?? null },
+      /* `rawItemUnit` (13 Oct 2026, owner): the station shows the raw item's registered unit, not the label's spelling */
+      sticker: { ...stickerView(b), ...src, ...(restoring ? { quantity: shownQty, labelReads: r4(b.quantity), restoringDebit: restoring } : {}), maxDefectPoints: ceiling?.maxDefectPoints ?? null, rawItemUnit: ceiling?.customUnit || ceiling?.unit || b.unit || "" },
       goodsReceipt: receipt,
       grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
       order: {
@@ -745,7 +746,9 @@ router.post("/save", requireChecker, async (req, res) => {
       if (!(defQty > 0) || defQty > actual) return res.status(400).json({ success: false, message: `The defective quantity must be between 0 and ${actual} ${b.unit || ""}.`.trim() });
     }
     const totalPoints = picked.reduce((a, d) => a + (d.points || 0), 0);
-    const ceilingDoc = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints").lean().catch(() => null) : null;
+    const ceilingDoc = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints unit customUnit").lean().catch(() => null) : null;
+    /* the record is worded in the raw item's registered unit (13 Oct 2026, owner); the label's spelling is the fallback */
+    const unitOf = ceilingDoc?.customUnit || ceilingDoc?.unit || b.unit || "";
     const maxAllowedPoints = Number.isFinite(Number(ceilingDoc?.maxDefectPoints)) && ceilingDoc?.maxDefectPoints !== null ? Number(ceilingDoc.maxDefectPoints) : null;
     const pointsVerdict = maxAllowedPoints === null ? null : (totalPoints > maxAllowedPoints ? "reject" : "accept");
 
@@ -755,7 +758,7 @@ router.post("/save", requireChecker, async (req, res) => {
     const fields = {
       date: shift.istDayKeyOf(now), hourKey: shift.shiftBuckets()[shift.bucketIndexOf(now)]?.key || "",
       manufacturingOrderId: orderDoc ? orderDoc._id : null, moNumber: orderDoc ? moNumberOf(orderDoc) : "", customerName: orderDoc ? (orderDoc.customerInfo?.name || "") : (receipt?.order?.customerName || receipt?.supplierName || ""), isJobWork: orderDoc ? isJobWork(orderDoc) : false,
-      barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantId: b.variantId || null, variantLabel: (b.variantCombination || []).join(" · "), quantity: actual, unit: b.unit || "", purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "",
+      barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantId: b.variantId || null, variantLabel: (b.variantCombination || []).join(" · "), quantity: actual, unit: unitOf, purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "",
       /* the GRN the label was received under (8 Oct 2026), so the GRN book can
          say how much of each receipt is checked */
       goodsReceiptId: receipt ? receipt.goodsReceiptId : null, goodsReceiptNumber: receipt?.receiptNumber || "",
@@ -819,8 +822,8 @@ router.post("/save", requireChecker, async (req, res) => {
         const sl = serial ? `SL ${serial} · ` : "";
         const pts = totalPoints ? ` · ${totalPoints} point${totalPoints === 1 ? "" : "s"}${maxAllowedPoints !== null ? ` (max ${maxAllowedPoints})` : ""}` : "";
         return status === "passed"
-          ? `Accepted: ${sl}${actual} ${b.unit || ""} of ${b.rawItemName}${pts}.`.replace(/\s+\./g, ".")
-          : `Rejected: ${sl}${actual} ${b.unit || ""} of ${b.rawItemName}${pts}.${stockLine}`.replace(/\s+\./g, ".");
+          ? `Accepted: ${sl}${actual} ${unitOf} of ${b.rawItemName}${pts}.`.replace(/\s+\./g, ".")
+          : `Rejected: ${sl}${actual} ${unitOf} of ${b.rawItemName}${pts}.${stockLine}`.replace(/\s+\./g, ".");
       })(),
     });
   } catch (err) {
