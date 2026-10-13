@@ -339,44 +339,6 @@ assistant does not create a parallel scope rule.
 
 ---
 
-# ACTIVE TASK — R&D FIT SIMULATION, SLICE 1 (1 Oct 2026)
-
-The active implementation scope is the **first in-app 2D→3D fit slice** for
-R&D. Decision record: `docs/decisions/rnd-fit-simulation.md`.
-
-**Direction update, 6 Oct 2026:** native in-app 2D pattern creation is the
-primary entry point; DXF import is optional. The existing slice's imported
-pattern adapter remains valid but is not the final user workflow. Before
-claiming a usable woven-shirt feature, implement a native root revision,
-production access to the 2D editor, complete construction-path confirmation,
-and saved-revision-to-drape validation as specified in
-`docs/decisions/rnd-native-pattern-authoring.md`. Treat this as sequential
-follow-on scope, not as proof that the current drape is visually acceptable.
-
-The product direction is fixed and is not re-litigated by this slice:
-
-- the 2D pattern is the only manufacturing source of truth;
-- the 3D garment is derived from an approved, immutable pattern revision;
-- nothing in 3D may modify 2D geometry;
-- it all happens inside the R&D web application — no Blender, no command-line
-  export, no separate operator application.
-
-**This slice builds:** the cloth solver with body and self collision and staged
-settling; an explicit mm/cm/in unit boundary with the millimetre as the one
-internal unit; the adapter from a `patternSet` revision to simulation pieces;
-triangulation that keeps every vertex's source piece; the geometry-fidelity
-gate; readiness validation and a visual seam-mapping step; the worker lifecycle
-wired to `RenderJob`; Draft/Normal/High; and a derived drape rendered in the
-existing workspace.
-
-**This slice does NOT build** the Fit Assistant or side-by-side trial
-comparison. Boundaries are left for Grab, Pin, Relax, Strain and Clearance.
-
-`cad.zip` is first-party GRAV code, authorised for reuse, **not open source and
-not for redistribution** — see the decision record.
-
----
-
 # ACTIVE TASK — CUSTOMER-SUPPLIED DEVELOPMENT SAMPLES (1 Oct 2026)
 
 Decision record: `docs/decisions/store-customer-supplied-material.md`.
