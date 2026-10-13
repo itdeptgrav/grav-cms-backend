@@ -1,3 +1,74 @@
+# ACTIVE TASK — GRAV MAIL APPLICATION FOUNDATION (12 Oct 2026)
+
+The product owner approved Mail as a separate first-class CMS application like
+Store & Purchase and HR. It takes the useful per-person Gmail concept from
+CoWork, but it does not remove, rename or redirect CoWork mail. Mail uses the
+CMS launcher, the `mail` application grant, `/mail`, `FrostShell` and a new
+self-scoped `/api/cms/mail` boundary.
+
+The implemented centralized slice adds GRAV-owned internal conversations beside
+live Gmail. Internal compose resolves employee IDs to canonical participant
+identities on the server; the IDs are addresses, never authority. Internal
+message content is stored in dedicated MongoDB collections and never forwarded
+to Gmail or copied into CoWork.
+
+Mailbox ownership is always derived from the verified CMS actor. A browser may
+not select an `employeeId`, email address or credential record. Platform
+administration grants application access but does not grant access to another
+person's mailbox. New Gmail credentials live encrypted in a dedicated
+connection store; OAuth state is random, short-lived, single-use and bound to
+the initiating actor. Mail reads Gmail live and does not persist mailbox
+content in the MVP.
+
+Implemented: catalogue + shell, protected Mail API, internal list/thread/send/
+reply, encrypted Gmail connect/status/disconnect, Gmail list/thread/send/reply,
+and a responsive unified inbox. Production release still requires the hardening
+items recorded in `docs/tasks/mail-app-foundation.md`.
+
+Durable scope:
+
+- `docs/product/mail-app.md`
+- `docs/decisions/mail-app-identity-oauth-boundary.md`
+- `docs/tasks/mail-app-foundation.md`
+
+Implementation starts with MA-01 application registration and proceeds in the
+documented sequence. Existing `/api/google/employee-gmail/*` routes and
+`cowork_employees.gmailToken` remain unchanged during the foundation.
+
+---
+
+# ACTIVE TASK — SALES OPENWA MEDIA (12 Oct 2026)
+
+Received WhatsApp images, stickers, voice notes/audio, video and documents now
+flow through a protected CMS-to-OpenWA media proxy. Media `body` values are
+thumbnails rather than message copy, so ingestion stores captions only and
+never renders base64 as chat text. The existing malformed image row was
+repaired and its original 160,953-byte JPEG was verified through the proxy.
+
+Durable scope: `docs/product/sales-openwa-messaging.md` and
+`docs/tasks/sales-openwa-messaging-integration.md`.
+
+OpenWA call-state tracking now writes into the existing Contact Logs call
+register. Repeated states correlate on the provider call id; `ACTIVE` marks a
+call received, terminal states set the outcome, and talk time excludes ringing.
+The integration stores only lifecycle metadata — never WhatsApp call audio.
+
+---
+
+# ACTIVE TASK — GRAV MUSIC WEBVIEW MVP (10 Oct 2026)
+
+The existing CMS `/music` route now selects between two playback adapters. GRAV desktop keeps its Nuclear bridge. Browser and mobile WebView sessions use an HTML audio player with authenticated search, queue, favourites, seeking, volume, and operating-system media controls.
+
+The backend exposes authenticated `/api/cms/music/health`, `/search`, and `/resolve` endpoints. Search uses a server-owned songs-only catalogue helper and audio-only stream resolution uses server-owned `yt-dlp` argument arrays; the browser may submit only bounded search text and validated YouTube video ids. The development runtime is installed under ignored `.local-tools/`; production must provide the pinned catalogue and playback dependencies or their configured paths.
+
+**10 Oct search correction.** Nuclear desktop does not expose its YouTube streaming search as the user-facing catalogue. Its active metadata plugin returns real tracks first; the separate YouTube plugin searches/resolves playback afterward. The WebView MVP originally used generic `ytsearch`, so a query such as “ghost” mixed horror videos with songs. Web search now uses YouTube Music's explicit songs-only filter through the pinned `ytmusicapi` helper, while `yt-dlp` remains the audio resolver. A live “ghost” search returned 20 song rows with artist, album, artwork and duration, and the selected result still passed the signed `206 audio/mp4` range-stream test.
+
+The iOS 1.0.10 IPA already loads `cms.grav.in` and permits `api.grav.in`, so the same-origin `/music` surface requires no IPA rebuild for the MVP. Focused frontend and backend tests pass, the running authenticated backend reports yt-dlp `2026.08.19`, a live Odia search returns results, and a signed range request returns `206 audio/mp4` with the requested 1,024 bytes. The whole frontend compiles, then its existing `/marketing/campaigns/plans` prerender error stops the repository-wide production build.
+
+Durable scope: `docs/product/grav-music-webview.md` and `docs/decisions/grav-music-webview-boundary.md`.
+
+---
+
 # ACTIVE TASK — AI INTERVIEW LAB MVP (10 Oct 2026)
 
 The candidate-facing question voice now uses Bodhan's hosted Indic-Speak API. The browser never receives the key or controls the upstream model; it can select only the server allowlisted Kavya/Amit voices for Hindi and English, or Itishree/Akash for Odia. The backend requests the provider's 24 kHz WAV, bounds synthesis time, validates RIFF output, and keeps a small process-local replay cache. A model-restricted key is configured as `BODHAN_API_KEY` in the ignored backend `.env`; live English and Odia synthesis both returned valid mono 24 kHz PCM WAV audio on 10 Oct 2026.
@@ -164,6 +235,22 @@ as `CUSTOMER_BUSY` / `CUSTOMER_NO_ANSWER`. The calling permission gate
 (`GRAV_VOICE_ALLOW_TEST_DIALLER=1` + administrator) is **unchanged** and is the
 owner's decision to widen. Historical Exotel `CallEvent` rows stay in Mongo
 (the `provider` enum is untouched) but are no longer listed or playable.
+
+**12 Oct per-user inbound and carrier-bypass update.** Voice lines are now
+owned per enabled Sales Person or company membership; an unassigned user never
+inherits the old shared DID. The CEO membership owns `+918065395337`, with a
+dedicated LiveKit inbound trunk, dispatch rule and opaque room. The browser has
+owner-scoped incoming discovery, audible/vibration ringing, answer/decline and
+recording lifecycle. Four direct Plivo Zentrunk attempts ended as SIP 487
+without creating a LiveKit room even after India endpoint pinning. The active
+implementation therefore adds a public Plivo Voice Application answer route at
+`/api/cms/voice/plivo/inbound`; it resolves the called DID from GRAV and returns
+a bounded Dial/User XML instruction to the regional LiveKit SIP endpoint.
+Focused bridge/assignment/LiveKit tests pass 22/22. This is not yet deployed:
+the current public URL still reaches the old authenticated router. Do not move
+the DID from Zentrunk to the Voice Application until the backend is deployed;
+then install/enforce Plivo V3 signature secrets and complete a real ring,
+answer, two-way-audio, decline and missed-call test.
 
 ---
 

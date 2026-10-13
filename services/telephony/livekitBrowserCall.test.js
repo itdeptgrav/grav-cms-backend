@@ -89,7 +89,7 @@ test("calling stays visibly unavailable without an outbound trunk", () => {
   assert.doesNotMatch(service.setupMessage(), /[A-Z]{3,}_[A-Z_]+/);
 });
 
-test("there is one GRAV line: the generic trunk and caller ID win over the legacy Plivo names", () => {
+test("generic line settings remain compatible with the legacy Plivo variable names", () => {
   const legacy = LiveKitBrowserCall.fromEnv({
     LIVEKIT_URL: "wss://example.livekit.cloud",
     LIVEKIT_API_KEY: "key",
@@ -145,6 +145,65 @@ test("customer-side hang-up makes participant cleanup idempotent", async () => {
   assert.equal(participantAlreadyGone({ code: "NOT_FOUND" }), true);
   assert.equal(participantAlreadyGone({ message: "participant does not exist" }), true);
   assert.equal(participantAlreadyGone({ message: "permission denied" }), false);
+});
+
+test("an inbound SIP participant is reduced to the safe ringing envelope", async () => {
+  const service = new LiveKitBrowserCall({
+    url: "wss://example.livekit.cloud",
+    apiKey: "key",
+    apiSecret: "secret",
+    outboundTrunkId: "ST_test",
+    businessNumber: "+918065395337",
+    roomClientFactory: () => ({
+      listParticipants: async () => [{
+        identity: "sip-caller",
+        kind: 3,
+        name: "+919876543210",
+        attributes: {
+          "sip.callID": "call-in-1",
+          "sip.phoneNumber": "+919876543210",
+          "sip.trunkPhoneNumber": "+918065395337",
+          "sip.callStatus": "active",
+          "private.provider.secret": "must-not-leak",
+        },
+      }],
+    }),
+    sipClientFactory: () => ({}),
+  });
+  assert.deepEqual(await service.incomingCaller({ roomName: "grav-voice-in-user" }), {
+    callId: "sip-caller",
+    participantIdentity: "sip-caller",
+    callerPhone: "+919876543210",
+    calledNumber: "+918065395337",
+    status: "IN_PROGRESS",
+  });
+});
+
+test("an inbound SIP participant rings before its asynchronous attributes arrive", async () => {
+  const service = new LiveKitBrowserCall({
+    url: "wss://example.livekit.cloud",
+    apiKey: "key",
+    apiSecret: "secret",
+    outboundTrunkId: "ST_test",
+    businessNumber: "+918065395337",
+    roomClientFactory: () => ({
+      listParticipants: async () => [{
+        identity: "sip-early-caller",
+        kind: 3,
+        name: "+919876543210",
+        attributes: {},
+      }],
+    }),
+    sipClientFactory: () => ({}),
+  });
+
+  assert.deepEqual(await service.incomingCaller({ roomName: "grav-voice-in-user" }), {
+    callId: "sip-early-caller",
+    participantIdentity: "sip-early-caller",
+    callerPhone: "+919876543210",
+    calledNumber: "+918065395337",
+    status: "AGENT_RINGING",
+  });
 });
 
 test("browser recording captures mixed room audio into GRAV-owned GCP storage", async () => {

@@ -109,6 +109,13 @@ deploy/mautic/*.sql.gz
 # source are comments explaining that api.grav.in sits behind the tunnel.
 cloudflared
 cloudflared.tgz
+.local-tools/
+
+# Downloaded ML model weights are runtime assets, not repository source.
+weights/**/*.pt
+
+# Local browser profiles contain runtime caches and authenticated session data.
+sessions/
 
 # ===============================
 # Scratch / one-off working files

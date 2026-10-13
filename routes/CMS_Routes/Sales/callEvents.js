@@ -212,6 +212,10 @@ router.get("/recent", salesAuth, async (req, res) => {
         recordingError: r.recordingError || null,
         recordingErrorAt: r.recordingErrorAt || null,
         source: r.source,
+        provider: r.provider || null,
+        providerEventState: r.providerEventState || null,
+        isVideoCall: Boolean(r.isVideoCall),
+        isGroupCall: Boolean(r.isGroupCall),
         createdAt: r.createdAt,
         // ── Attribution ──────────────────────────────────────────────────
         // `ownerPhone` is the handset that reported the call; `salesPerson`

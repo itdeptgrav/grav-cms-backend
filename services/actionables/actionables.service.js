@@ -25,6 +25,7 @@
 const { listAccessibleApps } = require("../access/appAccess.service");
 const { summarise, withTimeout, STATUS } = require("./actionablesSummary");
 const { PROVIDERS } = require("./actionableProviders");
+const { rankActionableSummary } = require("./jevRanking");
 
 const PROVIDER_TIMEOUT_MS = Number(process.env.ACTIONABLES_PROVIDER_TIMEOUT_MS || 6000);
 const CACHE_MS = (() => {
@@ -73,7 +74,8 @@ async function compute(user) {
   const out = await listAccessibleApps(user);
   if (!out.ok) return { ok: false, code: out.denialCode };
   const apps = await Promise.all(out.apps.map((a) => askApp(a, user, out.isPlatformAdmin)));
-  return { ok: true, generatedAt: new Date().toISOString(), ...summarise(apps) };
+  const summary = await rankActionableSummary(summarise(apps));
+  return { ok: true, generatedAt: new Date().toISOString(), ...summary };
 }
 
 /**

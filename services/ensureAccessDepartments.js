@@ -44,6 +44,13 @@ const DEPARTMENTS = [
     legacyModel: "SalesDepartment", legacyCollection: "salesdepartments",
     legacyUserType: "sales", dashboardPath: "/sales/dashboard",
     description: "Customer requests, quotations and orders." },
+  // Company Mail is a shared application rather than a legacy department.
+  // Access is still an explicit DepartmentRole grant; adding the catalogue row
+  // creates no grant and changes nothing in Cowork's existing Gmail feature.
+  { key: "mail", slug: "mail", name: "Mail", sortOrder: 42,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "mail", dashboardPath: "/mail/inbox",
+    description: "Internal employee mail and connected Gmail in one inbox." },
   // Merchandising — internal coordination of a confirmed requirement, worked
   // from a Style. No legacy collection of its own (no legacy merchandiser
   // logins exist), so it only registers the department + onboarding tile; a

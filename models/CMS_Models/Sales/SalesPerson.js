@@ -68,6 +68,16 @@ const salesPersonSchema = new mongoose.Schema(
     workPhone: { type: String, default: "", trim: true },
     normalizedPhone: { type: String, default: "", index: true },
 
+    // GRAV Voice DID assigned to this employee. This is deliberately separate
+    // from `workPhone`: the latter identifies a physical corporate handset in
+    // uploaded call logs, while this number is owned by the browser Voice app
+    // and may be moved independently by the telephony administrator.
+    voiceNumber: { type: String, default: null, trim: true },
+    voiceOutboundTrunkId: { type: String, default: null, trim: true },
+    voiceInboundTrunkId: { type: String, default: null, trim: true },
+    voiceInboundRoomName: { type: String, default: null, trim: true },
+    voiceEnabled: { type: Boolean, default: false },
+
     /** What this person is responsible for — free text, shown next to their
      *  name wherever their calls and routes are listed. The request asked for
      *  it specifically: "describe what he/she is doing/responsible for". */
@@ -89,6 +99,12 @@ salesPersonSchema.pre("save", function (next) {
   if (this.isModified("workPhone")) this.normalizedPhone = normalizePhone(this.workPhone);
   next();
 });
+
+// One DID has one owner. Null/unassigned rows stay outside the unique index.
+salesPersonSchema.index(
+  { voiceNumber: 1 },
+  { unique: true, partialFilterExpression: { voiceNumber: { $type: "string" } } },
+);
 
 module.exports = {
   SalesPerson: mongoose.models.SalesPerson || mongoose.model("SalesPerson", salesPersonSchema),

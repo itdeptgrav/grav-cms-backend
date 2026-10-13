@@ -1680,6 +1680,17 @@ app.use(
   require("./routes/Barcode_Scan_Punchings/scannerIngestRoutes.js"),
 );
 
+// Music includes a short-lived signed stream URL used by HTMLAudioElement,
+// which cannot attach the CMS Bearer header. Mount before the broad /api/cms
+// auth router; search and resolve still enforce EmployeeAuthMiddleware inside.
+app.use("/api/cms/music", require("./routes/music/webPlayer.routes"));
+
+// GRAV Voice authenticates every employee endpoint inside its own router. Its
+// Plivo answer URL is intentionally public (and validates Plivo's V3 signature
+// when the carrier token is configured), so this mount must stay above the
+// broad /api/cms employee-auth router just like the signed Music stream route.
+app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1728,10 +1739,6 @@ app.use("/api/cms/crm/call-recordings", require("./routes/CMS_Routes/Sales/callR
 // Every call (answered/missed/rejected, recorded or not) for the Active Lead
 // workspace's outreach-attempt suggestion — see that route file's own header.
 app.use("/api/cms/crm/call-events", require("./routes/CMS_Routes/Sales/callEvents"));
-
-// GRAV Voice — calls placed from the browser over the one GRAV business line
-// (LiveKit room + SIP trunk), recorded once answered. The router owns its auth.
-app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
 
 // The sales roster — which employees are on sales duty, and the corporate
 // phone number that stands for each of them in the call log and the tracking
@@ -2598,8 +2605,21 @@ const quotationRoutes = require("./routes/CMS_Routes/Sales/quotationRoutes");
 app.use("/api/cms/sales", salesWrites("quotation"), quotationRoutes);
 
 // ─── GOOGLE WORKSPACE ROUTES ────────────────────────────────
+const mailRoutes = require("./routes/mail/mailRoutes");
+// The current Google OAuth client already allows this callback for Cowork.
+// Claim only Mail's namespaced, database-backed state here; every legacy state
+// falls through to the existing Google router unchanged.
+app.get("/api/google/employee-gmail/callback", (req, res, next) => {
+  if (!String(req.query.state || "").startsWith("mail_")) return next();
+  return mailRoutes.googleOAuthCallback(req, res);
+});
 const googleWorkspaceRoutes = require("./routes/googleWorkspaceRoutes");
 app.use("/api/google", googleWorkspaceRoutes);
+
+// Standalone Mail application. This is intentionally mounted beside, not
+// inside, the legacy Google/Cowork router so its app grant and OAuth boundary
+// cannot widen access to Cowork's employee-id endpoints.
+app.use("/api/cms/mail", mailRoutes);
 
 // HR Department Routes
 const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");

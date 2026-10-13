@@ -10,6 +10,7 @@ const {
   RoomServiceClient,
   SipClient,
 } = require("livekit-server-sdk");
+const { ParticipantInfo_Kind } = require("@livekit/protocol");
 
 function required(value, name) {
   const clean = String(value || "").trim();
@@ -255,6 +256,43 @@ class LiveKitBrowserCall {
         status: sipState(participant.attributes?.["sip.callStatus"]) || "CUSTOMER_RINGING",
         sipCallId: participant.attributes?.["sip.callID"] || null,
       }));
+  }
+
+  /**
+   * Read the one inbound SIP caller waiting in an employee's dedicated room.
+   * The dispatch rule, not caller-controlled metadata, decides which employee
+   * room receives the call. Only provider attributes needed for correlation
+   * leave this boundary.
+   */
+  async incomingCaller({ roomName }) {
+    const { rooms } = this.clients();
+    const participants = await rooms.listParticipants(required(roomName, "inbound room name")).catch((error) => {
+      if (/not found/i.test(String(error?.message))) return [];
+      throw error;
+    });
+    const participant = participants.find((item) => {
+      const attributes = item.attributes || {};
+      // LiveKit marks the participant kind synchronously, while SIP
+      // attributes can arrive a little later. Detecting inbound calls only by
+      // attributes therefore misses the exact interval in which the browser
+      // needs to start ringing.
+      return item.kind === ParticipantInfo_Kind.SIP
+        || Boolean(attributes["sip.callID"] || attributes["sip.phoneNumber"] || attributes["sip.trunkPhoneNumber"]);
+    });
+    if (!participant) return null;
+    const attributes = participant.attributes || {};
+    // Participant identity is stable for the whole room visit. sip.callID is
+    // populated asynchronously, so using it as the database key could change
+    // a ringing call's identity halfway through polling and create a duplicate.
+    const callId = String(participant.identity || attributes["sip.callID"] || "").trim();
+    if (!callId) return null;
+    return {
+      callId,
+      participantIdentity: participant.identity,
+      callerPhone: outboundNumber(attributes["sip.phoneNumber"] || participant.name || ""),
+      calledNumber: outboundNumber(attributes["sip.trunkPhoneNumber"] || this.businessNumber),
+      status: sipState(attributes["sip.callStatus"]) || "AGENT_RINGING",
+    };
   }
 
   async hangup({ roomName, participantIdentity }) {

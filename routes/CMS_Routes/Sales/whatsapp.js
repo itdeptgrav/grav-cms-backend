@@ -10,7 +10,9 @@ const router = express.Router();
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
 const WhatsAppConversation = require("../../../models/CMS_Models/Sales/WhatsAppConversation");
 const { WhatsAppMessage } = require("../../../models/CMS_Models/Sales/WhatsAppMessage");
-const { cfg, canSend, canReceive, graphBase } = require("../../../config/whatsapp");
+const { cfg, canSend: canMetaSend, canReceive: canMetaReceive, graphBase } = require("../../../config/whatsapp");
+const { cfg: providerCfg, isMetaActive, isOpenWaActive } = require("../../../config/whatsappProvider");
+const openwa = require("../../../services/openwaClient");
 const { sendText, sendTemplate, WhatsAppError } = require("../../../services/whatsappSend");
 const { findOrCreateByPhone } = require("../../../services/whatsappStore");
 const { identityFor } = require("../../../services/customerIdentityLookup.service");
@@ -19,11 +21,15 @@ const { getApprovedTemplates, withReadableText, renderStoredText, placeholderNam
 router.use(salesAuth);
 
 const windowOpen = (c) => Boolean(c?.windowExpiresAt && new Date(c.windowExpiresAt) > new Date());
+const openwaConfigured = () => Boolean(providerCfg.openwaBaseUrl && providerCfg.openwaApiKey && providerCfg.openwaWebhookSecret);
+const activeCanSend = () => isOpenWaActive() ? openwaConfigured() : isMetaActive() ? canMetaSend() : false;
 // A conversation's `lastMessagePreview` can be a `[template: name]` placeholder
 // left by an old send — shown as the template's real words, same as the thread.
 const withWindow = (c) => ({
   ...c,
-  windowOpen: windowOpen(c),
+  // OpenWA automates the linked WhatsApp Web account and does not expose the
+  // Cloud API's template-only 24-hour gate. Meta retains its original rule.
+  windowOpen: isOpenWaActive() ? true : windowOpen(c),
   lastMessagePreview: placeholderName(c?.lastMessagePreview) ? renderStoredText(c.lastMessagePreview) : c?.lastMessagePreview,
 });
 const POP_ACCOUNT = ["accountId", "companyName accountId"];
@@ -32,15 +38,49 @@ const digits = (v) => String(v || "").replace(/\D/g, "");
 const last10 = (v) => digits(v).slice(-10);
 
 // GET /config — lets the UI show a "not configured yet" state instead of failing.
-router.get("/config", (req, res) => res.json({ success: true, canSend: canSend() }));
+router.get("/config", (req, res) => res.json({
+  success: true,
+  provider: providerCfg.provider,
+  canSend: activeCanSend(),
+  officialApiDormant: !isMetaActive(),
+  capabilities: {
+    text: activeCanSend(),
+    templates: isMetaActive() && canMetaSend(),
+    serviceWindow: isMetaActive(),
+    inboundMediaProxy: isOpenWaActive() ? openwaConfigured() : isMetaActive(),
+  },
+}));
 
 // GET /status — a live readiness check the UI can show at a glance: which
 // credentials are set, and whether Meta actually ACCEPTS them (returns the
 // connected number + verified business name). No secret values are returned.
 router.get("/status", async (req, res) => {
+  if (isOpenWaActive()) {
+    const configured = openwaConfigured();
+    const live = configured
+      ? await openwa.health()
+      : { live: false, connected: false, sessionReady: false, sessionId: providerCfg.openwaSessionId, error: "Set OPENWA_API_KEY and OPENWA_WEBHOOK_SECRET to connect Sales messaging." };
+    return res.json({
+      success: true,
+      status: {
+        provider: "openwa",
+        officialApiDormant: true,
+        configured,
+        canSend: configured,
+        canReceive: configured,
+        capabilities: { text: configured, templates: false, serviceWindow: false, inboundMediaProxy: configured },
+        ...live,
+      },
+    });
+  }
+  if (!isMetaActive()) {
+    return res.json({ success: true, status: { provider: "disabled", officialApiDormant: true, live: false, canSend: false, canReceive: false, error: null } });
+  }
   const status = {
-    canReceive: canReceive(),
-    canSend: canSend(),
+    provider: "meta",
+    officialApiDormant: false,
+    canReceive: canMetaReceive(),
+    canSend: canMetaSend(),
     hasVerifyToken: Boolean(cfg.verifyToken),
     hasAccessToken: Boolean(cfg.accessToken),
     hasPhoneNumberId: Boolean(cfg.phoneNumberId),
@@ -49,7 +89,7 @@ router.get("/status", async (req, res) => {
     apiVersion: cfg.apiVersion,
     live: false, number: null, name: null, quality: null, error: null,
   };
-  if (canSend()) {
+  if (canMetaSend()) {
     try {
       const r = await fetch(`${graphBase()}/${cfg.phoneNumberId}?fields=display_phone_number,verified_name,quality_rating&access_token=${cfg.accessToken}`);
       const d = await r.json().catch(() => ({}));
@@ -72,6 +112,7 @@ router.get("/status", async (req, res) => {
 // body variables ({{1}}…) it needs, so the UI can collect exactly that many
 // values (avoids Meta error #132000 "number of parameters does not match").
 router.get("/templates", async (req, res) => {
+  if (!isMetaActive()) return res.json({ success: true, templates: [], dormant: true });
   if (!cfg.wabaId || !cfg.accessToken) return res.json({ success: true, templates: [] });
   try {
     // Shared, cached list — the same one the thread uses to render old
@@ -91,6 +132,15 @@ router.get("/media/:messageId", async (req, res) => {
   try {
     const msg = await WhatsAppMessage.findById(req.params.messageId).lean();
     if (!msg || !msg.media || !msg.media.id) return res.status(404).json({ success: false, message: "No media for this message." });
+    if (msg.provider === "openwa" || isOpenWaActive()) {
+      const file = await openwa.downloadMedia(msg.media.id);
+      res.set("Content-Type", msg.media.mimeType || file.mimeType || "application/octet-stream");
+      res.set("Cache-Control", "private, max-age=86400");
+      res.set("X-Content-Type-Options", "nosniff");
+      if (msg.media.filename) res.set("Content-Disposition", `inline; filename="${String(msg.media.filename).replace(/["\r\n]/g, "")}"`);
+      return res.send(file.buffer);
+    }
+    if (!isMetaActive()) return res.status(409).json({ success: false, code: "provider_capability_unavailable", message: "Media is unavailable for the selected WhatsApp provider." });
     if (!cfg.accessToken) return res.status(503).json({ success: false, message: "WhatsApp sending/media isn't configured." });
 
     // 1) resolve the temporary download URL for the media id
@@ -185,7 +235,7 @@ router.post("/conversations/:id/send", async (req, res) => {
     } else {
       const body = String(text || "").trim();
       if (!body) return res.status(400).json({ success: false, message: "Message text is required." });
-      if (!windowOpen(conv)) {
+      if (isMetaActive() && !windowOpen(conv)) {
         return res.status(409).json({
           success: false,
           code: "window_closed",
@@ -197,7 +247,7 @@ router.post("/conversations/:id/send", async (req, res) => {
     res.status(201).json({ success: true, message: stored });
   } catch (err) {
     const status = err instanceof WhatsAppError ? err.status : 500;
-    res.status(status).json({ success: false, message: err.message });
+    res.status(status).json({ success: false, code: err.code, message: err.message });
   }
 });
 

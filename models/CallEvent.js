@@ -111,7 +111,7 @@ const callEventSchema = new mongoose.Schema(
     // These are optional for legacy PersonalCallRecorder rows. A provider ID
     // is the stable correlation key; bridge calls never use phone+time
     // proximity matching, which is retained only for the old device uploader.
-    provider: { type: String, enum: ["exotel", "knowlarity", "plivo", "telnyx", "fake"], default: null },
+    provider: { type: String, enum: ["exotel", "knowlarity", "plivo", "telnyx", "openwa", "fake"], default: null },
     // One browser action, one call. The API reserves this identity before it
     // talks to the provider, so a retry after a slow response cannot ring the
     // employee twice.
@@ -119,6 +119,14 @@ const callEventSchema = new mongoose.Schema(
     providerCallId: { type: String, default: null, trim: true },
     providerParentCallId: { type: String, default: null, trim: true },
     providerStatus: { type: String, enum: CALL_STATES, default: null },
+    // OpenWA exposes WhatsApp-Web call-state transitions rather than a
+    // telephony-provider status. Preserve the latest source state verbatim so
+    // support can distinguish ringing, active, rejected, missed and failed
+    // calls without forcing those values into GRAV Voice's provider enum.
+    providerEventState: { type: String, default: null, trim: true },
+    providerSessionId: { type: String, default: null, trim: true },
+    isVideoCall: { type: Boolean, default: false },
+    isGroupCall: { type: Boolean, default: false },
     providerDirection: {
       type: String,
       enum: ["inbound", "outbound_bridge", "outbound_browser"],
@@ -160,6 +168,11 @@ const callEventSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: "SalesPerson",
       default: null,
+    },
+    assignedTo: {
+      userId: { type: String, default: null, trim: true },
+      employeeId: { type: String, default: null, trim: true },
+      email: { type: String, default: null, trim: true, lowercase: true },
     },
     crmSource: {
       kind: {

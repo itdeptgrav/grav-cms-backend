@@ -6,14 +6,17 @@
 
 ## 1. Product outcome
 
-GRAV Voice gives the company one published business number and makes every call
-that passes through that number a traceable CRM conversation.
+GRAV Voice gives each enabled employee an administrator-assigned business
+number and makes every call through that number a traceable CRM conversation.
+Numbers are unique: one DID has one active employee owner. A company may begin
+with one provisioned pilot number, but the application model must never make
+every employee silently share it.
 
 The first release is a telephone call bridge, not a native VoIP replacement for
 the iPhone Phone app:
 
-- a customer calls the GRAV business number and the bridge rings an assigned
-  employee's existing corporate Jio number;
+- a customer calls an employee's assigned GRAV Voice number and that employee
+  receives a centered incoming-call overlay on any authenticated CMS page;
 - an employee starts an outbound call from GRAV CMS, the bridge rings the
   employee first, then rings the customer;
 - the licensed telephony provider remains in both call legs and records the
@@ -22,7 +25,7 @@ the iPhone Phone app:
   `CallEvent` record and shown in the CRM call log.
 
 This preserves ordinary cellular reliability for employees while making the
-GRAV business number, rather than a personal handset, the customer-facing
+assigned GRAV Voice number, rather than a personal handset, the customer-facing
 identity.
 
 ## 2. Explicit boundary
@@ -32,7 +35,7 @@ iPhone Phone app through a normal Jio SIM. Apple Configurator and MDM cannot
 disable the Phone app on iPhone.
 
 Release 1 therefore guarantees recording only for calls that enter through the
-GRAV business number or are initiated through the GRAV CMS call action. Direct
+assigned GRAV Voice numbers or are initiated through the GRAV CMS call action. Direct
 SIM calls remain outside the system and must never be presented as recorded.
 
 ## 3. Call journeys
@@ -61,7 +64,7 @@ SIM calls remain outside the system and must never be presented as recorded.
    CRM record. Arbitrary free-form destinations are excluded from release 1.
 4. The provider rings the employee first.
 5. After the employee answers, the provider plays the recording notice and
-   rings the customer using the GRAV business number as caller ID.
+   rings the customer using that employee's assigned GRAV Voice number as caller ID.
 6. The provider bridges and records the conversation.
 7. Webhook reconciliation completes the same `CallEvent` and links it to the
    chosen CRM source identity.
@@ -85,7 +88,11 @@ A missing recording is a visible exception, never a successful recorded call.
 
 ### Calling
 
-- One GRAV business number for the pilot.
+- One provisioned number for the pilot, with a distinct per-user number
+  assignment contract ready for additional DIDs.
+- Inbound ringing is mounted in the persistent CMS shell. The assigned employee
+  can answer, mute and end the call without first navigating to GRAV Voice; the
+  dedicated Voice page retains its richer phone controls.
 - Inbound routing to an active Sales Person roster entry or configured queue.
 - Outbound click-to-call from an authorised CRM entity.
 - Server-controlled agent and customer numbers.

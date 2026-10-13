@@ -7,12 +7,11 @@ const employeeAuth = require("../../../Middlewear/EmployeeAuthMiddlewear");
 const CallEvent = require("../../../models/CallEvent");
 const VoiceContact = require("../../../models/VoiceContact");
 const { scopeFor } = require("../../../services/companyContext/salesScope.service");
-const { LiveKitBrowserCall, dialFailureState } = require("../../../services/telephony/livekitBrowserCall");
+const { dialFailureState } = require("../../../services/telephony/livekitBrowserCall");
+const { dialStatusUrl, dialXml, validPlivoRequest } = require("../../../services/telephony/plivoInboundBridge");
+const { assignedVoiceLine, voiceOwnerByNumber } = require("../../../services/telephony/voiceLineAssignment");
 
 const router = express.Router();
-// One calling line. The carrier behind its SIP trunk is server configuration;
-// employees never choose a provider.
-const line = LiveKitBrowserCall.fromEnv();
 const VOICE_ROLES = new Set(["sales", "ceo", "project_manager", "merchandiser"]);
 
 function voiceAuth(req, res, next) {
@@ -32,6 +31,41 @@ function cleanE164(value) {
   throw error;
 }
 
+// Public Plivo Voice Application answer URL. This is an alternate carrier
+// ingress path for numbers whose Zentrunk route is not reaching LiveKit. Plivo
+// executes the returned Dial XML and sends the original PSTN caller to the
+// LiveKit SIP trunk; the existing LiveKit dispatch rule then selects the
+// per-user room. Signature validation becomes mandatory when PLIVO_AUTH_TOKEN
+// is present, and can be enforced at startup with the require-signature flag.
+router.all("/plivo/inbound", async (req, res) => {
+  try {
+    if (!validPlivoRequest(req)) return res.status(401).type("text/plain").send("Invalid Plivo signature");
+    const assignment = await voiceOwnerByNumber(req.body?.To || req.query?.To);
+    const xml = assignment ? dialXml({ number: assignment.number, actionUrl: dialStatusUrl(req) }) : null;
+    if (!xml) return res.status(404).type("text/plain").send("No inbound Voice route is assigned to this number.");
+    return res.status(200).type("text/xml").send(xml);
+  } catch (error) {
+    console.error("[GRAV Voice Plivo inbound]", error?.message || error);
+    return res.status(500).type("text/plain").send("Inbound Voice route failed.");
+  }
+});
+
+// Plivo invokes the Dial action after the SIP leg ends. Keep this endpoint
+// deliberately side-effect free: the fields make the next carrier-to-LiveKit
+// failure diagnosable without exposing the rest of the local application.
+router.all("/plivo/inbound/status", (req, res) => {
+  if (!validPlivoRequest(req)) return res.status(401).type("text/plain").send("Invalid Plivo signature");
+  const source = req.method === "POST" ? req.body : req.query;
+  console.info("[GRAV Voice Plivo dial status]", {
+    dialStatus: source?.DialStatus || null,
+    ringStatus: source?.DialRingStatus || null,
+    hangupCause: source?.DialHangupCause || null,
+    aLegUuid: source?.DialALegUUID || null,
+    bLegUuid: source?.DialBLegUUID || null,
+  });
+  return res.status(200).type("text/xml").send('<?xml version="1.0" encoding="UTF-8"?><Response/>');
+});
+
 // What the calling app needs and nothing else: no provider identities, no
 // storage keys, no carrier names.
 function publicCall(row) {
@@ -46,6 +80,7 @@ function publicCall(row) {
   }));
   return {
     id: String(row._id),
+    direction: row.providerDirection === "inbound" ? "inbound" : "outbound",
     status: row.providerStatus,
     customerPhone: row.phoneNumber,
     startedAt: row.providerOccurredAt || row.createdAt,
@@ -66,14 +101,29 @@ function participantIdentities(row) {
   ].filter(Boolean);
 }
 
-function canCall(req) {
-  return line.configured() && process.env.GRAV_VOICE_ALLOW_TEST_DIALLER === "1" && Boolean(req.user?.isAdmin);
+function canCall(assignment) {
+  return Boolean(assignment?.assigned && assignment?.configured && process.env.GRAV_VOICE_ALLOW_TEST_DIALLER === "1");
 }
 
-function callBlockedReason(req) {
-  if (!line.configured()) return line.setupMessage();
-  if (!canCall(req)) return "Calling isn't enabled for your account yet. Ask your administrator to turn it on.";
+function callBlockedReason(assignment) {
+  if (!assignment?.assigned) return assignment?.reason || "No Voice line is assigned to your account.";
+  if (!assignment?.configured) return assignment?.reason || "Your Voice line is not fully connected yet.";
+  if (!canCall(assignment)) return "Calling isn't enabled for your account yet. Ask your administrator to turn it on.";
   return null;
+}
+
+function ownedByActor(req, assignment) {
+  return {
+    $or: [
+      assignment?.salesPersonOwnerId ? { salesPersonId: assignment.salesPersonOwnerId } : null,
+      req.user?.id ? { "initiatedBy.userId": String(req.user.id) } : null,
+      req.user?.employeeId ? { "initiatedBy.employeeId": String(req.user.employeeId) } : null,
+      req.user?.email ? { "initiatedBy.email": String(req.user.email).trim().toLowerCase() } : null,
+      req.user?.id ? { "assignedTo.userId": String(req.user.id) } : null,
+      req.user?.employeeId ? { "assignedTo.employeeId": String(req.user.employeeId) } : null,
+      req.user?.email ? { "assignedTo.email": String(req.user.email).trim().toLowerCase() } : null,
+    ].filter(Boolean),
+  };
 }
 
 const DIAL_FAILURE_MESSAGES = Object.freeze({
@@ -119,7 +169,7 @@ function applyRecordingResult(row, result) {
   }
 }
 
-async function reconcileBrowserCall(row) {
+async function reconcileBrowserCall(row, line) {
   const current = await line.status({
     roomName: row.livekitRoomName,
     participantIdentity: row.livekitParticipantIdentity,
@@ -168,6 +218,32 @@ async function reconcileBrowserCall(row) {
       egressId: row.livekitEgressId,
       storageKey: row.recordingStorageKey,
     });
+    applyRecordingResult(row, recording);
+  }
+  await row.save();
+  return row;
+}
+
+async function reconcileInboundCall(row, line) {
+  const caller = await line.incomingCaller({ roomName: row.livekitRoomName });
+  if (!caller && !row.endTime) {
+    if (row.livekitEgressId) {
+      const stopped = await line.stopRecording({ egressId: row.livekitEgressId, storageKey: row.recordingStorageKey });
+      applyRecordingResult(row, stopped);
+    }
+    if (row.received || row.providerStatus === "IN_PROGRESS") {
+      row.providerStatus = "COMPLETED";
+      row.callType = "INCOMING";
+    } else {
+      row.providerStatus = "AGENT_NO_ANSWER";
+      row.callType = "MISSED";
+      row.recordingSync.status = "not_expected";
+      row.recordingSync.failureCode = "AGENT_NO_ANSWER";
+    }
+    row.endTime = Date.now();
+    if (row.connectedAt) row.durationSec = Math.max(0, Math.round((row.endTime - row.connectedAt) / 1000));
+  } else if (row.livekitEgressId) {
+    const recording = await line.recordingStatus({ egressId: row.livekitEgressId, storageKey: row.recordingStorageKey });
     applyRecordingResult(row, recording);
   }
   await row.save();
@@ -275,30 +351,43 @@ router.delete("/contacts/:id", voiceAuth, async (req, res) => {
 router.get("/status", voiceAuth, async (req, res) => {
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
     // Recents are the caller's own calls, like the phone in their pocket.
     const mine = [
       req.user?.id ? { "initiatedBy.userId": String(req.user.id) } : null,
       req.user?.employeeId ? { "initiatedBy.employeeId": String(req.user.employeeId) } : null,
+      req.user?.email ? { "initiatedBy.email": String(req.user.email).trim().toLowerCase() } : null,
+      req.user?.id ? { "assignedTo.userId": String(req.user.id) } : null,
+      req.user?.employeeId ? { "assignedTo.employeeId": String(req.user.employeeId) } : null,
+      req.user?.email ? { "assignedTo.email": String(req.user.email).trim().toLowerCase() } : null,
     ].filter(Boolean);
+    if (assignment.salesPersonOwnerId) mine.push({ salesPersonId: assignment.salesPersonOwnerId });
     const rows = mine.length ? await CallEvent.find({
       companyId: scope.companyId,
-      providerDirection: "outbound_browser",
+      providerDirection: { $in: ["outbound_browser", "inbound"] },
       $or: mine,
     }).sort({ createdAt: -1 }).limit(40) : [];
     // Repair an active row even after a reload or browser sleep. This also
     // fixes a customer-side hang-up that happened before this deployment.
     await Promise.all(rows
-      .filter((row) => row.providerStatus === "IN_PROGRESS")
-      .map((row) => reconcileBrowserCall(row).catch((error) => {
+      .filter((row) => ["AGENT_RINGING", "IN_PROGRESS"].includes(row.providerStatus) && assignment.line)
+      .map((row) => (row.providerDirection === "inbound"
+        ? reconcileInboundCall(row, assignment.line)
+        : reconcileBrowserCall(row, assignment.line)).catch((error) => {
         console.error("[GRAV Voice status refresh]", error?.message || error);
         return row;
       })));
-    const described = line.describe();
+    const described = assignment.line?.describe() || { configured: false, callerId: assignment.number || null };
     res.json({
       success: true,
-      line: { configured: described.configured, callerId: described.callerId },
-      canCall: canCall(req),
-      blockedReason: callBlockedReason(req),
+      line: {
+        configured: described.configured,
+        callerId: described.callerId,
+        assigned: assignment.assigned,
+        inboundConfigured: assignment.inboundConfigured,
+      },
+      canCall: canCall(assignment),
+      blockedReason: callBlockedReason(assignment),
       calls: rows.map(publicCall),
     });
   } catch (error) {
@@ -306,16 +395,197 @@ router.get("/status", voiceAuth, async (req, res) => {
   }
 });
 
+router.get("/incoming", voiceAuth, async (req, res) => {
+  try {
+    const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
+    if (!assignment.inboundConfigured || !assignment.line) {
+      return res.json({
+        success: true,
+        ringingConfigured: false,
+        incoming: null,
+        reason: assignment.assigned
+          ? "Incoming calling has not been connected to this Voice number yet."
+          : "No Voice line is assigned to your account.",
+      });
+    }
+
+    const caller = await assignment.line.incomingCaller({ roomName: assignment.roomName });
+    const owner = ownedByActor(req, assignment);
+    const waiting = await CallEvent.findOne({
+      companyId: scope.companyId,
+      providerDirection: "inbound",
+      providerStatus: { $in: ["AGENT_RINGING", "IN_PROGRESS"] },
+      endTime: null,
+      ...owner,
+    }).sort({ createdAt: -1 });
+
+    if (!caller) {
+      if (waiting) await reconcileInboundCall(waiting, assignment.line);
+      return res.json({ success: true, ringingConfigured: true, incoming: null });
+    }
+
+    let row = await CallEvent.findOne({
+      companyId: scope.companyId,
+      provider: assignment.line.provider,
+      providerCallId: caller.callId,
+    });
+    if (!row) {
+      row = await CallEvent.create({
+        companyId: scope.companyId,
+        provider: assignment.line.provider,
+        providerCallId: caller.callId,
+        providerStatus: "AGENT_RINGING",
+        providerDirection: "inbound",
+        businessNumber: assignment.number,
+        providerOccurredAt: new Date(),
+        startTime: Date.now(),
+        phoneNumber: caller.callerPhone || null,
+        direction: "INCOMING",
+        callType: "INCOMING",
+        kind: "call",
+        source: "grav_voice_browser",
+        recordingMethod: "livekit_egress",
+        recordingSync: { status: null },
+        livekitRoomName: assignment.roomName,
+        livekitParticipantIdentity: caller.participantIdentity,
+        salesPersonId: assignment.salesPersonOwnerId,
+        assignedTo: {
+          userId: req.user.id ? String(req.user.id) : null,
+          employeeId: req.user.employeeId ? String(req.user.employeeId) : null,
+          email: req.user.email || null,
+        },
+      });
+    }
+    return res.json({ success: true, ringingConfigured: true, incoming: publicCall(row) });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+router.post("/incoming/:id/accept", voiceAuth, async (req, res) => {
+  try {
+    const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
+    if (!assignment.inboundConfigured || !assignment.line) {
+      return res.status(409).json({ success: false, message: "Incoming calling is not configured for your Voice number." });
+    }
+    const row = await CallEvent.findOne({
+      _id: req.params.id,
+      companyId: scope.companyId,
+      providerDirection: "inbound",
+      providerStatus: "AGENT_RINGING",
+      endTime: null,
+      ...ownedByActor(req, assignment),
+    });
+    if (!row) return res.status(409).json({ success: false, message: "This incoming call is no longer ringing." });
+    const caller = await assignment.line.incomingCaller({ roomName: assignment.roomName });
+    if (!caller || caller.callId !== row.providerCallId) {
+      row.providerStatus = "AGENT_NO_ANSWER";
+      row.callType = "MISSED";
+      row.endTime = Date.now();
+      row.recordingSync.status = "not_expected";
+      await row.save();
+      return res.status(409).json({ success: false, message: "The caller has already hung up." });
+    }
+    const identity = `employee-${req.user?.employeeId || req.user?.id || crypto.randomBytes(6).toString("hex")}`;
+    const session = await assignment.line.createSession({
+      roomName: assignment.roomName,
+      identity,
+      displayName: req.user?.name || req.user?.email || "GRAV employee",
+    });
+    return res.json({ success: true, call: publicCall(row), session });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
+router.post("/incoming/:id/answered", voiceAuth, async (req, res) => {
+  let row = null;
+  try {
+    const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
+    if (!assignment.inboundConfigured || !assignment.line) {
+      return res.status(409).json({ success: false, message: "Incoming calling is not configured for your Voice number." });
+    }
+    row = await CallEvent.findOne({
+      _id: req.params.id,
+      companyId: scope.companyId,
+      providerDirection: "inbound",
+      providerStatus: "AGENT_RINGING",
+      endTime: null,
+      ...ownedByActor(req, assignment),
+    });
+    if (!row) return res.status(409).json({ success: false, message: "This incoming call is no longer ringing." });
+    const caller = await assignment.line.incomingCaller({ roomName: assignment.roomName });
+    if (!caller || caller.callId !== row.providerCallId) {
+      return res.status(409).json({ success: false, message: "The caller has already hung up." });
+    }
+    row.providerStatus = "IN_PROGRESS";
+    row.received = true;
+    row.connectedAt = Date.now();
+    await row.save();
+    const storageKey = `grav-voice/${scope.companyId}/${row._id}.mp3`;
+    const recording = await assignment.line.startRecording({ roomName: row.livekitRoomName, storageKey });
+    applyRecordingResult(row, recording);
+    await row.save();
+    return res.json({ success: true, call: publicCall(row) });
+  } catch (error) {
+    if (row) {
+      row.providerStatus = "FAILED";
+      row.endTime = Date.now();
+      row.recordingSync.status = "failed";
+      row.recordingSync.failureCode = error?.code || "INBOUND_RECORDING_FAILED";
+      await row.save().catch(() => null);
+    }
+    return sendError(res, error);
+  }
+});
+
+router.delete("/incoming/:id", voiceAuth, async (req, res) => {
+  try {
+    const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
+    const row = await CallEvent.findOne({
+      _id: req.params.id,
+      companyId: scope.companyId,
+      providerDirection: "inbound",
+      endTime: null,
+      ...ownedByActor(req, assignment),
+    });
+    if (!row) return res.status(404).json({ success: false, message: "Incoming call not found." });
+    if (assignment.line) {
+      await assignment.line.hangup({ roomName: row.livekitRoomName, participantIdentity: row.livekitParticipantIdentity }).catch(() => null);
+      if (row.livekitEgressId) {
+        const recording = await assignment.line.stopRecording({ egressId: row.livekitEgressId, storageKey: row.recordingStorageKey });
+        applyRecordingResult(row, recording);
+      }
+    }
+    row.providerStatus = row.received ? "COMPLETED" : "CANCELLED";
+    row.callType = row.received ? "INCOMING" : "REJECTED";
+    row.rejected = !row.received;
+    row.endTime = Date.now();
+    if (!row.received) row.recordingSync.status = "not_expected";
+    if (row.connectedAt) row.durationSec = Math.max(0, Math.round((row.endTime - row.connectedAt) / 1000));
+    await row.save();
+    return res.json({ success: true, call: publicCall(row) });
+  } catch (error) {
+    return sendError(res, error);
+  }
+});
+
 router.post("/browser-calls/session", voiceAuth, async (req, res) => {
   let row = null;
   try {
-    if (!line.configured()) {
-      const error = new Error(line.setupMessage());
+    const assignment = await assignedVoiceLine(req.user);
+    const line = assignment.line;
+    if (!line?.configured()) {
+      const error = new Error(callBlockedReason(assignment));
       error.code = "BROWSER_CALL_NOT_CONFIGURED";
       throw error;
     }
-    if (!canCall(req)) {
-      return res.status(403).json({ success: false, code: "CALLING_NOT_ENABLED", message: callBlockedReason(req) });
+    if (!canCall(assignment)) {
+      return res.status(403).json({ success: false, code: "CALLING_NOT_ENABLED", message: callBlockedReason(assignment) });
     }
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
     const requestId = String(req.body?.requestId || "").trim();
@@ -355,6 +625,12 @@ router.post("/browser-calls/session", voiceAuth, async (req, res) => {
         employeeId: req.user.employeeId ? String(req.user.employeeId) : null,
         email: req.user.email || null,
       },
+      salesPersonId: assignment.salesPersonOwnerId,
+      assignedTo: {
+        userId: req.user.id ? String(req.user.id) : null,
+        employeeId: req.user.employeeId ? String(req.user.employeeId) : null,
+        email: req.user.email || null,
+      },
     });
     const session = await line.createSession({
       roomName,
@@ -374,11 +650,15 @@ router.post("/browser-calls/session", voiceAuth, async (req, res) => {
 
 router.post("/browser-calls/:id/dial", voiceAuth, async (req, res) => {
   let row = null;
+  let line = null;
   let connected = false;
   let recordingStarted = false;
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
-    row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, providerDirection: "outbound_browser" });
+    const assignment = await assignedVoiceLine(req.user);
+    line = assignment.line;
+    if (!line?.configured()) return res.status(403).json({ success: false, message: callBlockedReason(assignment) });
+    row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, providerDirection: "outbound_browser", ...ownedByActor(req, assignment) });
     if (!row) return res.status(404).json({ success: false, message: "Browser call not found." });
     if (!row.providerCallId?.startsWith("pending:")) {
       return res.json({ success: true, duplicate: true, call: publicCall(row) });
@@ -495,12 +775,16 @@ router.post("/browser-calls/:id/participants", voiceAuth, async (req, res) => {
   let participantIdentity = null;
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
+    const assignment = await assignedVoiceLine(req.user);
+    const line = assignment.line;
+    if (!line?.configured()) return res.status(403).json({ success: false, message: callBlockedReason(assignment) });
     row = await CallEvent.findOne({
       _id: req.params.id,
       companyId: scope.companyId,
       providerDirection: "outbound_browser",
       providerStatus: "IN_PROGRESS",
       endTime: null,
+      ...ownedByActor(req, assignment),
     });
     if (!row) return res.status(409).json({ success: false, message: "This call is no longer active." });
 
@@ -573,7 +857,10 @@ router.post("/browser-calls/:id/participants", voiceAuth, async (req, res) => {
 router.delete("/browser-calls/:id", voiceAuth, async (req, res) => {
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
-    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, providerDirection: "outbound_browser" });
+    const assignment = await assignedVoiceLine(req.user);
+    const line = assignment.line;
+    if (!line) return res.status(403).json({ success: false, message: callBlockedReason(assignment) });
+    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, providerDirection: "outbound_browser", ...ownedByActor(req, assignment) });
     if (!row) return res.status(404).json({ success: false, message: "Browser call not found." });
     // A dial that already ended (busy, no answer, failed) keeps its outcome;
     // pressing End afterwards must not relabel it as cancelled.
@@ -604,10 +891,15 @@ router.delete("/browser-calls/:id", voiceAuth, async (req, res) => {
 router.post("/calls/:id/refresh", voiceAuth, async (req, res) => {
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
-    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId });
+    const assignment = await assignedVoiceLine(req.user);
+    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, ...ownedByActor(req, assignment) });
     if (!row) return res.status(404).json({ success: false, message: "Call not found." });
-    if (row.providerDirection !== "outbound_browser") return res.json({ success: true, call: publicCall(row) });
-    await reconcileBrowserCall(row);
+    // Historical calls remain readable even after an administrator disables or
+    // reassigns the employee's line. Live reconciliation needs an active line,
+    // so return the last persisted state when there is no longer one available.
+    if (!assignment.line) return res.json({ success: true, call: publicCall(row) });
+    if (row.providerDirection === "inbound") await reconcileInboundCall(row, assignment.line);
+    else if (row.providerDirection === "outbound_browser") await reconcileBrowserCall(row, assignment.line);
     return res.json({ success: true, call: publicCall(row) });
   } catch (error) {
     return sendError(res, error);
@@ -617,9 +909,10 @@ router.post("/calls/:id/refresh", voiceAuth, async (req, res) => {
 router.get("/calls/:id/recording", voiceAuth, async (req, res) => {
   try {
     const scope = await scopeFor(req, { domainLabel: "GRAV Voice" });
-    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId });
+    const assignment = await assignedVoiceLine(req.user);
+    const row = await CallEvent.findOne({ _id: req.params.id, companyId: scope.companyId, ...ownedByActor(req, assignment) });
     if (!row) return res.status(404).json({ success: false, message: "Call not found." });
-    if (row.providerDirection !== "outbound_browser") {
+    if (!["outbound_browser", "inbound"].includes(row.providerDirection)) {
       return res.status(409).json({ success: false, message: "Recording is not available." });
     }
     if (!row.recordingStorageKey || row.recordingSync?.status !== "imported") {
