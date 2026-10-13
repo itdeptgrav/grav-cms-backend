@@ -2182,3 +2182,39 @@ list, the GRN book and my-day were read with such a record present.
 Checked 13 Oct 2026 on the owner's STAR CRATE label (GRN/2026-27/0001,
 PO/2026-27/0013): accepted as "SL CR-1 · 5 Nos", the record carried no
 order and the GRN number, then it was deleted.
+
+## Sewing completion scans: the preview was broken, the route rule is a note (13 Oct 2026, owner)
+
+`routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js`:
+
+- **`POST /preview` threw on every call** — its loop pushed to `invalidOrder`,
+  `invalidOrderDetails` and `orderPassed`, none declared, so Save Record on
+  the supervisor's page answered "Server error" every time; and it read
+  `wo.orderQuantity`, a field the model does not have (it is `quantity`), so
+  "past the quantity ordered" never fired. Both fixed. The preview now also
+  answers `details[]` (one verdict per barcode: `state` new /
+  already-recorded / no-order / beyond-quantity / unrouted / invalid-format,
+  `reason`, `product`, `workOrderNumber`, `unitNumber`, `quantity`,
+  `noRoute`) and `byWorkOrder[]` (the new pieces grouped: product, order,
+  quantity, `units`, `count`) for the page's rows and its confirmation.
+- **`parseBarcode` FINDS `WO-<8|24 hex>-<unit>` in the text** (a camera hands
+  over a URL; a label may be printed upper-case — the hex is lowered, `WO`
+  stays upper as every other parser has it) and every stored spelling is the
+  canonical `WO-<hex>-<unit as printed>` (`canonicalOf`).
+- **A piece of an order with no operation route is RECORDED, with a note.**
+  Since 9 Oct 2026 orders reach the floor without a route, so the refusal
+  turned every genuine scan of such an order into "wrong scan". The scan
+  saves; `details[].noRoute` says so. `PRODUCTION_SCAN_REQUIRE_ROUTE=1`
+  restores the refusal (then unrouted pieces are skipped, never the whole
+  batch).
+- **`POST /mark-done` skips and names, never refuses the batch**: pieces on no
+  work order (`notInOrderBarcodes`), past the quantity
+  (`beyondQuantityBarcodes`), unrouted under the switch (`unroutedBarcodes`),
+  not piece barcodes (`invalidBarcodes`) and already recorded
+  (`alreadyScannedBarcodes`) are listed beside `savedBarcodes`; the good
+  pieces in the same batch are written. "Nothing could be recorded" is a 200
+  with zero saved, not a 400.
+Checked 13 Oct 2026 on the owner's own codes: WO-d9f4eb87-001/002 are
+"already recorded on 2026-07-27" (which is why they were refused),
+WO-5c10f3bb-002 is new, WO-5c10f3bb-999 is past the 15 ordered, "hello" is
+not a piece barcode.

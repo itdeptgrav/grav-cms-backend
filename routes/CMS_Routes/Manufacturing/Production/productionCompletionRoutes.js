@@ -13,17 +13,34 @@ const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Ma
 const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
+/* A piece barcode is `WO-<8 or 24 hex>-<unit>`. The hex is the work order's
+   id (lower case in the database) — a label printed in upper case, or a
+   scanner that upper-cases, must still match, so it is lowered here; and a
+   camera may hand over the code inside a URL or with stray text around it,
+   so the pattern is FOUND in the text rather than demanded of the whole
+   string (13 Oct 2026, owner: "even a genuine scan is called wrong"). The
+   canonical form `WO-<hex>-<unit as typed>` is what every record stores. */
+const PIECE_RE = /WO-([0-9A-Fa-f]{8,24})-(\d{1,6})/;
 const parseBarcode = (barcodeId) => {
   if (!barcodeId || typeof barcodeId !== "string") return { success: false };
-  const parts = barcodeId.trim().split("-");
-  if (parts.length >= 3 && parts[0] === "WO") {
-    const unit = parseInt(parts[2]);
-    if (!isNaN(unit) && unit > 0) {
-      return { success: true, woShortId: parts[1], unitNumber: unit };
-    }
-  }
-  return { success: false };
+  const m = PIECE_RE.exec(barcodeId.trim());
+  if (!m) return { success: false };
+  const unit = parseInt(m[2], 10);
+  if (!Number.isFinite(unit) || unit <= 0) return { success: false };
+  return { success: true, woShortId: m[1].toLowerCase(), unitNumber: unit, canonical: `WO-${m[1].toLowerCase()}-${m[2]}` };
 };
+/* The stored spelling of a scan: the canonical form when it parses, the trimmed text otherwise. */
+const canonicalOf = (bc) => { const p = parseBarcode(bc); return p.success ? p.canonical : String(bc || "").trim(); };
+/* ── A PIECE OF AN UNROUTED ORDER IS RECORDED, WITH A NOTE (13 Oct 2026, owner) ──
+   Since 9 Oct 2026 an order can be released to production with no operation
+   route (the Sales doors no longer require one), so the floor sews pieces of
+   such orders every day — and this page refused every one of them as "no
+   operation route", which the owner saw as genuine scans called wrong. The
+   sewing-done ledger is a count of finished pieces; it does not need the
+   route to be true. So the scan is RECORDED and the row says the order has
+   no route (PPC and the piece tracker still show the order as unplanned).
+   `PRODUCTION_SCAN_REQUIRE_ROUTE=1` restores the refusal. */
+const REQUIRE_ROUTE = process.env.PRODUCTION_SCAN_REQUIRE_ROUTE === "1";
 
 // Current labels carry the full Mongo id (`WO-<24 hex>-001`), while older
 // labels carry only its last eight characters. Index both identities so every
@@ -165,7 +182,7 @@ router.post("/preview", async (req, res) => {
     if (!Array.isArray(barcodes) || barcodes.length === 0) {
       return res.status(400).json({ success: false, message: "barcodes array is required" });
     }
-    const uniqueBarcodes = [...new Set(barcodes.map((b) => b?.trim()).filter(Boolean))];
+    const uniqueBarcodes = [...new Set(barcodes.map((b) => canonicalOf(b)).filter(Boolean))];
 
     // ── Step 1: format ───────────────────────────────────────────────────────
     const invalidFormat = [];
@@ -175,6 +192,9 @@ router.post("/preview", async (req, res) => {
       if (!parsed.success) invalidFormat.push(bc);
       else formatPassed.push({ bc, woShortId: parsed.woShortId, unitNumber: parsed.unitNumber });
     }
+    /* per-barcode verdicts, for the page's rows (13 Oct 2026) */
+    const details = new Map(); // bc -> { bc, state, reason, workOrderNumber, product, unitNumber }
+    for (const bc of invalidFormat) details.set(bc, { bc, state: "invalid-format", reason: "Not a piece barcode (WO-<order>-<unit>)" });
 
     // ── Step 2: WO existence check (batch) ───────────────────────────────────
     // woShortId = last 8 chars of WO _id — fetch all WOs once and build a map
@@ -182,30 +202,32 @@ router.post("/preview", async (req, res) => {
     const allWOs = uniqueShortIds.length
       /* `operations` comes back too: a work order's route is what a production
          scan advances, and an order without one has nothing to advance. */
-      ? await WorkOrder.find({}).select("_id workOrderNumber quantity operations").lean()
+      ? await WorkOrder.find({}).select("_id workOrderNumber quantity operations stockItemName customerRequestId").lean()
       : [];
     const woByShortId = indexWorkOrdersByBarcodeIdentity(allWOs);
 
     const notInOrder = [];      // no such work order
     const beyondQuantity = [];  // work order exists, unit number past what was ordered
+    const unrouted = [];        // work order exists, has no operation route
     const invalidDetails = [];  // { bc, reason }
     const passed = [];          // real garments on real orders
+    const woOf = new Map();     // bc -> work order (for the groups below)
 
     for (const { bc, woShortId, unitNumber } of formatPassed) {
       const wo = woByShortId.get(woShortId);
       if (!wo) {
         notInOrder.push(bc);
         invalidDetails.push({ bc, reason: `No work order ending ${woShortId}` });
+        details.set(bc, { bc, state: "no-order", reason: `No work order ending ${woShortId.slice(-8)}`, unitNumber });
         continue;
       }
-      /* A work order with no quantity on file cannot say a unit is beyond it.
-         Treating "unknown" as "exceeded" would reject good garments. */
-      if (wo.orderQuantity != null && unitNumber > wo.orderQuantity) {
+      /* `quantity` is the work order's figure (the model has no
+         `orderQuantity` — reading that made this check never fire). A work
+         order with no quantity on file cannot say a unit is beyond it. */
+      if (wo.quantity != null && unitNumber > wo.quantity) {
         beyondQuantity.push(bc);
-        invalidDetails.push({
-          bc,
-          reason: `Piece ${unitNumber} is past the ${wo.orderQuantity} ordered`,
-        });
+        invalidDetails.push({ bc, reason: `Piece ${unitNumber} is past the ${wo.quantity} ordered` });
+        details.set(bc, { bc, state: "beyond-quantity", reason: `Piece ${unitNumber} is past the ${wo.quantity} ordered`, workOrderNumber: displayWorkOrderNumber(wo), product: wo.stockItemName || "", unitNumber });
         continue;
       }
       /* ── A SCAN AGAINST NO ROUTE IS AN ORPHAN LOG ───────────────────
@@ -216,16 +238,18 @@ router.post("/preview", async (req, res) => {
 
          Refused here, in the preview, so the person sees it before saving,
          and again in mark-done so a direct call cannot get past it. */
-      if (!(wo.operations || []).length) {
-        invalidOrder.push(bc);
-        invalidOrderDetails.push({
+      if (!(wo.operations || []).length && REQUIRE_ROUTE) {
+        unrouted.push(bc);
+        invalidDetails.push({
           bc,
-          reason: `${wo.workOrderNumber || "This work order"} has no operation route, so a production scan has nothing to record against. Record the product's operations in R&D, then re-plan this order.`,
+          reason: `${displayWorkOrderNumber(wo)} has no operation route, so a production scan has nothing to record against. Record the product's operations in R&D, then re-plan this order.`,
           code: "WORK_ORDER_NOT_ROUTED",
         });
+        details.set(bc, { bc, state: "unrouted", reason: `${displayWorkOrderNumber(wo)} has no operation route`, workOrderNumber: displayWorkOrderNumber(wo), product: wo.stockItemName || "", unitNumber });
         continue;
       }
-      orderPassed.push(bc);
+      passed.push(bc);
+      woOf.set(bc, wo);
     }
 
     // ── Step 3: recorded before? THE SAME QUESTION /mark-done ASKS ───────────
@@ -247,8 +271,10 @@ router.post("/preview", async (req, res) => {
         }
       }
       for (const bc of passed) {
-        if (seenOn.has(bc)) alreadyRecorded.push(bc);
-        else newToSave.push(bc);
+        const wo = woOf.get(bc);
+        const base = { bc, workOrderNumber: displayWorkOrderNumber(wo), product: wo.stockItemName || "", unitNumber: parseBarcode(bc).unitNumber, quantity: wo.quantity ?? null, noRoute: !(wo.operations || []).length };
+        if (seenOn.has(bc)) { alreadyRecorded.push(bc); details.set(bc, { ...base, state: "already-recorded", reason: `Already recorded on ${seenOn.get(bc) ? istDayKeyOf(seenOn.get(bc)) : "an earlier day"}`, on: seenOn.get(bc) || null }); }
+        else { newToSave.push(bc); details.set(bc, { ...base, state: "new", reason: "" }); }
       }
       /* Saying WHEN turns "already recorded" from a refusal into an answer —
          the operator can tell a genuine duplicate from a re-scan of their own
@@ -261,16 +287,31 @@ router.post("/preview", async (req, res) => {
 
     const allInvalidBarcodes = invalidDetails;
 
+    /* ── THE NEW SCANS, WORK ORDER BY WORK ORDER (13 Oct 2026, owner) ─────
+       The confirmation names what is about to be written as a person reads
+       it: the product, the work order, how many pieces and which numbers —
+       not a list of hex. */
+    const groups = new Map();
+    for (const bc of newToSave) {
+      const wo = woOf.get(bc); const key = String(wo._id);
+      const g = groups.get(key) || { workOrderId: key, workOrderNumber: displayWorkOrderNumber(wo), product: wo.stockItemName || "", quantity: wo.quantity ?? null, units: [], barcodes: [] };
+      g.units.push(parseBarcode(bc).unitNumber); g.barcodes.push(bc); groups.set(key, g);
+    }
+    const byWorkOrder = [...groups.values()].map((g) => ({ ...g, units: g.units.sort((a, b) => a - b), count: g.units.length })).sort((a, b) => b.count - a.count);
+
     return res.json({
       success: true,
       total: uniqueBarcodes.length,
 
-      /* The five buckets. They are disjoint and they sum to `total`. */
+      /* The six buckets. They are disjoint and they sum to `total`. */
       invalidFormatCount: invalidFormat.length,
       notInOrderCount: notInOrder.length,
       beyondQuantityCount: beyondQuantity.length,
+      unroutedCount: unrouted.length,
       alreadyRecordedCount: alreadyRecorded.length,
       newToSaveCount: newToSave.length,
+      details: [...details.values()],
+      byWorkOrder,
 
       invalidBarcodes: allInvalidBarcodes, // [{bc, reason}]
       alreadyRecordedBarcodes: alreadyRecorded,
@@ -281,7 +322,7 @@ router.post("/preview", async (req, res) => {
          meant "passed format and order", never "valid format". */
       validCount: passed.length,
       invalidCount: allInvalidBarcodes.length,
-      invalidOrderCount: notInOrder.length + beyondQuantity.length,
+      invalidOrderCount: notInOrder.length + beyondQuantity.length + unrouted.length,
     });
   } catch (err) {
     console.error("preview error:", err);
@@ -296,11 +337,11 @@ router.post("/mark-done", async (req, res) => {
       return res.status(400).json({ success: false, message: "barcodes array is required" });
     }
 
-    const uniqueBarcodes = [...new Set(barcodes.map((b) => b?.trim()).filter(Boolean))];
+    const uniqueBarcodes = [...new Set(barcodes.map((b) => canonicalOf(b)).filter(Boolean))];
 
     // Validate format and collect invalid ones for response
     const invalidBarcodes = [];
-    const validBarcodes = [];
+    let validBarcodes = [];
     for (const bc of uniqueBarcodes) {
       const parsed = parseBarcode(bc);
       if (!parsed.success) invalidBarcodes.push(bc);
@@ -324,25 +365,35 @@ router.post("/mark-done", async (req, res) => {
        Refused for the WHOLE request rather than filtered out of it: a
        partial save on a screen that showed six barcodes is worse than a
        refusal that names the order and what to fix. */
+    /* 13 Oct 2026 (owner): the preview and the save agree piece by piece —
+       an unrouted order's pieces, pieces of no order and pieces past the
+       quantity are SKIPPED and named, and the good pieces in the same batch
+       are saved. A whole-batch refusal left a screen full of genuine scans
+       unsaved for one bad label. */
     const unroutedBarcodes = [];
+    const notInOrderBarcodes = [];
+    const beyondQuantityBarcodes = [];
     const scannedShortIds = [...new Set(validBarcodes.map((bc) => parseBarcode(bc).woShortId))];
     if (scannedShortIds.length) {
-      const orders = await WorkOrder.find({}).select("_id workOrderNumber operations").lean();
+      const orders = await WorkOrder.find({}).select("_id workOrderNumber quantity operations").lean();
       const byShortId = indexWorkOrdersByBarcodeIdentity(orders);
+      const keep = [];
       for (const bc of validBarcodes) {
-        const wo = byShortId.get(parseBarcode(bc).woShortId);
-        if (wo && !(wo.operations || []).length) {
-          unroutedBarcodes.push({ barcode: bc, workOrderNumber: wo.workOrderNumber || "" });
-        }
+        const p = parseBarcode(bc);
+        const wo = byShortId.get(p.woShortId);
+        if (!wo) { notInOrderBarcodes.push(bc); continue; }
+        if (wo.quantity != null && p.unitNumber > wo.quantity) { beyondQuantityBarcodes.push(bc); continue; }
+        if (!(wo.operations || []).length && REQUIRE_ROUTE) { unroutedBarcodes.push({ barcode: bc, workOrderNumber: displayWorkOrderNumber(wo) }); continue; }
+        keep.push(bc);
       }
+      validBarcodes = keep;
     }
-    if (unroutedBarcodes.length) {
-      return res.status(409).json({
-        success: false,
-        code: "WORK_ORDER_NOT_ROUTED",
-        message: `${unroutedBarcodes[0].workOrderNumber || "That work order"} has no operation route, so these scans have nothing to record against. Nothing was saved. Record the product's operations in R&D, then re-plan the order.`,
-        unroutedBarcodes,
-        remedy: "RECORD_OPERATIONS_IN_RND",
+    if (validBarcodes.length === 0) {
+      return res.json({
+        success: true,
+        message: "Nothing could be recorded: no scanned piece belongs to a routed work order.",
+        totalScansSaved: 0, alreadyScannedBarcodes: [], invalidBarcodes,
+        unroutedBarcodes, notInOrderBarcodes, beyondQuantityBarcodes,
       });
     }
 
@@ -404,14 +455,17 @@ router.post("/mark-done", async (req, res) => {
       );
     }
 
+    const skipped = alreadyScannedBarcodes.length + invalidBarcodes.length + unroutedBarcodes.length + notInOrderBarcodes.length + beyondQuantityBarcodes.length;
     return res.json({
       success: true,
       message: newBarcodes.length > 0
-        ? `${newBarcodes.length} scan${newBarcodes.length !== 1 ? "s" : ""} recorded${alreadyScannedBarcodes.length ? `, ${alreadyScannedBarcodes.length} skipped (already scanned earlier)` : ""}`
-        : `All ${alreadyScannedBarcodes.length} barcode${alreadyScannedBarcodes.length !== 1 ? "s were" : " was"} already scanned earlier — nothing new recorded`,
+        ? `${newBarcodes.length} piece${newBarcodes.length !== 1 ? "s" : ""} recorded${skipped ? `, ${skipped} skipped` : ""}`
+        : `Nothing new recorded — ${alreadyScannedBarcodes.length ? `${alreadyScannedBarcodes.length} already recorded earlier` : "every piece was skipped"}`,
       totalScansSaved: newBarcodes.length,
+      savedBarcodes: newBarcodes,
       alreadyScannedBarcodes,
       invalidBarcodes,
+      unroutedBarcodes, notInOrderBarcodes, beyondQuantityBarcodes,
     });
 
   } catch (err) {
