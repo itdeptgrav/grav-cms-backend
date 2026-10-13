@@ -414,38 +414,6 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
   assertShape(body);
   assertNoForbiddenFields(body);
 
-  const summary = str(body.requirementSummary);
-  if (summary.length < 15) {
-    throw fail("VALIDATION",
-      "A merchandiser has to select materials from this, so say what is wanted.",
-      { field: "requirementSummary", minimum: 15 });
-  }
-
-  const categories = (Array.isArray(body.requestedCategories) ? body.requestedCategories : [])
-    .map((c) => str(c).toUpperCase());
-  if (!categories.length) {
-    throw fail("VALIDATION", "Say which materials Merchandising should select.",
-      { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
-  }
-  const badCategory = categories.find((c) => !Object.values(MATERIAL_CATEGORY).includes(c));
-  if (badCategory) {
-    throw fail("VALIDATION", `"${badCategory}" is not a material category.`,
-      { field: "requestedCategories", allowed: Object.values(MATERIAL_CATEGORY) });
-  }
-
-  let targetPriceCeiling;
-  if (body.targetPriceCeiling !== undefined && body.targetPriceCeiling !== null) {
-    const amount = Number(body.targetPriceCeiling?.amount);
-    const currency = str(body.targetPriceCeiling?.currency).toUpperCase();
-    const basis = str(body.targetPriceCeiling?.basis).toUpperCase();
-    if (!Number.isFinite(amount) || amount < 0 || !currency || basis !== "PER_PIECE") {
-      throw fail("VALIDATION",
-        "A target-price ceiling needs a non-negative amount, currency and PER_PIECE basis.",
-        { field: "targetPriceCeiling" });
-    }
-    targetPriceCeiling = { amount, currency: currency.slice(0, 8), basis };
-  }
-
   /* ── AN IN-HOUSE SAMPLE HAS NO JOURNEY (6 Oct 2026, owner: "the sampling
      section works without a customer; the industry samples in its free time").
      The request's grain is company + journey + product line, and both are
@@ -467,10 +435,6 @@ async function issue(scope, { journeyId, productLineRef, body = {}, actor = null
     ({ journey, enquiry, line } = await resolveProductLine(scope.companyId, { journeyId, productLineRef }));
   }
   const buyerDisplayLabel = house?.style ? "In-house sample" : await buyerLabelFor(journey);
-  const { journey, enquiry, line } = await resolveProductLine(scope.companyId, {
-    journeyId, productLineRef,
-  });
-  const buyerDisplayLabel = await buyerLabelFor(journey);
 
   /* A named sample style must belong to this journey — a request pointing at
      somebody else's style would open a Development File on the wrong work. */
