@@ -215,6 +215,14 @@ const rawItemSchema = new mongoose.Schema(
        2026: "the marked inputs are defined but edit shows nothing filled"). */
     productType: { type: String, trim: true, maxlength: 80, default: "" },
 
+    /* ── MAXIMUM ALLOWED DEFECT POINTS (13 Oct 2026, owner) ───────────────
+       Raw-material QC scores a roll on points per defect (the 4-point idea:
+       each reason found adds points). When this ceiling is set, the QC
+       station shows it beside the running total and suggests Accept or
+       Reject; null means "no ceiling stated" and the checker decides alone.
+       Optional, whole points. */
+    maxDefectPoints: { type: Number, default: null, min: 0 },
+
     /* ── WHAT WOULD MAKE THIS THE SAME MATERIAL AS ANOTHER ──────────────────
        The name, the shelf, the unit and the classification, with case, spacing
        and punctuation removed, joined into one string.

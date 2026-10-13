@@ -951,6 +951,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       customCategory,
       usedAs,
       productType,
+      maxDefectPoints,
       customsTariffCode,
       unit,
       customUnit,
@@ -1014,6 +1015,11 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       rawItem.usedAs = String(usedAs).trim().toUpperCase();
     }
     if (productType !== undefined) rawItem.productType = String(productType || "").trim().slice(0, 80);
+    /* The QC ceiling (13 Oct 2026): empty / null clears it, a whole number sets it. */
+    if (maxDefectPoints !== undefined) {
+      const v = Number(maxDefectPoints);
+      rawItem.maxDefectPoints = maxDefectPoints === null || String(maxDefectPoints).trim() === "" ? null : (Number.isFinite(v) && v >= 0 ? Math.round(v) : rawItem.maxDefectPoints);
+    }
 
     /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
        Read only when the payload speaks about it (an absent key is "not part

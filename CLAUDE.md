@@ -1925,3 +1925,36 @@ stock line or warning. `QC_DEFECT_MOVES_STOCK=1` restores it.
 verdict DID apply a debit, so stock taken before today is put back as it was
 always meant to be. `qcDefectStock.service.js` is untouched (Label quantity
 shares its movers).
+
+## Raw-material QC on points: serial, defined vs actual, a ceiling per raw item (13 Oct 2026, owner)
+
+"When a raw item is scanned, ask for the SL number, the defined quantity
+(auto) and the actual quantity (auto, editable). On defect, each reason
+joins a cart at 1 point and the checker raises or lowers it — no total
+defective quantity. The raw item form gets an optional maximum allowed
+defect points; QC shows it and suggests Accept or Reject."
+
+- `RawItem.maxDefectPoints` (Number, null = no ceiling) — created by
+  `rawItemCreation.service`, updated by `PUT /raw-items/:id` (empty / null
+  clears, a whole number sets).
+- `QCRawItemInspection`: `defects[].points` (default 1; records before this
+  carry none and read as 1), `serialNo`, `definedQuantity` (the label's
+  figure), `quantity` is now the ACTUAL figure checked (what every rollup
+  reads), `totalPoints`, `maxAllowedPoints` (the ceiling as it stood),
+  `pointsVerdict` ("accept" / "reject" / null — the suggestion, never the
+  decision).
+- `POST /raw-items/save` takes `serialNo`, `actualQuantity` (blank = the
+  label's figure; must be > 0) and `defects: [{ code, points }]` on EITHER
+  verdict — an accepted roll may carry points. `status: "passed"` →
+  passed = actual, defective 0; `"defective"` → the whole actual quantity
+  is defective (an older client's `defectiveQuantity` is still honoured)
+  and needs at least one reason. Unknown codes are refused as before. The
+  message reads "Accepted: SL R-7 · 18 Mtr of X · 4 points (max 10)."
+- `POST /lookup` answers `sticker.maxDefectPoints`; `recordView` carries
+  the new fields; `GET /report` is open to owner, approver and checker
+  (`requireOrdersReader`), since the overview's report button is for all.
+- Nothing moves stock (the 12 Oct rule stands). Checked 13 Oct 2026 through
+  the station on a SuitingFabric label against MO-REQ-2026-0010 with a
+  temporary ceiling of 10 and two temporary reasons: SL R-7, actual 18 of
+  20, 10 points, Reject; the record read back with every field, then it,
+  the reasons and the ceiling were removed.

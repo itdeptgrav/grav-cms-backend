@@ -31,6 +31,10 @@ const defectEntrySchema = new mongoose.Schema({
   code:     { type: String, required: true, trim: true, uppercase: true },
   name:     { type: String, default: "", trim: true },
   category: { type: String, default: "", trim: true },
+  /* POINTS (13 Oct 2026, owner): each reason found carries the points the
+     checker gave it — 1 when it joins the cart, raised or lowered as more
+     of it is found. Records before this carry no points (treated as 1). */
+  points:   { type: Number, default: 1, min: 1 },
 }, { _id: false });
 
 const schema = new mongoose.Schema(
@@ -73,6 +77,22 @@ const schema = new mongoose.Schema(
     defectiveQuantity: { type: Number, required: true, min: 0 },
     defects:           { type: [defectEntrySchema], default: [] },
     note:              { type: String, default: "", trim: true, maxlength: 500 },
+
+    /* ── THE ROLL AS CHECKED (13 Oct 2026, owner) ──────────────────────────
+       "When a raw item is scanned it asks for the SL number, the defined
+       quantity (auto) and the actual quantity (auto, editable); on defect
+       the user sets points per defect; the raw item may carry a maximum
+       allowed points." `quantity` above is the ACTUAL figure checked;
+       `definedQuantity` is what the label said; `totalPoints` the sum of the
+       defects' points; `maxAllowedPoints` the raw item's ceiling as it stood;
+       `pointsVerdict` the suggestion the ceiling gave (null without one).
+       The status (passed = accepted, defective = rejected) is the checker's
+       own decision — the suggestion never overrides it. */
+    serialNo:          { type: String, default: "", trim: true, maxlength: 60 },
+    definedQuantity:   { type: Number, default: null },
+    totalPoints:       { type: Number, default: 0, min: 0 },
+    maxAllowedPoints:  { type: Number, default: null },
+    pointsVerdict:     { type: String, enum: ["accept", "reject", null], default: null },
 
     /* who */
     inspectedByEmail:       { type: String, default: "", lowercase: true, trim: true, index: true },
