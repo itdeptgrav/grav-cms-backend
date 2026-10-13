@@ -44,6 +44,13 @@ const DEPARTMENTS = [
     legacyModel: "SalesDepartment", legacyCollection: "salesdepartments",
     legacyUserType: "sales", dashboardPath: "/sales/dashboard",
     description: "Customer requests, quotations and orders." },
+  // Company Mail is a shared application rather than a legacy department.
+  // Access is still an explicit DepartmentRole grant; adding the catalogue row
+  // creates no grant and changes nothing in Cowork's existing Gmail feature.
+  { key: "mail", slug: "mail", name: "Mail", sortOrder: 42,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "mail", dashboardPath: "/mail/inbox",
+    description: "Internal employee mail and connected Gmail in one inbox." },
   // Merchandising — internal coordination of a confirmed requirement, worked
   // from a Style. No legacy collection of its own (no legacy merchandiser
   // logins exist), so it only registers the department + onboarding tile; a
@@ -206,6 +213,17 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: null, showOnOnboarding: false,
     legacyUserType: "board", dashboardPath: "/board/dashboard/policies/financing",
     description: "Company policy: the rules every costing is calculated under." },
+  /* Maintenance (3 Oct 2026). The architecture's own app (#11: equipment
+     availability), starting with sewing machines: a permanent tag on each
+     existing machine and its maintenance history. No legacy collection —
+     nobody ever signed in to a maintenance module — so like IE and PPC this
+     registers the department and nothing else, which is what makes it
+     GRANTABLE from CEO → Access Control. That grant is the whole access
+     model: routes/CMS_Routes/Maintenance/maintenanceAccess.js. */
+  { key: "maintenance", slug: "maintenance", name: "Maintenance", sortOrder: 105,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "maintenance", dashboardPath: "/maintenance",
+    description: "Sewing machine tags, breakdowns and maintenance history." },
 ];
 
 // Platform administration is NOT a department.

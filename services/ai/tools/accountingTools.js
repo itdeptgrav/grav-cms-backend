@@ -10,7 +10,11 @@
  */
 
 const { registerTool } = require("../toolRegistry");
-const { ACCOUNTING_CATALOGUE_ID } = require("../../accountingSemanticCatalogue");
+const {
+  ACCOUNTING_CATALOGUE_ID,
+  metricFromText: financialMetricFromText,
+  metricFromToolValue,
+} = require("../../accountingSemanticCatalogue");
 const {
   buildCompanyInfo,
   buildFinancials,
@@ -65,8 +69,47 @@ function renderSingleLedgerBalance({ data } = {}) {
   return `${row.name}${row.group ? ` (${row.group})` : ""}: ${amount} ${row.drCr === "Cr" ? "Cr" : "Dr"}, as at ${effectiveAt}.`;
 }
 
+function getPath(value, path) {
+  return String(path || "").split(".").filter(Boolean).reduce((current, key) => (
+    current && Object.prototype.hasOwnProperty.call(current, key) ? current[key] : undefined
+  ), value);
+}
+
+function claimFinancialMetric({ message } = {}) {
+  const definition = financialMetricFromText(message);
+  return definition ? { metric: definition.toolMetric } : null;
+}
+
+function renderFinancialMetric({ data } = {}) {
+  const financials = data?.financials;
+  const definition = data?.definition;
+  if (!financials || !definition) {
+    return "I couldn't verify that financial metric from posted accounting entries.";
+  }
+  if (definition.toolMetric === "summary") {
+    return typeof financials.readable === "string" && financials.readable.trim()
+      ? financials.readable.trim()
+      : "I couldn't verify the financial summary from posted accounting entries.";
+  }
+  const rawValue = getPath(financials, definition.path);
+  if (!Number.isFinite(Number(rawValue))) {
+    return `I couldn't verify ${definition.label.toLowerCase()} from posted accounting entries.`;
+  }
+  const fy = financials.financialYear || "the current financial year";
+  if (definition.valueType === "percent") {
+    const percentage = Number(rawValue).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+    return `${definition.label} for FY ${fy}: ${percentage}%.`;
+  }
+  const amount = formatAmount(rawValue, financials.baseCurrency || "INR");
+  if (!amount) return `I couldn't verify ${definition.label.toLowerCase()} from posted accounting entries.`;
+  const label = definition.toolMetric === "net_profit" && Number(rawValue) < 0 ? "Net loss" : definition.label;
+  const absoluteAmount = formatAmount(Math.abs(Number(rawValue)), financials.baseCurrency || "INR");
+  return `${label} for FY ${fy}: ${definition.toolMetric === "net_profit" ? absoluteAmount : amount}.`;
+}
+
 registerTool({
   name: "acc_financials",
+  modelSelectable: false,
   semantic: semantic(["financials"]),
   description:
     "Company FINANCIAL METRICS for authorised accounting/CEO. Returns the exact requested figure: total revenue, total expenses, direct revenue, direct expenses/COGS, gross profit, gross-profit margin, net profit/loss, net-profit margin, assets, liabilities or equity; use the full summary only when explicitly requested. Read-only and calculated from posted accounting entries.",
@@ -89,7 +132,13 @@ registerTool({
     /\b(profit|loss|p&l|p and l|revenue|turnover|income|expenses?|balance sheet|financials?|net worth|assets|liabilit|how are we doing financially|financial (position|health|summary))\b/i.test(
       msg,
     ),
-  provideContext: async ({ args }) => ({ requestedMetric: args && args.metric, financials: await buildFinancials() }),
+  claim: claimFinancialMetric,
+  provideContext: async ({ args }) => ({
+    requestedMetric: args && args.metric,
+    definition: metricFromToolValue(args && args.metric),
+    financials: await buildFinancials(),
+  }),
+  renderAnswer: renderFinancialMetric,
 });
 
 registerTool({
@@ -212,7 +261,8 @@ registerTool({
   // Relevance for the ordinary non-Jev assistant. The hybrid accounting
   // router receives every authorised tool definition directly and therefore
   // does not depend on phrase matching.
-  matches: () => true,
+  matches: (msg) =>
+    /\b(account(?:ing)?|ledger|voucher|journal|debit|credit|turnover|trial balance|profit|loss|balance sheet|receivable|payable|gst|financial year|books?|party ageing|party aging)\b/i.test(String(msg || "")),
   provideContext: async ({ user, args }) => {
     const result = await require("../accountingReportQuery").runAccountingReport({ user, query: args });
     return { accountingReport: result.ok ? result.reply : null };

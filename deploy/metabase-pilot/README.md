@@ -49,11 +49,40 @@ cp .env.example .env          # then set the passwords it names
 make up                       # start; waits for health (~60-90s on first boot)
 ```
 
-Then build the mart, from **`grav-cms-backend`** (not from here):
+Then build the mart, from **`grav-cms-backend`** (not from here) — one command:
 
 ```bash
-npm run reporting:migrate -- --apply     # schema + curated views
+npm run reporting:setup              # the plan, runs nothing
+npm run reporting:setup -- --apply   # roles → migrate → roles → sync → verify
+```
+
+It stops at the first failure and exits non-zero. Every step is idempotent, so
+re-running after fixing the cause is the normal way to use it. **It deletes
+nothing** — no database, no schema, no row, no Docker volume.
+
+### Why that order, and not migrate → roles
+
+This README used to say migrate first, and on a database that already had its
+roles that worked — which was every database anybody had, so nobody hit it. On
+a **fresh** one the two commands deadlock:
+
+- `migrate` runs every versioned migration before any repeatable one, and
+  `V003__voucher_register_view.sql` ends with a `GRANT` to `metabase_reader`.
+  That role is created by `roles`. So migrate stops at V003.
+- `roles` grants `SELECT` on the curated views, and those are created by
+  `R__curated_views.sql` — repeatable, so migrate runs it last. So roles cannot
+  go first either.
+
+`R__roles.sql` now skips a relation that does not exist yet, which breaks the
+deadlock, and the roles step runs **twice**: once to create the roles, and
+again after the migrations to grant on what they created. That is what
+`reporting:setup` does for you.
+
+The steps are still there individually if you need one on its own:
+
+```bash
 npm run reporting:roles   -- --apply     # reporting_sync + metabase_reader
+npm run reporting:migrate -- --apply     # schema + curated views
 npm run reporting:sync    -- --full      # real data from MongoDB
 npm run reporting:verify-roles           # prove the reader cannot write
 ```

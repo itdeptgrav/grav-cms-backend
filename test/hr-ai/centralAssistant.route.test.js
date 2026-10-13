@@ -212,6 +212,16 @@ describe("central assistant tool gating", () => {
     expect(body.meta.toolsUsed).not.toContain("hr_overview");
     expect(body.meta.toolsUsed).not.toContain("hr_daily_attendance");
     expect(chatJson.mock.calls.some(([args]) => args.prompt.includes("HR_OVERVIEW_CONTEXT"))).toBe(false);
+    expect(body.reply).toMatch(/permission/i);
+  });
+
+  test("an uncatalogued CMS application fails visibly without asking Qwen to invent data", async () => {
+    const callsBefore = chatJson.mock.calls.length;
+    const { status, body } = await message({ message: "show the Board overview" }, ids.HR);
+    expect(status).toBe(200);
+    expect(body.reply).toMatch(/verified CMS data yet/i);
+    expect(body.reply).toMatch(/board/i);
+    expect(chatJson.mock.calls.length).toBe(callsBefore);
   });
 
   test("Daily Attendance tool is selected for a day-attendance question", async () => {

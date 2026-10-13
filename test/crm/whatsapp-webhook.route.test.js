@@ -7,6 +7,7 @@
 "use strict";
 
 process.env.WHATSAPP_VERIFY_TOKEN = "test-verify-token";
+process.env.WHATSAPP_PROVIDER = "meta";
 delete process.env.WHATSAPP_APP_SECRET; // skip signature checks in the route test
 
 const express = require("express");

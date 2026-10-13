@@ -18,7 +18,8 @@ and semantic-catalogue metadata (see
    catalogue claims execute without Qwen; otherwise Qwen receives only the
    authorised, domain-compatible capability names and descriptions.
 3. Qwen receives only that capability's closed JSON schema and fills its
-   arguments from the user's words and the last validated plan.
+   arguments from the user's words. The last validated plan is included only
+   for an explicitly elliptical follow-up; a complete request resets context.
 4. GRAV validates the object, rejects unknown fields, and re-authorises the
    capability after the model decision.
 5. A deterministic application service resolves real identities and scope,
@@ -65,7 +66,14 @@ checks permission again before reading.
 The assistant stores the last validated tool and typed arguments separately
 from answer prose. Follow-ups such as “show me details”, “what about yesterday”
 or “and Priya” may use that state. Assistant prose and previously returned HR
-records are not copied into the planning prompt.
+records are not copied into the planning prompt. A self-contained question such
+as “what is Umung's salary?” receives no previous subject, period or tool state.
+
+Generic business concepts do not ask Qwen to guess a physical field or tool.
+They compile through catalogue metadata into a typed source and response shape.
+The stored plan trace records the concept, authoritative source, temporal grain,
+response shape and fields used, so incorrect answers can be attributed without
+replaying model reasoning.
 
 ## Jev
 

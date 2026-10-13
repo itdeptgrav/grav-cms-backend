@@ -16,6 +16,10 @@ const whatsAppMessageSchema = new mongoose.Schema(
     conversationId: { type: mongoose.Schema.Types.ObjectId, ref: "WhatsAppConversation", index: true, required: true },
     waId: { type: String, index: true },              // denormalized customer id
     waMessageId: { type: String, index: true },       // Meta's message id (wamid.*)
+    // Transport that produced the row. Historical rows predate this field and
+    // are implicitly Meta; new rows always set it explicitly.
+    provider: { type: String, enum: ["meta", "openwa"], index: true },
+    providerSessionId: { type: String, index: true },
     // The message THIS one is replying to — Meta's `context.id` on an
     // inbound message, carried on both a template quick-reply button tap
     // and a plain in-thread reply. Lets a business feature (e.g. sample

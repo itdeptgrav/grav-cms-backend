@@ -229,10 +229,28 @@ const FIELDS = [
   /* ── Voucher ── */
   field("voucher.number", "voucher_number", "Voucher Number", C.VOUCHER, TYPES.TEXT,
     "The voucher number as entered.",
-    { placements: ["rows", "filters"], defaultWidth: 150,
+    /* ── ACROSS THE TOP IS ALLOWED, AND BOUNDED AT RUN TIME ───────────────
+       `columns` was withheld because a voucher number is the highest-cardinality
+       thing in the books — thousands of distinct values — and no STATIC gate
+       can tell "every voucher this year" from "the four I filtered to". The
+       catalogue was the only lever available, so it said no to both.
+
+       It is a real report: voucher numbers across the top, ledgers down the
+       left, debit in the cells, filtered to a handful of vouchers. The bound
+       now sits where the answer lives — `headingBudget.js` counts the distinct
+       headings the report would actually produce, after company scope and the
+       report's own filters, with the count itself limited. Over the maximum is
+       refused with REPORTING_TOO_MANY_HEADINGS.
+
+       `highCardinality: true` is unchanged and still true: it is what keeps
+       this field from being RECOMMENDED for a chart axis. Permitted and
+       recommended are different questions. */
+    { placements: ["rows", "columns", "filters"], defaultWidth: 150,
       /* `text_exact` is what protects `00531`: the format says "these
          characters", and `assertSemantics` refuses to let a field carrying it
-         be calculated or placed in Values. */
+         be calculated or placed in Values. It constrains VALUES, not columns,
+         so grouping by it across the top keeps the exact characters and the
+         natural order — `00531` stays `00531`, and 2 sorts before 10. */
       semanticType: "identifier", display: { format: "text_exact", sort: "natural" },
       chart: { role: "identifier", defaultGroupingPriority: 95, highCardinality: true } }),
   field("voucher.type", "voucher_type", "Voucher Type", C.VOUCHER, TYPES.CHOICE,

@@ -4,13 +4,14 @@ set -euo pipefail
 # Private development tunnel from the local CMS backend to Ollama on RunPod.
 # The model API remains bound to loopback on both machines.
 
-RUNPOD_QWEN_HOST="${RUNPOD_QWEN_HOST:-69.30.85.69}"
-RUNPOD_QWEN_SSH_PORT="${RUNPOD_QWEN_SSH_PORT:-22108}"
+RUNPOD_QWEN_HOST="${RUNPOD_QWEN_HOST:-69.30.85.129}"
+RUNPOD_QWEN_SSH_PORT="${RUNPOD_QWEN_SSH_PORT:-22195}"
 RUNPOD_QWEN_SSH_KEY="${RUNPOD_QWEN_SSH_KEY:-${HOME}/.ssh/id_ed25519}"
-RUNPOD_QWEN_LOCAL_PORT="${RUNPOD_QWEN_LOCAL_PORT:-11435}"
+RUNPOD_QWEN_LOCAL_PORT="${RUNPOD_QWEN_LOCAL_PORT:-11436}"
 RUNPOD_QWEN_REMOTE_PORT="${RUNPOD_QWEN_REMOTE_PORT:-11434}"
 RUNPOD_QWEN_CONTROL_SOCKET="${RUNPOD_QWEN_CONTROL_SOCKET:-/tmp/grav-qwen-${UID}.sock}"
 RUNPOD_QWEN_MODEL="${RUNPOD_QWEN_MODEL:-qwen3:32b}"
+RUNPOD_QWEN_MODELS_DIR="${RUNPOD_QWEN_MODELS_DIR:-/workspace/ollama-models}"
 
 ssh_base=(
   ssh
@@ -23,6 +24,31 @@ ssh_base=(
 )
 
 remote="root@${RUNPOD_QWEN_HOST}"
+
+remote_api_ready() {
+  "${ssh_base[@]}" "${remote}" \
+    "curl -fsS http://127.0.0.1:${RUNPOD_QWEN_REMOTE_PORT}/api/tags >/dev/null" \
+    >/dev/null 2>&1
+}
+
+ensure_remote_api() {
+  if remote_api_ready; then
+    return
+  fi
+
+  "${ssh_base[@]}" "${remote}" \
+    "test -x /usr/local/bin/ollama && mkdir -p /workspace/logs && (pgrep -f '^/usr/local/bin/ollama serve$' >/dev/null || setsid env OLLAMA_HOST=127.0.0.1:${RUNPOD_QWEN_REMOTE_PORT} OLLAMA_MODELS=${RUNPOD_QWEN_MODELS_DIR} OLLAMA_KEEP_ALIVE=30m /usr/local/bin/ollama serve >>/workspace/logs/ollama-cms.log 2>&1 </dev/null &)"
+
+  for _ in {1..20}; do
+    if remote_api_ready; then
+      return
+    fi
+    sleep 1
+  done
+
+  echo "Remote Ollama API did not become ready." >&2
+  return 1
+}
 
 status() {
   if ! "${ssh_base[@]}" -S "${RUNPOD_QWEN_CONTROL_SOCKET}" -O check "${remote}" >/dev/null 2>&1; then
@@ -49,6 +75,8 @@ status() {
 
 case "${1:-start}" in
   start)
+    ensure_remote_api
+
     if "${ssh_base[@]}" -S "${RUNPOD_QWEN_CONTROL_SOCKET}" -O check "${remote}" >/dev/null 2>&1; then
       status
       exit 0

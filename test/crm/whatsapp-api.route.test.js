@@ -7,6 +7,7 @@
 process.env.WHATSAPP_ACCESS_TOKEN = "test-token";
 process.env.WHATSAPP_PHONE_NUMBER_ID = "PNID";
 process.env.WHATSAPP_API_VERSION = "v21.0";
+process.env.WHATSAPP_PROVIDER = "meta";
 
 const express = require("express");
 const mongoose = require("mongoose");

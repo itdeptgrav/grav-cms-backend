@@ -54,7 +54,12 @@ const {
   resolveHrActor,
   DECISIONS,
 } = require("../services/access/hrAuthorization");
-const { CAPABILITIES } = require("../services/access/hrCapabilities");
+const { CAPABILITIES, ROLE_TEMPLATES } = require("../services/access/hrCapabilities");
+
+/* What an HR approver holds — the ceiling an editor's write may be SENT UP to. */
+const APPROVER_CAPABILITIES = new Set(
+  (Array.isArray(ROLE_TEMPLATES.hr_approver) ? ROLE_TEMPLATES.hr_approver : ROLE_TEMPLATES.hr_approver?.capabilities) || [],
+);
 const { classifyEmployeeWrite } = require("../services/access/hrWritePolicy");
 const { projectEmployee, projectEmployees, scrubResponse } = require("../services/access/hrFieldPolicy");
 
@@ -116,6 +121,14 @@ function seedIdentity(req) {
     userType: decoded.userType || "",
     type: decoded.type || "",
     replayOf: decoded.replayOf || null,
+    /* Carried so the department guard's administrator check
+       (isDatabaseVerifiedAdmin → verifiedIdentity) can compare the token's
+       version with the database. Dropped, every administrator read as
+       version 0 and failed it — the CEO was told "You have not been given a
+       role in this department yet" on every HR write (12 Oct 2026). */
+    tv: decoded.tv,
+    subject: decoded.subject,
+    deptId: decoded.deptId,
     _hrContractSeeded: true,
   };
 }
@@ -198,7 +211,7 @@ function hrContract(opts = {}) {
          /api/employee/payslip/<somebody-else>. */
       req.hrParams = extractParams(declaration, fullPath);
 
-      const result = await authorizeHr({
+      let result = await authorizeHr({
         user: req.user,
         capabilities: declaration.capabilities,
         scope: declaration.scope,
@@ -207,6 +220,30 @@ function hrContract(opts = {}) {
         managerScope: declaration.managerScope,
         req,
       });
+
+      /* SENT FOR APPROVAL, NOT REFUSED (12 Oct 2026, owner's report: "editor
+         needed approval but the approval isn't sending"). An HR EDITOR making
+         a write an approver may make — running payroll, holidays, a leave
+         balance, releasing a document, a policy — was answered "You do not
+         have permission", and nothing reached the Approvals page. Now it goes
+         on to the department guard marked `holdForApprover`; the guard holds
+         it for an approver or the owner to decide (services/changeRequests.js).
+         Only for a department-wide write whose every capability an approver
+         holds: a viewer, a self/manager-scoped route or an owner-only
+         capability is still refused exactly as before. */
+      if (
+        !result.allowed &&
+        result.decision === DECISIONS.MISSING_CAPABILITY &&
+        !["GET", "HEAD", "OPTIONS"].includes(req.method) &&
+        result.actor?.template === "hr_editor" &&
+        (!declaration.scope || declaration.scope === "hr") &&
+        !(Array.isArray(declaration.selfParams) ? declaration.selfParams.length : declaration.selfParams) &&
+        !declaration.managerScope &&
+        (declaration.capabilities || []).every((c) => APPROVER_CAPABILITIES.has(c))
+      ) {
+        req.holdForApprover = { capability: result.capability || null };
+        result = { ...result, allowed: true, status: 200, decision: DECISIONS.PERMITTED };
+      }
 
       if (!result.allowed) {
         logDenial(req, declaration, result);

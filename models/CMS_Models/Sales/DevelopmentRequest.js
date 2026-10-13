@@ -124,6 +124,119 @@ const REFERENCE_TYPE = Object.freeze({
   OTHER: "OTHER",
 });
 
+const {
+  MARKET, SEASON, INTENDED_USE, FIT, FABRIC_FAMILY, PERFORMANCE,
+  SAMPLE_TYPE, PROCESS_STATE, TESTING, CERTIFICATION, SUSTAINABILITY, keysOf,
+} = require("../../../services/sales/developmentBriefVocabulary");
+
+/* ── THE BUYER'S BRIEF, IN THREE GROUPS ─────────────────────────────────────
+   Typed fields, not a `preferences` object. A blob would make every one of
+   these unqueryable and unvalidatable, and "the buyer wants it breathable"
+   would be a string nobody could count across orders.
+
+   Three groups because they answer three different questions, and the
+   Merchandising brief shows them as three blocks: WHO it is for, WHAT it
+   should be like, and WHAT HAS TO BE MADE.
+
+   Every field is optional. An early brief legitimately has almost none of
+   them, and an empty field means "Sales has not said" — which the brief shows
+   in those words rather than inventing a default. */
+
+/**
+ * A controlled choice with room for the buyer's own words after it.
+ *
+ * The note is not a second way to say the same thing: the choice is what
+ * reports count and what a selection is checked against, and the note is the
+ * qualification that would otherwise be lost ("relaxed, but not boxy through
+ * the shoulder"). Hence `maxlength` short enough that nobody writes an essay
+ * where a field was wanted.
+ */
+const chosen = (values, { note = 300 } = {}) => ({
+  /* ── `choice`, NOT `value` ───────────────────────────────────────────
+     `value` is a FORBIDDEN field name on this request: it means the
+     opportunity's value, and `assertNoForbiddenFields` refuses it at any
+     depth so a commercial fact cannot travel inside a nested object. A
+     controlled choice called `value` collided with that guard. Renaming the
+     field was the right way round — weakening a check that exists to keep
+     Sales' commercial record in Sales, to suit a field name, is not. */
+  choice: { type: String, enum: [...values, ""], default: "", uppercase: true, trim: true },
+  note: { type: String, trim: true, default: "", maxlength: note },
+});
+
+/** Several controlled choices, with one note covering the set. */
+const chosenMany = (values, { note = 300 } = {}) => ({
+  values: { type: [{ type: String, enum: values, uppercase: true, trim: true }], default: [] },
+  note: { type: String, trim: true, default: "", maxlength: note },
+});
+
+/**
+ * ── REQUIRED / NOT REQUIRED / NOT CONFIRMED, AND A DETAIL ─────────────────
+ * Three answers because a blank is unreadable: nobody can tell "the buyer said
+ * no" from "Sales has not asked yet", and those lead to different actions. The
+ * detail is only meaningful when the answer is REQUIRED, which the form
+ * enforces by only showing it then and the service enforces by refusing a
+ * detail on any other answer.
+ */
+const processSchema = new mongoose.Schema({
+  state: {
+    type: String, enum: [...keysOf(PROCESS_STATE), ""], default: "", uppercase: true, trim: true,
+  },
+  detail: { type: String, trim: true, default: "", maxlength: 600 },
+}, { _id: false });
+
+const customerDirectionSchema = new mongoose.Schema({
+  /* Where it will be sold. */
+  market: chosen(keysOf(MARKET)),
+  /* When it is for. The year is its own number so the enum does not go stale. */
+  season: {
+    choice: { type: String, enum: [...keysOf(SEASON), ""], default: "", uppercase: true, trim: true },
+    year: { type: Number, min: 2000, max: 2100, default: null },
+    note: { type: String, trim: true, default: "", maxlength: 300 },
+  },
+  intendedUse: chosen(keysOf(INTENDED_USE)),
+  /* Only when the buyer actually said it. Never inferred from the account. */
+  targetCustomer: { type: String, trim: true, default: "", maxlength: 300 },
+}, { _id: false });
+
+const productDirectionSchema = new mongoose.Schema({
+  fit: chosen(keysOf(FIT)),
+  fabric: chosenMany(keysOf(FABRIC_FAMILY), { note: 600 }),
+  /* The buyer's own words: "60/40 linen cotton", "at least 70% natural". A
+     fixed list cannot hold a ratio. */
+  composition: { type: String, trim: true, default: "", maxlength: 300 },
+  /* GSM, ounces, or how it should feel in the hand. One field because a buyer
+     says one or the other and never both. */
+  weightOrFeel: { type: String, trim: true, default: "", maxlength: 300 },
+  /* "Warm ivory, not optic white." Free text on purpose — a dropdown of
+     colours loses the sentence that mattered. */
+  coloursWanted: { type: String, trim: true, default: "", maxlength: 600 },
+  performance: chosenMany(keysOf(PERFORMANCE), { note: 600 }),
+  /* Buttons, labels, logo placement, stitching. The buyer's words. */
+  trimsAndBranding: { type: String, trim: true, default: "", maxlength: 600 },
+  /* ── WHAT THE BUYER DOES NOT WANT ─────────────────────────────────
+     Its own field rather than a line in the summary, because it is the one
+     thing a merchandiser must read before selecting anything, and prose
+     buries it. */
+  avoid: { type: String, trim: true, default: "", maxlength: 600 },
+}, { _id: false });
+
+const developmentNeedSchema = new mongoose.Schema({
+  sampleType: chosen(keysOf(SAMPLE_TYPE)),
+  sampleQuantity: { type: Number, min: 0, max: 10000, default: null },
+  /* As the buyer names them — "S, M, L" or "UK 8–16". Not an enum: size
+     vocabularies differ by market and by buyer. */
+  sampleSizes: { type: [{ type: String, trim: true, maxlength: 24 }], default: [] },
+  samplePackaging: { type: String, trim: true, default: "", maxlength: 600 },
+
+  printing: { type: processSchema, default: () => ({}) },
+  embroidery: { type: processSchema, default: () => ({}) },
+  washFinish: { type: processSchema, default: () => ({}) },
+
+  testing: chosenMany(keysOf(TESTING), { note: 600 }),
+  certification: chosenMany(keysOf(CERTIFICATION), { note: 600 }),
+  sustainability: chosenMany(keysOf(SUSTAINABILITY), { note: 600 }),
+}, { _id: false });
+
 const imageSchema = new mongoose.Schema(
   {
     url: { type: String, trim: true, required: true, maxlength: 2000 },
@@ -178,6 +291,14 @@ const requestSchema = new mongoose.Schema(
     requestedCategories: [{ type: String, enum: Object.values(MATERIAL_CATEGORY) }],
 
     requiredByDate: dateOnly({ default: null }),
+
+    /* ── THE BUYER'S BRIEF ────────────────────────────────────────────────
+       Sales owns every one of these; Merchandising reads them and has no
+       write for any of them. A request issued before they existed carries
+       none, loads exactly as it did, and shows honest absence states. */
+    customerDirection: { type: customerDirectionSchema, default: () => ({}) },
+    productDirection: { type: productDirectionSchema, default: () => ({}) },
+    developmentNeed: { type: developmentNeedSchema, default: () => ({}) },
 
     /* A BUYER constraint, not Merchandising's price. Optional because many
        early briefs have none; complete when present so an amount never appears
@@ -326,6 +447,7 @@ requestSchema.pre("save", function freezeIssued(next) {
 });
 
 module.exports = {
+  PROCESS_STATE_KEYS: keysOf(PROCESS_STATE),
   REFERENCE_TYPE,
   REQUEST_STATE, MATERIAL_CATEGORY, FORBIDDEN_FIELDS,
   SalesDevelopmentRequest: mongoose.models.SalesDevelopmentRequest

@@ -83,6 +83,7 @@ const models = () => ({
 });
 
 const isOid = (v) => Boolean(v) && mongoose.Types.ObjectId.isValid(String(v));
+const oid = (v) => new mongoose.Types.ObjectId(String(v));
 const lower = (v) => String(v || "").toLowerCase().trim();
 
 /**
@@ -104,13 +105,15 @@ function actorFrom(source) {
 async function employeeIdentity(actor) {
   const { Employee } = models();
   if (!isOid(actor.id)) return { ok: false, code: DENIAL.IDENTITY_NOT_FOUND };
-  const emp = await Employee.findById(actor.id)
-    .select("email isActive status accessDepartmentId additionalDepartmentIds department").lean();
+  const emp = await Employee.collection.findOne(
+    { _id: oid(actor.id) },
+    { projection: { email: 1, isActive: 1, status: 1, accessDepartmentId: 1, additionalDepartmentIds: 1, department: 1 } },
+  );
   if (!emp) return { ok: false, code: DENIAL.IDENTITY_NOT_FOUND };
   if (emp.isActive === false || emp.status === "inactive") return { ok: false, code: DENIAL.IDENTITY_INACTIVE };
   const email = lower(emp.email);
   if (email) {
-    const twins = await Employee.countDocuments({
+    const twins = await Employee.collection.countDocuments({
       email, isActive: { $ne: false }, status: { $ne: "inactive" },
     });
     if (twins > 1) return { ok: false, code: DENIAL.AMBIGUOUS_IDENTITY };
@@ -161,8 +164,15 @@ async function verifiedIdentity(actor) {
 
   // Department login (DeptUser) — the only identity that can be an administrator.
   if (!isOid(actor.id)) return { ok: false, code: DENIAL.IDENTITY_NOT_FOUND };
-  const user = await DeptUser.findById(actor.id)
-    .select("email isActive isAdmin tokenVersion departmentId employeeRef").lean();
+  // Native collection reads deliberately bypass Mongoose model initialisation.
+  // In development `autoIndex` can otherwise make the first request for a
+  // newly-loaded application wait for every pending index build before this
+  // security check even begins. This still re-reads the database as the
+  // authority; it merely avoids coupling authentication latency to indexing.
+  const user = await DeptUser.collection.findOne(
+    { _id: oid(actor.id) },
+    { projection: { email: 1, isActive: 1, isAdmin: 1, tokenVersion: 1, departmentId: 1, employeeRef: 1 } },
+  );
   // An unlabelled token (older formats carry no `subject`) names whichever
   // record its id belongs to: a department login first, else an employee.
   if (!user && actor.subject !== "dept_user") return employeeIdentity(actor);
@@ -173,7 +183,10 @@ async function verifiedIdentity(actor) {
   const emails = [lower(user.email)];
   if (user.employeeRef) {
     try {
-      const emp = await Employee.findById(user.employeeRef).select("email").lean();
+      const emp = await Employee.collection.findOne(
+        { _id: oid(user.employeeRef) },
+        { projection: { email: 1 } },
+      );
       if (emp?.email && !emails.includes(lower(emp.email))) emails.push(lower(emp.email));
     } catch { /* the DeptUser's own address still stands */ }
   }
@@ -281,7 +294,7 @@ async function resolveAppAccess(actorLike, appSlug, { requireCatalogueEntry = tr
     if (!identity.ok) return deny(slug, identity.code);
     if (NON_APPLICATION_SLUGS.has(slug)) return deny(slug, DENIAL.APP_NOT_FOUND);
     const { AccessDepartment } = models();
-    const dept = await AccessDepartment.findOne({ slug }).lean();
+    const dept = await AccessDepartment.collection.findOne({ slug });
     return await resolveWithIdentity(identity, slug, dept, { requireCatalogueEntry, allowLegacyAssignment });
   } catch (err) {
     console.error("[appAccess] access check failed:", err?.message || err);

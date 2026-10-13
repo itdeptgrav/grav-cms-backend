@@ -4,6 +4,11 @@
 //   npm run reporting:migrate            # plan only (dry run, the default)
 //   npm run reporting:migrate -- --apply
 //
+// Building a FRESH mart? Use `npm run reporting:setup -- --apply`, which runs
+// this in the only order that works: the roles have to exist before V003, and
+// its grant, can be applied. Running this alone on an empty database stops at
+// V003 with `role "metabase_reader" does not exist`.
+//
 // Connects as REPORTING_ADMIN_URL (the owner). The sync role cannot run this,
 // deliberately: a compromised sync should be able to refill the mart, never
 // reshape it.

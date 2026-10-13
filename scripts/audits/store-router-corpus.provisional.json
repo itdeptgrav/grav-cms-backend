@@ -1,0 +1,35 @@
+{
+  "note": "PROVISIONAL — written by hand on 8 Oct 2026, NOT collected from real users. There is no persisted corpus: the assistant's conversation store is in-memory and grav_ai_usage holds no rows. This set exists to exercise the harness and give a first read of the router on paraphrases. It is not the evidence the plan asks for before switching 32b to 8b. Questions are about the records seeded by test/support/storeCommandFixtures.js. `expect` lists the sentences a correct route may become; null means the correct answer is a refusal.",
+  "questions": [
+    { "q": "stock of macbook", "expect": ["stock of macbook"] },
+    { "q": "pending material requests", "expect": ["pending material requests"] },
+    { "q": "GRN/2026-27/0004", "expect": ["GRN/2026-27/0004"] },
+    { "q": "purchase orders of Gaurav Enterprises", "expect": ["purchase orders of Gaurav Enterprises"] },
+
+    { "q": "goods we received", "expect": ["goods receipts"] },
+    { "q": "list the receipts of goods", "expect": ["goods receipts"] },
+    { "q": "how many POs are still issued", "expect": ["how many issued purchase orders"] },
+    { "q": "all PO", "expect": ["purchase orders"] },
+    { "q": "what is on order from Gaurav", "expect": ["purchase orders of Gaurav"] },
+    { "q": "requests for material still waiting", "expect": ["pending material requests"] },
+    { "q": "material requests that got approved", "expect": ["approved material requests"] },
+    { "q": "newest material requisitions", "expect": ["latest 5 material requests"] },
+    { "q": "count our suppliers", "expect": ["how many suppliers"] },
+    { "q": "number of warehouses we run", "expect": ["how many warehouses"] },
+    { "q": "anything reserved in stock", "expect": ["stock reservations"] },
+    { "q": "inspections done on receipts", "expect": ["goods receipt inspections"] },
+    { "q": "units of measure we use", "expect": ["units"] },
+    { "q": "machines on the floor", "expect": ["machines"] },
+    { "q": "who supplies us", "expect": ["suppliers"] },
+    { "q": "tally of goods receipts", "expect": ["how many goods receipts"] },
+
+    { "q": "open purchase orders", "expect": null },
+    { "q": "requisitions pending", "expect": null },
+    { "q": "what is the weather today", "expect": null },
+    { "q": "salary of ravi", "expect": null },
+    { "q": "why is our fabric stock wrong", "expect": null },
+    { "q": "stuff lying around", "expect": null },
+    { "q": "who approved the last order and why", "expect": null },
+    { "q": "orders from Nobody Traders", "expect": null }
+  ]
+}

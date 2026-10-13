@@ -48,9 +48,14 @@ services:
     # every environment rather than by a container init script that runs once
     # and can never be re-run.
     #
-    #   npm run reporting:migrate -- --apply     schema + curated views
-    #   npm run reporting:roles   -- --apply     reporting_sync, metabase_reader
-    #   npm run reporting:sync    -- --full      real data from MongoDB
+    #   npm run reporting:setup -- --apply
+    #
+    # which runs, in the only order that works on a fresh database:
+    #   roles    reporting_sync, metabase_reader
+    #   migrate  schema + curated views
+    #   roles    again, to grant on what the migrations created
+    #   sync     real data from MongoDB
+    #   verify   prove the reader cannot write
     #
     # It used to seed a SYNTHETIC dataset here. That is retired — see
     # seed/synthetic/README.md and migrations/reporting/V002.

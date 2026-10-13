@@ -139,6 +139,11 @@ const DECLARATIONS = [
   D("PUT", "/api/employees/:id", [C.HR_ACCESS, C.PEOPLE_WRITE], {
     persona: "HR editor",
     writePolicy: "employee",
+    /* Pay changed by an approver or editor goes to the OWNER to accept
+       instead of being refused (12 Oct 2026, owner: approvals are for what
+       is connected to pay). This is also how a new employee's pay — split
+       off the create — is applied once the owner approves it. */
+    holdForOwnerOn: [C.COMPENSATION_WRITE],
     ...P,
   }),
   D("PATCH", "/api/employees/bulk-update", [C.HR_ACCESS, C.PEOPLE_WRITE], {
@@ -263,6 +268,22 @@ const DECLARATIONS = [
   D("POST", "/hr/attendance/restore-to-month", [C.HR_ACCESS, C.ATTENDANCE_CLOSE], {
     persona: "attendance approver",
     note: "The undo of remove-from-month, and declared to match it: same month-shaped effect on the roster, so the same CLOSE capability. It shipped undeclared, which meant the contract refused it for everybody — the door out of an accidental removal was the one door that did not open.",
+  }),
+  D("POST", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Counts a time-office code that is not the employee's biometricId as theirs (a ghost that is really them), then re-syncs the ghost's days. It moves punches onto a person, so it takes the correction capability, like a punch correction.",
+  }),
+  D("DELETE", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "The undo of link-device-code, declared to match it.",
+  }),
+  D("GET", "/hr/attendance/rekey-preview", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "time office",
+    note: "What moving an employee's rows from an old biometric ID to their current one would do. A read.",
+  }),
+  D("POST", "/hr/attendance/rekey", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Moves an employee's attendance rows from an old biometric ID to their current one and re-syncs the days; may lift a hold on the new ID that HR ticked. Moves punches onto a person, so the correction capability.",
   }),
   D("GET", "/hr/attendance/roster-exclusions", [C.HR_ACCESS, C.ATTENDANCE_READ], {
     persona: "time office",
@@ -398,6 +419,20 @@ const DECLARATIONS = [
   D("PATCH", "/api/hr/job-postings/:id/status", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
   D("DELETE", "/api/hr/job-postings/:id", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
 
+  /* Prototype only: advisory output is never persisted and cannot move a
+     candidate or make a hiring decision. Running inference is a manage action. */
+  D("GET", "/api/hr/ai-interview-lab/health", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter" }),
+  D("POST", "/api/hr/ai-interview-lab/follow-up", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
+  D("POST", "/api/hr/ai-interview-lab/score", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
+  D("POST", "/api/hr/ai-interview-lab/turn", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
+  D("POST", "/api/hr/ai-interview-lab/report", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
+  D("POST", "/api/hr/ai-interview-lab/voice", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
+  D("POST", "/api/hr/ai-interview-lab/transcribe", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], {
+    persona: "recruiter",
+    note: "Application adapter over the central GRAV Speech client; company identity comes from the actor's server-side grant, never the browser.",
+    ...P,
+  }),
+
   D("GET", "/api/hr/candidates/:jobId/candidates/:candidateId/interviews", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter", ...P }),
   D("GET", "/api/hr/candidates/:jobId/candidates/:candidateId/details", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter", ...P }),
   D("GET", "/api/hr/candidates/:jobId/candidates/:candidateId", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter", ...P }),
@@ -417,6 +452,14 @@ const DECLARATIONS = [
   D("PATCH", "/api/hr/tasks/:taskId/status", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
   D("PATCH", "/api/hr/tasks/:taskId/complete", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
   D("DELETE", "/api/hr/tasks/:taskId", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter" }),
+
+  /* ══════════════════════════════════════════════════════════════════════════
+   *  CMD/CTRL K — HR's search in the shared palette. Opening it needs only
+   *  `hr.access`; what it READS is narrowed inside, family by family, to the
+   *  capabilities the actor holds (services/ai/hrCommandContract.js) — the same
+   *  capability each family's own screen declares here. Read-only, one route.
+   * ══════════════════════════════════════════════════════════════════════════ */
+  D("GET", "/api/hr/command-search", [C.HR_ACCESS], { persona: "any HR user" }),
 
   /* ══════════════════════════════════════════════════════════════════════════
    *  DOCUMENTS — issue and release are two authorities, not one

@@ -15,6 +15,17 @@
 // Requiring the feature tool modules registers their permission-gated tools.
 require("./tools/hrTools");
 require("./tools/accountingTools");
+require("./tools/salesTools");
+require("./tools/storePurchaseTools");
+require("./tools/storePurchaseUniversalTools");
+require("./tools/storePurchaseCollectionTools");
+require("./tools/inventoryTools");
+require("./tools/plannerTools");
+require("./tools/configurationTools");
+require("./tools/storeTools");
+require("./tools/storeCollectionTools");
+require("./tools/storeRequestDeskTools");
+require("./tools/storeOperationalTools");
 
 const { chatJson } = require("../ollamaClient");
 const { buildSystemPrompt } = require("./identity");
@@ -22,7 +33,12 @@ const { authorizedTools, getTool } = require("./toolRegistry");
 const { planToolQuestion, STATUS: PLAN_STATUS, CONTROL: PLAN_CONTROL } = require("./qwenToolPlanner");
 const { resolveHrAccess, resolveHrActor } = require("../access/hrAccess");
 const { resolveAccountingAccess } = require("../access/accountingAccess");
+const { resolveAppAccess } = require("../access/appAccess.service");
+const storeTenant = require("../storePurchase/tenantContext.service");
 const { semanticToolCandidates, detectSemanticDomains } = require("./semanticCatalogue");
+const { detectApplications, PENDING } = require("./cmsApplicationManifest");
+const { sanitizeAssistantLinks } = require("./assistantLinks");
+const { sanitizeAssistantChoices } = require("./assistantChoices");
 
 const REPLY_SCHEMA = { type: "object", properties: { reply: { type: "string" } }, required: ["reply"] };
 
@@ -172,6 +188,29 @@ async function ensureAccess(user) {
       user.accountingAccess = { allowed: false, via: null };
     }
   }
+  if (user.storePurchaseAccess === undefined) {
+    try {
+      user.storePurchaseAccess = await storeTenant.resolveForActor(user);
+    } catch {
+      user.storePurchaseAccess = { capabilities: [], capabilitySet: new Set(), companyId: null };
+    }
+  }
+  if (user.applicationAccess === undefined) user.applicationAccess = {};
+  const applications = [...new Set([...require("./toolRegistry")._tools.values()]
+    .map((tool) => tool.application).filter(Boolean))];
+  await Promise.all(applications.map(async (application) => {
+    if (user.applicationAccess[application] !== undefined) return;
+    try {
+      user.applicationAccess[application] = await resolveAppAccess(user, application);
+    } catch {
+      user.applicationAccess[application] = {
+        allowed: false,
+        capabilities: null,
+        denialCode: "ACCESS_CHECK_UNAVAILABLE",
+        appSlug: application,
+      };
+    }
+  }));
 }
 
 /**
@@ -183,22 +222,87 @@ async function selectContext({ user, message, history = [], routeContext }) {
   const tools = authorizedTools(user);
   const toolData = [];
   const toolsUsed = [];
+  const links = [];
+  const choices = [];
   let directAnswer = null;
   let contextState = null;
 
-  if (!tools.length) return { toolData, toolsUsed, directAnswer, contextState };
+  const detectedDomains = detectSemanticDomains(message);
   // A tool may claim an exact catalogue-defined request before model planning.
   // Claims are typed semantic metadata (not sentence regexes) and are accepted
   // only when exactly one authorised tool claims the message.
   const claims = (await Promise.all(tools.map(async (tool) => {
     if (!tool.claim) return null;
     try {
-      const args = await tool.claim({ message, history });
+      const args = await tool.claim({ user, message, history });
       return args ? { tool: tool.name, arguments: args } : null;
     } catch {
       return null;
     }
   }))).filter(Boolean);
+  // Resolve exact, authorised business identities independently of metric
+  // language. This prevents a word inside a real record name ("Board" in a
+  // material, "Sales" in a supplier, etc.) from being mistaken for an
+  // application boundary. Resolvers remain server-side and their records are
+  // never included in Qwen's planning prompt.
+  const subjectRecognitions = claims.length ? [] : (await Promise.all(tools.map(async (tool) => {
+    if (!tool.recognizeSubject) return null;
+    try {
+      // A subject resolver is allowed to inspect business identities only after
+      // the tool's own semantic relevance contract accepts the question. Some
+      // resolvers search large collections by name; running every resolver for
+      // an aggregate/workspace request can accidentally treat a common word as
+      // a record identity and then hide the correct collection capability from
+      // the planner.
+      if (tool.matches && !tool.matches(message)) return null;
+      const recognition = await tool.recognizeSubject({ user, message, history });
+      return recognition && (recognition.found || recognition.ambiguous)
+        ? { tool: tool.name, recognition }
+        : null;
+    } catch {
+      return null;
+    }
+  }))).filter(Boolean);
+  if (claims.length === 0 && subjectRecognitions.length === 0 && Object.keys(detectedDomains).length) {
+    const covered = tools.some((tool) => {
+      const detected = detectedDomains[tool.semantic?.catalogue];
+      return Array.isArray(detected) && (tool.semantic.domains || []).some((domain) => detected.includes(domain));
+    });
+    if (!covered) {
+      return {
+        toolData,
+        toolsUsed,
+        links,
+        choices,
+        directAnswer: "I don't have permission to access that business data.",
+        contextState: { schema: "grav.assistant.plan/2", selection: "permission_boundary", detectedDomains },
+      };
+    }
+  }
+  const pendingApplications = subjectRecognitions.length === 0 && Object.keys(detectedDomains).length === 0
+    ? detectApplications(message, { status: PENDING })
+    : [];
+  if (claims.length === 0 && pendingApplications.length) {
+    return {
+      toolData,
+      toolsUsed,
+      links,
+      choices,
+      directAnswer:
+        `I can't answer that from verified CMS data yet. Assistant access for ${pendingApplications.map((item) => item.id.replace(/_/g, " ")).join(", ")} is not catalogued.`,
+      contextState: {
+        schema: "grav.assistant.plan/2",
+        selection: "coverage_boundary",
+        pendingApplications: pendingApplications.map((item) => item.id),
+        detectedDomains,
+      },
+    };
+  }
+  if (!tools.length) return { toolData, toolsUsed, links, choices, directAnswer, contextState };
+  const recognizedToolNames = new Set(subjectRecognitions.map((item) => item.tool));
+  const recognizedCandidates = tools.filter((tool) => (
+    recognizedToolNames.has(tool.name) && tool.modelSelectable !== false
+  ));
   const plan = claims.length === 1
     ? { status: PLAN_STATUS.OK, tool: claims[0].tool, arguments: claims[0].arguments, selection: "catalogue_claim" }
     : await planToolQuestion({
@@ -208,7 +312,9 @@ async function selectContext({ user, message, history = [], routeContext }) {
       // the request, Qwen cannot escape that domain and select an unrelated
       // but schema-valid tool/enum. Unrecognised paraphrases still see the full
       // authorised catalogue.
-      tools: semanticToolCandidates(tools, message),
+      tools: recognizedCandidates.length
+        ? recognizedCandidates
+        : semanticToolCandidates(tools, message),
       history,
     });
   if (!plan.selection) plan.selection = "qwen";
@@ -217,31 +323,95 @@ async function selectContext({ user, message, history = [], routeContext }) {
     // changing behaviour through phrase rules or attaching the wrong dataset.
     if (plan.error) throw plan.error;
     directAnswer = "I couldn't safely determine which authorised business data to use. Please rephrase the request with the subject and period you want.";
-    return { toolData, toolsUsed, directAnswer, contextState };
+    return { toolData, toolsUsed, links, choices, directAnswer, contextState };
   }
   if (plan.control === PLAN_CONTROL.CONVERSATION) {
-    return { toolData, toolsUsed, directAnswer, contextState };
+    contextState = {
+      schema: "grav.assistant.plan/2",
+      selection: "conversation",
+      detectedDomains,
+    };
+    return { toolData, toolsUsed, links, choices, directAnswer, contextState };
   }
   if (plan.control === PLAN_CONTROL.CLARIFY) {
     directAnswer = plan.clarification;
-    return { toolData, toolsUsed, directAnswer, contextState };
+    contextState = {
+      schema: "grav.assistant.plan/2",
+      selection: "clarify",
+      detectedDomains,
+      // Capability names are safe operational metadata. Keeping the offered
+      // set makes a wrong clarification diagnosable without logging records,
+      // argument values, credentials or the user's message.
+      offeredTools: (recognizedCandidates.length
+        ? recognizedCandidates
+        : semanticToolCandidates(tools, message)).map((item) => item.name),
+    };
+    return { toolData, toolsUsed, links, choices, directAnswer, contextState };
   }
 
   const tool = getTool(plan.tool);
   if (!tool || tool.permission(user) !== true) {
     directAnswer = "I don't have permission to access that data.";
-    return { toolData, toolsUsed, directAnswer, contextState };
+    return { toolData, toolsUsed, links, choices, directAnswer, contextState };
   }
   try {
-    const data = await tool.provideContext({ user, message, args: plan.arguments || {} });
-    toolData.push({ tool: plan.tool, data });
+    const recognizedSubject = subjectRecognitions.find((item) => item.tool === plan.tool)?.recognition || null;
+    const data = await tool.provideContext({
+      user,
+      message,
+      args: plan.arguments || {},
+      recognizedSubject,
+      history,
+    });
+    if (tool.buildLinks) {
+      try {
+        links.push(...sanitizeAssistantLinks(tool.buildLinks({
+          data,
+          args: plan.arguments || {},
+          message,
+          user,
+        })));
+      } catch {
+        // Navigation is optional presentation metadata. A malformed link must
+        // never suppress an otherwise verified business answer.
+      }
+    }
+    if (tool.buildChoices) {
+      try {
+        choices.push(...sanitizeAssistantChoices(tool.buildChoices({
+          data,
+          args: plan.arguments || {},
+          message,
+          user,
+        })));
+      } catch {
+        // Prompt choices are optional presentation metadata. A malformed choice
+        // must never suppress an otherwise verified business answer.
+      }
+    }
+    const modelData = data && typeof data === "object"
+      ? Object.fromEntries(Object.entries(data).filter(([key]) => key !== "navigation"))
+      : data;
+    toolData.push({ tool: plan.tool, data: modelData });
     toolsUsed.push(plan.tool);
     contextState = {
       schema: "grav.assistant.plan/2",
       tool: plan.tool,
       arguments: plan.arguments || {},
       selection: plan.selection,
-      detectedDomains: detectSemanticDomains(message),
+      detectedDomains,
+      ...(data?.subject ? { subject: data.subject } : {}),
+      ...(data && data.definition ? {
+        semanticResolution: {
+          concept: data.definition.id,
+          source: data.definition.source,
+          temporal: data.definition.temporal,
+          responseShape: data.definition.valueType,
+          fields: Array.isArray(data.definition.path)
+            ? data.definition.path
+            : data.definition.path ? [data.definition.path] : [],
+        },
+      } : {}),
     };
     if (tool.renderAnswer) {
       directAnswer = tool.renderAnswer({ data, args: plan.arguments || {}, message, user }) || null;
@@ -249,18 +419,25 @@ async function selectContext({ user, message, history = [], routeContext }) {
   } catch {
     directAnswer = "I couldn't read that data safely right now. Please try again.";
   }
-  return { toolData, toolsUsed, directAnswer, contextState };
+  return {
+    toolData,
+    toolsUsed,
+    links: sanitizeAssistantLinks(links),
+    choices: sanitizeAssistantChoices(choices),
+    directAnswer,
+    contextState,
+  };
 }
 
 async function chat({ user, message, routeContext, history = [] } = {}) {
-  const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
+  const { toolData, toolsUsed, links, choices, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
   if (directAnswer) {
-    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, links, choices, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted
   const { reply, model } = await generateGroundedReply({ system, toolData, history, message });
-  return { reply: reply.slice(0, 4000), model, toolsUsed, contextState };
+  return { reply: reply.slice(0, 4000), model, toolsUsed, links, choices, contextState };
 }
 
 /**
@@ -271,17 +448,17 @@ async function chat({ user, message, routeContext, history = [] } = {}) {
  * conversational reply is emitted as-is.
  */
 async function chatStreaming({ user, message, routeContext, history = [], onThinking, onAnswer, signal } = {}) {
-  const { toolData, toolsUsed, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
+  const { toolData, toolsUsed, links, choices, directAnswer, contextState } = await selectContext({ user, message, history, routeContext });
   if (directAnswer) {
     if (onAnswer) onAnswer(directAnswer);
-    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, contextState };
+    return { reply: directAnswer.slice(0, 4000), model: "deterministic", toolsUsed, links, choices, contextState };
   }
   const taskRules = [...ANSWER_RULES, 'Respond with a single JSON object: {"reply": string}. Put your whole answer in "reply".'].join("\n");
   const system = buildSystemPrompt({ taskRules }); // route deliberately omitted
   const { reply, model } = await generateGroundedReply({ system, toolData, history, message });
   const finalReply = (reply && reply.trim()) || "I couldn't produce a response for that.";
   if (onAnswer) onAnswer(finalReply);
-  return { reply: finalReply.slice(0, 4000), model, toolsUsed, contextState };
+  return { reply: finalReply.slice(0, 4000), model, toolsUsed, links, choices, contextState };
 }
 
 /**

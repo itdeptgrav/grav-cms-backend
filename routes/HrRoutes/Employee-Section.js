@@ -89,6 +89,42 @@ async function detachIfDeparted(req, before, after) {
     return null;
   }
 }
+/* ── INACTIVE IN HR = NO COWORK; ACTIVE AGAIN = ACCESS BACK (12 Oct 2026) ──
+   CoWork's accounts are Firestore records behind Firebase logins, and nothing
+   tied them to this status. On every transition either way the linked
+   account is marked (never deleted) and its login switched off or back on —
+   services/coworkHrAccess.service.js. Like the departure above it never fails
+   the HR save: a failure is logged, and CoWork's own token check still
+   refuses the person on their next request because it asks HR too. */
+async function syncCoworkAccess(req, before, after) {
+  const { hasLeft } = require("../../services/employeeDeparture");
+  if (!after || hasLeft(before) === hasLeft(after)) return null;
+  try {
+    const out = await require("../../services/coworkHrAccess.service").syncEmployee(after, {
+      by: req.user?.name || req.user?.email || "HR",
+    });
+    const changed = out.deactivated.length + out.reactivated.length;
+    if (changed) {
+      recordChange(req, {
+        departmentSlug: "hr",
+        section: "hr:employees",
+        entity: "employee",
+        entityId: after._id,
+        entityLabel: `${after.firstName || ""} ${after.lastName || ""}`.trim(),
+        action: "update",
+        summary: out.deactivated.length
+          ? `CoWork access switched off (${out.deactivated.map((d) => d.id).join(", ")}); the CoWork record is kept.`
+          : `CoWork access switched back on (${out.reactivated.map((d) => d.id).join(", ")}).`,
+        before: { cowork: out.deactivated.length ? "active" : "inactive" },
+        after: { cowork: out.deactivated.length ? "inactive" : "active" },
+      });
+    }
+    return out;
+  } catch (err) {
+    console.error(`[cowork-hr] ${after?._id}: could not sync CoWork access — ${err.message}`);
+    return null;
+  }
+}
 const router = express.Router();
 const bcrypt = require("bcryptjs");
 const Employee = require("../../models/Employee");
@@ -99,6 +135,30 @@ const SalaryConfig = require("../../models/Salaryconfig");
 const EmployeeAuthMiddlewear = require("../../Middlewear/EmployeeAuthMiddlewear");
 const emailService = require("../../services/emailService");
 const { recordChange } = require("../../services/changeLog");
+const { rekeyAttendanceRows } = require("../../services/attendanceRekey");
+
+/* The ACTIVE employee already holding a biometric ID, if any (12 Oct 2026).
+   The schema says biometricId is unique, but the index on it was built
+   non-unique, so nothing enforced it and two people could share an ID — the
+   sync then gives every punch to whichever it reads first. An inactive holder
+   is allowed: the sync ignores inactive people, and the time office reuses a
+   leaver's code. */
+async function activeBiometricHolder(biometricId, exceptId) {
+  const bid = String(biometricId || "").trim();
+  if (!bid) return null;
+  const q = {
+    biometricId: { $regex: `^${bid.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, $options: "i" },
+    $or: [{ status: "active" }, { status: { $exists: false } }, { isActive: true }],
+  };
+  if (exceptId) q._id = { $ne: exceptId };
+  return Employee.findOne(q).select("firstName lastName biometricId").lean();
+}
+const holderRefusal = (bid, h) => ({
+  success: false,
+  code: "BIOMETRIC_ID_IN_USE",
+  field: "biometricId",
+  message: `${String(bid).toUpperCase()} is already the biometric ID of ${[h.firstName, h.lastName].filter(Boolean).join(" ")}, who is active. Two people on one ID would put all the punches on one of them — change it there first.`,
+});
 const {
   invalidateAppAccess,
 } = require("../../Middlewear/AllEmployeeAppMiddleware");
@@ -325,7 +385,20 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
        handler only as the owner-approved replay. If it ever arrives any other
        way — a mount reordered, a path exempted — refuse, rather than create
        somebody with pay nobody allowed to be set. */
-    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+    /* SPLIT (owner, 12 Oct 2026: adding an employee never waits). The pay
+       fields the caller may not set are taken out here; the employee is
+       created now without them, and they are filed for the owner below. */
+    let deferredPay = null;
+    if (req.holdForOwner && req.splitPayForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      deferredPay = {};
+      for (const f of req.holdForOwner.fields || []) {
+        const top = String(f).split(".")[0];
+        if (req.body && req.body[top] !== undefined) {
+          deferredPay[top] = req.body[top];
+          delete req.body[top];
+        }
+      }
+    } else if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
       return res.status(403).json({
         success: false,
         code: "OWNER_APPROVAL_REQUIRED",
@@ -460,6 +533,11 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
        that was moved is a decision, not a value to recompute. */
     fillConfirmationDate(employeeData);
 
+    if (employeeData.biometricId) {
+      const holder = await activeBiometricHolder(employeeData.biometricId);
+      if (holder) return res.status(400).json(holderRefusal(employeeData.biometricId, holder));
+    }
+
     const newEmployee = new Employee({
       ...employeeData,
       password: temporaryPassword,
@@ -546,10 +624,41 @@ router.post("/", EmployeeAuthMiddlewear, async (req, res) => {
     // Decrypt salary in the response so the client gets plain numbers back
     if (resp.salary) resp.salary = decryptSalaryFields(resp.salary);
 
+    /* The pay that was taken out goes to the owner as a change to THIS new
+       employee. If filing fails the employee still exists — say so plainly
+       rather than pretend the pay was saved. */
+    let payPendingOwner = false;
+    if (deferredPay && Object.keys(deferredPay).length) {
+      try {
+        await require("../../services/changeRequests").fileOwnerFollowUp(req, {
+          path: `/api/employees/${newEmployee._id}`,
+          method: "PUT",
+          body: deferredPay,
+          entity: "employee",
+          entityId: newEmployee._id,
+          entityLabel: createdName,
+          summary: `Pay for new employee ${createdName}`,
+          fields: Object.keys(deferredPay),
+        });
+        payPendingOwner = true;
+      } catch (e) {
+        console.error("[employees] could not file pay for the owner:", e.message);
+        return res.status(201).json({
+          success: true,
+          message: `${createdName} was added, but their pay could not be sent to the owner for approval. Enter it again from Salary & Bank.`,
+          data: resp,
+          payPendingOwner: false,
+        });
+      }
+    }
+
     res.status(201).json({
       success: true,
-      message: "Employee created successfully",
+      message: payPendingOwner
+        ? `${createdName} was added. Their pay and bank details were sent to the HR owner for approval.`
+        : "Employee created successfully",
       data: resp,
+      payPendingOwner,
     });
   } catch (error) {
     console.error("Create employee error:", error);
@@ -643,6 +752,16 @@ function employeeAuditSnapshot(doc, decryptedSalary) {
 // ─── UPDATE employee ──────────────────────────────────────────────────────────
 router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    /* BACKSTOP, as on create: pay from somebody who may not set it is held
+       for the owner by the department guard and reaches here only as the
+       owner-approved replay. */
+    if (req.holdForOwner && !require("../../services/changeRequests").isApprovalReplay(req)) {
+      return res.status(403).json({
+        success: false,
+        code: "OWNER_APPROVAL_REQUIRED",
+        message: "Pay is set by the HR owner — this should have been sent to them for approval. Nothing was saved.",
+      });
+    }
     const { user } = req;
     const { id } = req.params;
     const updateData = req.body;
@@ -717,6 +836,10 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       } else {
         delete updateData.biometricId;
       }
+    }
+    if (updateData.biometricId) {
+      const holder = await activeBiometricHolder(updateData.biometricId, beforeDoc?._id || req.params.id);
+      if (holder) return res.status(400).json(holderRefusal(updateData.biometricId, holder));
     }
 
     // Strip base64 blobs (should have been uploaded to Cloudinary before hitting this endpoint)
@@ -840,6 +963,7 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
         .status(404)
         .json({ success: false, message: "Employee not found" });
     await detachIfDeparted(req, beforeDoc, updated.toObject());
+    await syncCoworkAccess(req, beforeDoc, updated.toObject());
 
     /* An email is the key every access record is filed under, and it is
        editable right here. Changing it without moving those records orphans
@@ -896,6 +1020,22 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
       ),
       after: employeeAuditSnapshot(updated, decryptedDoc?.salary || {}),
     });
+    /* Their attendance follows the new ID (12 Oct 2026). Left behind, the rows
+       under the old ID showed as a ghost with the person's own name, and the
+       new ID's days stayed the device's ghost. Only rows carrying THIS
+       employee's _id move. Never fails the save — the rename is done. */
+    if (biometricIdRenamed) {
+      try {
+        biometricIdRenamed.attendance = await rekeyAttendanceRows({
+          employeeId: updated._id,
+          fromId: biometricIdRenamed.from,
+          toId: biometricIdRenamed.to,
+        });
+      } catch (e) {
+        console.error("[EMPLOYEE] attendance re-key after ID change failed:", e.message);
+        biometricIdRenamed.attendanceError = e.message;
+      }
+    }
     res.status(200).json({
       success: true,
       message: "Employee updated successfully",
@@ -909,10 +1049,28 @@ router.put("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     });
   } catch (error) {
     console.error("Update employee error:", error);
-    if (error.code === 11000)
-      return res
-        .status(400)
-        .json({ success: false, message: "Duplicate value error" });
+    if (error.code === 11000) {
+      /* Name the field and who already holds it — "Duplicate value error" left
+         HR unable to give an employee the ID the time office really uses. */
+      const field = Object.keys(error.keyPattern || error.keyValue || {})[0];
+      const value = field ? (error.keyValue || {})[field] : null;
+      let holder = null;
+      if (field && value != null)
+        holder = await Employee.findOne({ [field]: value, _id: { $ne: req.params.id } })
+          .select("firstName lastName status")
+          .lean()
+          .catch(() => null);
+      return res.status(400).json({
+        success: false,
+        code: "DUPLICATE_VALUE",
+        field,
+        message: holder
+          ? `${value} is already the ${field} of ${[holder.firstName, holder.lastName].filter(Boolean).join(" ")} (${holder.status || "no status"}). Change or clear it there first.`
+          : field
+            ? `${value} is already used as ${field} by another record.`
+            : "Duplicate value error",
+      });
+    }
     if (error.name === "CastError")
       return res
         .status(400)
@@ -1336,6 +1494,7 @@ router.patch("/bulk-update", EmployeeAuthMiddlewear, async (req, res) => {
         // pre-save hook recalculates + re-encrypts salary and stamps updatedAt
         await doc.save();
         await detachIfDeparted(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
+        await syncCoworkAccess(req, { isActive: beforeSnap.status === "inactive" ? false : true, status: beforeSnap.status }, doc.toObject());
         // Same reason as the single-employee update: a change of employment
         // type changes whether the app will let them in, and the answer is
         // cached for five minutes.
@@ -1825,6 +1984,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
     invalidateAppAccess(req.params.id);
     dropHrAuthorizationCache("employee deactivated");
     const departure = await detachIfDeparted(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
+    const cowork = await syncCoworkAccess(req, { isActive: true, status: "active" }, employee.toObject ? employee.toObject() : employee);
 
     // Audit: who deactivated this employee.
     recordChange(req, {
@@ -1841,7 +2001,7 @@ router.delete("/:id", EmployeeAuthMiddlewear, async (req, res) => {
 
     res
       .status(200)
-      .json({ success: true, message: "Employee deactivated successfully", departure });
+      .json({ success: true, message: "Employee deactivated successfully", departure, cowork });
   } catch (error) {
     console.error("Delete employee error:", error);
     if (error.name === "CastError")

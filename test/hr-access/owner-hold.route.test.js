@@ -78,14 +78,14 @@ describe("POST /api/employees — pay from a non-owner", () => {
     expect(r.status).toBe(403);
   });
 
-  test("an EDIT of an existing employee's pay is still refused, not held", async () => {
+  test("an EDIT of an existing employee's pay is marked for the owner too (12 Oct 2026)", async () => {
     const tok = await as("approver");
     const r = await fetch(`${base}/api/employees/507f1f77bcf86cd799439011`, {
       method: "PUT",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
       body: JSON.stringify({ salary: { gross: 99999 } }),
     });
-    expect(r.status).toBe(403);
-    expect((await r.json()).requiredCapability).toBe("compensation.write");
+    expect(r.status).toBe(200);
+    expect((await r.json()).holdForOwner).toMatchObject({ capability: "compensation.write" });
   });
 });

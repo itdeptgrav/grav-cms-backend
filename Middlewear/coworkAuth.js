@@ -72,6 +72,20 @@ async function resolveCoworkUser(idToken) {
   }
 
   const data = snap.docs[0].data();
+
+  /* ── INACTIVE IN HR → NO COWORK (12 Oct 2026, owner) ──────────────────────
+     Checked before anything is cached, so a refused person is asked again on
+     every request rather than remembered as allowed. The record is kept as it
+     is — this refuses, it deletes nothing. The rule, and how HR and CoWork
+     records are matched, are services/coworkHrAccess.service.js. */
+  const refusal = await require("../services/coworkHrAccess.service").refusalFor(snap.docs[0].id, data);
+  if (refusal) {
+    const err = new Error(refusal.message);
+    err.status = 403;
+    err.code = refusal.code;
+    throw err;
+  }
+
   if (!data.authUid) await snap.docs[0].ref.update({ authUid: decoded.uid });
 
   const empUser = { employeeId: data.employeeId, role: data.role, name: data.name, employeeData: data };
@@ -87,7 +101,7 @@ async function verifyCoworkToken(req, res, next) {
     req.coworkUser = await resolveCoworkUser(header.split("Bearer ")[1]);
     next();
   } catch (err) {
-    if (err.status === 403) return res.status(403).json({ error: err.message });
+    if (err.status === 403) return res.status(403).json({ error: err.message, ...(err.code ? { code: err.code } : {}) });
     res.status(401).json({ error: "Auth error: " + err.message });
   }
 }

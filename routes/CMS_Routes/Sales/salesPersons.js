@@ -14,12 +14,14 @@
 // onto the roster row rather than read live off the Employee every time.
 "use strict";
 
+const crypto = require("crypto");
 const express = require("express");
 const router = express.Router();
 
 const Employee = require("../../../models/Employee");
 const { SalesPerson, normalizePhone } = require("../../../models/CMS_Models/Sales/SalesPerson");
 const salesAuth = require("../../../Middlewear/SalesAuthMiddlewear");
+const { e164, safeRoomName } = require("../../../services/telephony/voiceLineAssignment");
 
 /** The fields the picker and every roster row need.
  *
@@ -132,6 +134,11 @@ router.get("/", salesAuth, async (req, res) => {
           employeeMissing: !live,
           phoneDrifted: Boolean(live && liveWorkPhone && liveWorkPhone !== (r.workPhone || "").trim()),
           livePhone: liveWorkPhone,
+          voiceNumber: r.voiceNumber || null,
+          voiceOutboundTrunkId: r.voiceOutboundTrunkId || null,
+          voiceInboundTrunkId: r.voiceInboundTrunkId || null,
+          voiceInboundRoomName: r.voiceInboundRoomName || null,
+          voiceEnabled: r.voiceEnabled === true,
         };
       }),
     });
@@ -202,10 +209,45 @@ router.patch("/:id", salesAuth, async (req, res) => {
     const row = await SalesPerson.findById(req.params.id);
     if (!row) return res.status(404).json({ success: false, message: "Not on the roster." });
 
-    const { responsibility, active, resyncPhone } = req.body || {};
+    const {
+      responsibility, active, resyncPhone,
+      voiceNumber, voiceOutboundTrunkId, voiceInboundTrunkId, voiceInboundRoomName, voiceEnabled,
+    } = req.body || {};
 
     if (responsibility !== undefined) row.responsibility = String(responsibility || "").trim().slice(0, 500);
     if (active !== undefined) row.active = Boolean(active);
+
+    const changesVoiceLine = [voiceNumber, voiceOutboundTrunkId, voiceInboundTrunkId, voiceInboundRoomName, voiceEnabled]
+      .some((value) => value !== undefined);
+    if (changesVoiceLine && !req.user?.isAdmin) {
+      return res.status(403).json({ success: false, message: "Only an administrator can assign GRAV Voice numbers." });
+    }
+    if (voiceNumber !== undefined) {
+      if (voiceNumber === null || String(voiceNumber).trim() === "") row.voiceNumber = null;
+      else {
+        const number = e164(voiceNumber);
+        if (!number) return res.status(400).json({ success: false, code: "INVALID_VOICE_NUMBER", message: "Enter the assigned Voice number in E.164 format." });
+        row.voiceNumber = number;
+      }
+    }
+    if (voiceOutboundTrunkId !== undefined) row.voiceOutboundTrunkId = String(voiceOutboundTrunkId || "").trim() || null;
+    if (voiceInboundTrunkId !== undefined) row.voiceInboundTrunkId = String(voiceInboundTrunkId || "").trim() || null;
+    if (voiceInboundRoomName !== undefined) {
+      const supplied = String(voiceInboundRoomName || "").trim();
+      if (supplied && !safeRoomName(supplied)) {
+        return res.status(400).json({ success: false, code: "INVALID_VOICE_ROOM", message: "The inbound Voice room name is invalid." });
+      }
+      row.voiceInboundRoomName = supplied || null;
+    }
+    if (voiceEnabled !== undefined) {
+      if (voiceEnabled && !e164(row.voiceNumber)) {
+        return res.status(400).json({ success: false, code: "VOICE_NUMBER_REQUIRED", message: "Assign a valid Voice number before enabling the line." });
+      }
+      row.voiceEnabled = Boolean(voiceEnabled);
+      if (row.voiceEnabled && !row.voiceInboundRoomName) {
+        row.voiceInboundRoomName = `grav-voice-in-${crypto.createHash("sha256").update(String(row._id)).digest("hex").slice(0, 24)}`;
+      }
+    }
 
     if (resyncPhone) {
       const employee = await Employee.findById(row.employeeRef).select(EMPLOYEE_FIELDS).lean();
@@ -226,6 +268,9 @@ router.patch("/:id", salesAuth, async (req, res) => {
     await row.save();
     res.json({ success: true, salesPerson: row });
   } catch (err) {
+    if (err?.code === 11000 && err?.keyPattern?.voiceNumber) {
+      return res.status(409).json({ success: false, code: "VOICE_NUMBER_IN_USE", message: "That Voice number is already assigned to another user." });
+    }
     console.error("[salesPersons] update failed:", err);
     res.status(500).json({ success: false, message: err.message });
   }

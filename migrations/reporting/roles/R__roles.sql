@@ -1,6 +1,7 @@
 -- R__roles.sql — the two roles that touch the mart, and what each may do.
 --
--- Applied by `npm run reporting:roles`, as the database owner, with both
+-- Applied by `npm run reporting:roles -- --apply`, as the database owner, with
+-- both
 -- passwords bound at run time from the environment. **No password is ever
 -- written into this file or any other committed file.**
 --
@@ -121,18 +122,48 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA reporting FROM metabase_reader;
 -- migration must be considered before it is exposed, not exposed because it
 -- happened to land in this schema. There is no ALTER DEFAULT PRIVILEGES for
 -- this role for the same reason.
-GRANT SELECT ON reporting.dim_company        TO metabase_reader;
-GRANT SELECT ON reporting.dim_group          TO metabase_reader;
-GRANT SELECT ON reporting.dim_ledger         TO metabase_reader;
-GRANT SELECT ON reporting.fact_voucher       TO metabase_reader;
-GRANT SELECT ON reporting.fact_voucher_line  TO metabase_reader;
-GRANT SELECT ON reporting.v_general_ledger   TO metabase_reader;
-GRANT SELECT ON reporting.v_trial_balance    TO metabase_reader;
-
--- The run log is operational, not accounting data. The reader is shown it so a
--- "data as of" question can be answered from the same connection, and it holds
--- no financial figures and no secrets.
-GRANT SELECT ON reporting.mart_sync_run      TO metabase_reader;
+--
+-- ── EACH GRANT WAITS FOR ITS OBJECT ─────────────────────────────────────────
+-- Granting on a relation that does not exist yet aborts the whole file, and on
+-- a FRESH mart some of these do not exist when this first runs. That produced
+-- a bootstrap deadlock: `migrate` stopped at V003, which grants to
+-- metabase_reader, because the role is created here; and this file could not
+-- run first, because it granted on views that V003's own run would have
+-- created. Neither command could go first and a new mart could not be built at
+-- all — which is how a working reporting stack became an unrecoverable one the
+-- moment its Docker volume was lost.
+--
+-- Skipping an absent object is safe in a way that granting on ALL TABLES is
+-- not: this file is REPEATABLE and is run again after the migrations, so every
+-- object that exists by then is granted then. The list stays explicit, so a
+-- table added by a future migration is still exposed only by being named here.
+DO $$
+DECLARE
+  rel  text;
+  rels text[] := ARRAY[
+    'reporting.dim_company',
+    'reporting.dim_group',
+    'reporting.dim_ledger',
+    'reporting.fact_voucher',
+    'reporting.fact_voucher_line',
+    'reporting.v_general_ledger',
+    'reporting.v_trial_balance',
+    'reporting.v_voucher_register',
+    -- The run log is operational, not accounting data. The reader is shown it
+    -- so a "data as of" question can be answered from the same connection, and
+    -- it holds no financial figures and no secrets.
+    'reporting.mart_sync_run'
+  ];
+BEGIN
+  FOREACH rel IN ARRAY rels LOOP
+    IF to_regclass(rel) IS NULL THEN
+      RAISE NOTICE 'skipping %, which does not exist yet', rel;
+    ELSE
+      EXECUTE format('GRANT SELECT ON %s TO metabase_reader', rel);
+    END IF;
+  END LOOP;
+END
+$$;
 
 -- Belt and braces: no write verb on anything that exists now, including the
 -- objects just granted SELECT.
