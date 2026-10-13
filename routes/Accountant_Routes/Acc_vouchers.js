@@ -466,6 +466,12 @@ function pickGstRate(candidates, fallback = 18) {
 
 // Lazy-require the CMS StockItem model so this file loads even where the
 // CMS inventory module isn't installed.
+const {
+  salesCatalogue,
+  purchaseCatalogue,
+  matchesQuery,
+} = require("../../services/accounting/voucherItemCatalogue");
+
 function loadCMSStockItem() {
   try {
     return require("../../models/CMS_Models/Inventory/Products/StockItem");
@@ -643,79 +649,33 @@ async function applyPurchaseOrderProvenance(body) {
   };
 }
 
+/* The sales-side item list. Built by services/accounting/voucherItemCatalogue
+   — read its header for where each figure comes from and why (13 Oct 2026). */
 router.get("/stock-items", auth, companyScope, async (req, res) => {
   try {
-    const { companyId, q, limit = 500 } = req.query;
+    const { companyId, q, limit = 2000 } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
+    const lim = parseInt(limit) || 2000;
 
-    const lim = parseInt(limit);
-    const rx = q
-      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
-      : null;
-
-    // ── Source 1: CMS StockItem catalog ────────────────────────────
     const CMSStockItem = loadCMSStockItem();
-    let cmsItems = [];
-    if (CMSStockItem) {
-      const cmsFilter = {};
-      if (rx) {
-        cmsFilter.$or = [
-          { name: rx },
-          { additionalNames: rx },
-          { hsnCode: rx },
-          { reference: rx },
-          { barcode: rx },
-        ];
-      }
-      const cmsRaw = await CMSStockItem.find(cmsFilter)
-        .sort({ name: 1 })
-        .limit(lim)
-        .select(
-          "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory",
-        )
-        .lean();
-
-      cmsItems = cmsRaw.map((s) => ({
-        _id: s._id,
-        name: s.name,
-        aliases: s.additionalNames || [],
-        hsnCode: s.hsnCode || "",
-        baseUnit: s.unit || "Nos",
-        taxRate: parseTaxRate(s.salesTax),
-        standardSellingPrice: s.baseSalesPrice || 0,
-        standardCost: s.baseCost || 0,
-        closingQuantity: s.totalQuantityOnHand || 0,
-        gstApplicable: !!s.salesTax,
-        source: "cms",
-        reference: s.reference,
-        category: s.category,
-      }));
-    }
-
-    // ── Source 2: Acc_StockItem (accountant-side, company-scoped) ──
-    const tallyFilter = { companyId, isActive: true };
-    if (rx) {
-      tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
-    }
-    const tallyRaw = await Acc_StockItem.find(tallyFilter)
+    const products = CMSStockItem
+      ? await CMSStockItem.find({})
+          .sort({ name: 1 })
+          .select(
+            "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory isActive deletedAt variants._id variants.attributes variants.salesPrice variants.status",
+          )
+          .lean()
+      : [];
+    const tallyRows = await Acc_StockItem.find({ companyId, isActive: true })
       .sort({ name: 1 })
-      .limit(lim)
-      .select(
-        "name aliases hsnCode taxRate baseUnit altUnit standardSellingPrice standardCost closingQuantity gstApplicable",
-      )
+      .select("name aliases hsnCode taxRate baseUnit standardSellingPrice standardCost closingQuantity")
       .lean();
 
-    const tallyItems = tallyRaw.map((t) => ({ ...t, source: "tally" }));
-
-    // ── Merge — CMS items win when names collide (case-insensitive) ──
-    const seen = new Set(cmsItems.map((i) => (i.name || "").toLowerCase()));
-    const merged = [
-      ...cmsItems,
-      ...tallyItems.filter((t) => !seen.has((t.name || "").toLowerCase())),
-    ];
-
-    res.json({ items: merged, count: merged.length });
+    const items = salesCatalogue(products, tallyRows)
+      .filter((r) => matchesQuery(r, q))
+      .slice(0, lim);
+    res.json({ items, count: items.length });
   } catch (e) {
     console.error("[stock-items]", e);
     res.status(500).json({ error: e.message });
@@ -2819,97 +2779,43 @@ router.post("/:id/link-po", auth, companyScopeOptional, async (req, res) => {
   }
 });
 
-/* GET /raw-materials                                                   */
+/* GET /raw-materials — the purchase-side item list. Built by
+   services/accounting/voucherItemCatalogue (13 Oct 2026). */
 router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
   try {
-    const { companyId, q, limit = 500 } = req.query;
-    const lim = parseInt(limit);
-    const rx = q
-      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
-      : null;
-    let rawItems = [];
-    try {
-      const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
-      const filter = {};
-      /* `vendorNicknames` is the purchase-side equivalent of a stock item's
-         additionalNames: the names a SUPPLIER puts on the same material. It
-         was never searched or returned, so a material the vendor calls
-         something else could not be found by the name on their bill, and the
-         line was typed out by hand. RawItem has carried the field all along —
-         it is simply empty on every one of the 303 items today, so nothing
-         changes until somebody records a nickname. */
-      if (rx)
-        filter.$or = [
-          { name: rx },
-          { sku: rx },
-          { hsnCode: rx },
-          { vendorNicknames: rx },
-          { "vendorNicknames.name": rx },
-        ];
-      const items = await RawItem.find(filter)
+    const { companyId, q, limit = 2000 } = req.query;
+    const lim = parseInt(limit) || 2000;
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+
+    const [rawItems, tallyRows, orders] = await Promise.all([
+      RawItem.find({})
         .sort({ name: 1 })
-        .limit(lim)
-        .select("name sku unit category hsnCode gstRate basePrice vendorNicknames")
-        .lean();
-      rawItems = items.map((r) => ({
-        _id: r._id,
-        name: r.name,
-        sku: r.sku || "",
-        hsnCode: r.hsnCode || "",
-        baseUnit: r.unit || "Nos",
-        taxRate: r.gstRate || 0,
-        standardCost: r.basePrice || 0,
-        category: r.category || "",
-        /* Normalised to `aliases`, the name the picker already understands,
-           so the purchase side behaves exactly like the sales side. Entries
-           may be plain strings or {name, vendor} objects depending on who
-           wrote them. */
-        aliases: (r.vendorNicknames || [])
-          .map((v) => (typeof v === "string" ? v : v?.name || v?.nickname || ""))
-          .filter(Boolean),
-        source: "cms_raw",
-      }));
-    } catch {
-      try {
-        const Product = require("../../models/CMS_Models/Inventory/Products/Product");
-        const filter = {
-          type: { $in: ["raw_material", "rawMaterial", "raw"] },
-        };
-        if (rx) filter.$or = [{ name: rx }, { sku: rx }];
-        const items = await Product.find(filter)
-          .sort({ name: 1 })
-          .limit(lim)
-          .lean();
-        rawItems = items.map((r) => ({
-          _id: r._id,
-          name: r.name,
-          sku: r.sku || "",
-          hsnCode: r.hsnCode || "",
-          baseUnit: r.unit || "Nos",
-          taxRate: r.gstRate || 0,
-          standardCost: r.basePrice || r.costPrice || 0,
-          source: "cms_product",
-        }));
-      } catch {
-        /* no CMS product model */
-      }
-    }
-    if (companyId) {
-      const tallyFilter = { companyId, isActive: true };
-      if (rx)
-        tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
-      const tallyRaw = await Acc_StockItem.find(tallyFilter)
-        .sort({ name: 1 })
-        .limit(lim)
-        .select("name aliases hsnCode taxRate baseUnit standardCost")
-        .lean();
-      const seen = new Set(rawItems.map((r) => r.name?.toLowerCase()));
-      for (const t of tallyRaw) {
-        if (!seen.has(t.name?.toLowerCase()))
-          rawItems.push({ ...t, source: "tally" });
-      }
-    }
-    res.json({ items: rawItems, count: rawItems.length });
+        .select(
+          "name sku unit customUnit category customCategory vendorNicknames primaryVendor variants._id variants.combination variants.vendorNicknames",
+        )
+        .lean(),
+      companyId
+        ? Acc_StockItem.find({ companyId, isActive: true })
+            .sort({ name: 1 })
+            .select("name aliases hsnCode taxRate baseUnit standardCost")
+            .lean()
+        : [],
+      /* The latest purchase rate per material is what it costs now. Live
+         orders only — a cancelled or draft order's rate was never paid. */
+      PurchaseOrder.find({ status: { $nin: ["CANCELLED", "Cancelled", "DRAFT", "Draft"] } })
+        .sort({ orderDate: -1, createdAt: -1 })
+        .select("items.rawItem items.variantId items.unitPrice items.gstRate")
+        .limit(1000)
+        .lean(),
+    ]);
+    const poLines = [];
+    for (const o of orders) for (const l of o.items || []) poLines.push(l);
+
+    const items = purchaseCatalogue(rawItems, tallyRows, poLines)
+      .filter((r) => matchesQuery(r, q))
+      .slice(0, lim);
+    res.json({ items, count: items.length });
   } catch (e) {
     console.error("[raw-materials]", e);
     res.status(500).json({ error: e.message });
