@@ -1,56 +1,54 @@
 "use strict";
 
 /**
- * The item list behind every voucher line's name box (13 Oct 2026).
+ * The item list behind every voucher line's name box (13 Oct 2026, owner).
  *
  * `GET /api/accountant/vouchers/stock-items`   — sales, credit notes, proforma
  * `GET /api/accountant/vouchers/raw-materials` — purchase, debit notes
  *
+ * Everything comes from the CMS. Tally is not read anywhere — the owner: "we
+ * don't need to depend on Tally; fetch those things from the CMS where they
+ * already exist". Picking a row fills the line's name, HSN, unit, price and
+ * GST.
+ *
  * ── WHAT WAS WRONG ──────────────────────────────────────────────────────────
- * 1. Every item twice. Each list joined the CMS catalogue (StockItem /
- *    RawItem) with the accountant's Acc_StockItem — the Tally import — and
- *    dropped a Tally row only when its name matched EXACTLY, case aside.
- *    Tally spells the same goods its own way ("SuitingFabric 80/20 PC Plain"
- *    vs "SUITING FABRIC 80/20 PC PLAIN"), so both were offered. The sales
- *    list also listed inactive and deleted products, and offered the men's
- *    and women's version of a garment under one bare name.
- * 2. Prices from fields that are not where the price lives. A raw item has no
- *    `basePrice`: what it costs is on its purchase orders, and per supplier on
- *    each variant. A product's price is per size (`variants[].salesPrice`);
- *    `baseSalesPrice` is only the fallback the proforma itself uses.
- * 3. HSN and GST from fields that do not exist. A raw item has no `hsnCode`
- *    or `gstRate` at all, and no product has `salesTax` set, so every line
- *    arrived with HSN blank and GST 0% — and because 0 is a number, the
- *    voucher forms overwrote their own rate with it.
+ * Each list joined the CMS catalogue with the Tally import and dropped a Tally
+ * row only when its spelling matched exactly, so items showed twice; the
+ * men's and women's version of a garment shared one bare name; inactive
+ * products were listed; prices were read from fields where no price is kept;
+ * and HSN / GST from fields that do not exist, so every line got a blank HSN
+ * and 0% GST — which, being a number, overwrote the line's own rate.
  *
- * ── WHERE EACH FIGURE COMES FROM NOW ────────────────────────────────────────
+ * ── WHERE EACH FIGURE COMES FROM ────────────────────────────────────────────
  * Sales (a product):
- *   price — the size's own `salesPrice`, else `baseSalesPrice` (the proforma's
- *           `rateOf`). A product whose sizes are priced differently is offered
- *           once per size, so the price on the line is the size's price.
- *   GST   — the product's own rate when recorded, else the Tally item's, else
- *           the company's garment rule the proforma uses: 5% below Rs. 2,499,
- *           18% at or above (lib/salesJourney/quotationMath.js).
- *   HSN   — the product's, else the Tally item's.
+ *   With a customer chosen, that customer's own PI lines come FIRST — the
+ *   agreed price and GST, the name as the PI wrote it (with the size). Then
+ *   every live product:
+ *   price — the size's own price, else the base price (the proforma's rule);
+ *           a product whose sizes are priced differently is offered per size.
+ *   GST   — the product's own rate; else the rate of the latest sales bill
+ *           for it; else the company's garment rule the PI uses (5% below
+ *           Rs. 2,499, 18% at or above).
+ *   HSN   — the product's; else any PI line for it; else the latest sales
+ *           bill for it.
  * Purchase (a raw material):
- *   price — the latest purchase-order rate for that material and variant,
- *           else that material's latest PO rate, else the primary supplier's
- *           price on the variant, else any supplier's.
- *   GST   — the Tally item's, else the latest PO line that recorded a rate.
- *           Otherwise UNKNOWN (null), never 0: the form keeps its own rate.
- *   HSN   — the Tally item's. The CMS records none for raw materials (the
- *           customs tariff code on a raw item is not the GST HSN).
+ *   price — the latest purchase-order rate for that variant; else the
+ *           material's latest PO rate; else the primary supplier's price on
+ *           the variant; else the latest purchase bill's rate.
+ *   GST   — the latest PO line that recorded one; else the latest purchase
+ *           bill for it; else UNKNOWN (null) — the line keeps its own rate.
+ *   HSN   — the latest purchase bill for it (the CMS records none on a raw
+ *           item; its customs tariff code is not the GST HSN).
+ * "The latest bill for it" is an accounting voucher line carrying the item's
+ * id, or failing that its name — the bills the accountant already entered.
  * Every row says where its figures came from (`priceSource`, `taxRateSource`,
- * `hsnSource`), and a figure nobody recorded is null, not a guess.
- *
- * A Tally item that matches no CMS item is still offered — it may be a
- * service or a material bought only through accounts.
+ * `hsnSource`).
  */
 
 const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const num = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
 
-/** The proforma's slab (lib/salesJourney/quotationMath.js `getGSTPercentage`). */
+/** The PI's slab (lib/salesJourney/quotationMath.js `getGSTPercentage`). */
 function garmentSlabRate(price) {
   const p = Number(price);
   if (!Number.isFinite(p) || p <= 0) return null;
@@ -64,7 +62,7 @@ function parseTaxRate(raw) {
   return m ? parseFloat(m[1]) : null;
 }
 
-/** "Size: 30" / "Fancy Corner / 14*20" */
+/** "30" / "Fancy Corner / 14*20" */
 function variantLabelOf(v) {
   if (Array.isArray(v?.attributes) && v.attributes.length)
     return v.attributes.map((a) => a?.value).filter(Boolean).join(" / ");
@@ -74,87 +72,123 @@ function variantLabelOf(v) {
 }
 
 /**
- * Index Tally items by every spelling they carry, so a CMS item can find its
- * twin by its own name or any alias. Returns { find(names) → tally row, used }.
+ * What earlier bills say about an item. `lines` are voucher inventory lines,
+ * LATEST FIRST: { stockItemId, stockItemName, rate, taxRate, taxAmount,
+ * hsnCode, isCharge }. Each figure is the latest one actually recorded, so a
+ * bill with no HSN does not hide an older bill that had one.
  */
-function tallyIndex(tallyRows) {
-  const by = new Map();
-  for (const t of tallyRows) {
-    for (const n of [t.name, ...(t.aliases || [])]) {
-      const k = norm(n);
-      if (k && !by.has(k)) by.set(k, t);
-    }
+function billHistory(lines) {
+  const byId = new Map();
+  const byName = new Map();
+  const take = (map, key, l) => {
+    if (!key) return;
+    const h = map.get(key) || {};
+    if (h.hsnCode == null && l.hsnCode) h.hsnCode = String(l.hsnCode).trim();
+    /* A 0 on an old bill is far more often "not entered" than an exempt
+       item, so only a recorded rate counts. */
+    if (h.taxRate == null && num(l.taxRate)) h.taxRate = Number(l.taxRate);
+    if (h.rate == null && num(l.rate)) h.rate = num(l.rate);
+    map.set(key, h);
+  };
+  for (const l of lines || []) {
+    if (!l || l.isCharge) continue;
+    take(byId, l.stockItemId ? String(l.stockItemId) : null, l);
+    take(byName, norm(l.stockItemName), l);
   }
-  const used = new Set();
   return {
-    find(names) {
-      for (const n of names) {
-        const t = by.get(norm(n));
-        if (t) {
-          used.add(String(t._id));
-          return t;
-        }
-      }
-      return null;
+    /** Figures for an item: by id first, then by any of its names. */
+    of(id, names = []) {
+      const out = {};
+      const fill = (h) => {
+        if (!h) return;
+        for (const k of ["hsnCode", "taxRate", "rate"]) if (out[k] == null && h[k] != null) out[k] = h[k];
+      };
+      if (id) fill(byId.get(String(id)));
+      for (const n of names) fill(byName.get(norm(n)));
+      return out;
     },
-    used,
   };
 }
 
-const tallyOnlyRow = (t, priceField) => ({
-  _id: t._id,
-  name: t.name,
-  aliases: t.aliases || [],
-  hsnCode: t.hsnCode || "",
-  baseUnit: t.baseUnit || "Nos",
-  taxRate: typeof t.taxRate === "number" ? t.taxRate : null,
-  [priceField]: num(t[priceField]),
-  hsnSource: t.hsnCode ? "tally" : null,
-  taxRateSource: typeof t.taxRate === "number" ? "tally" : null,
-  priceSource: num(t[priceField]) ? "tally" : null,
-  source: "tally",
-  detail: "Accounts only",
-});
-
 // ── Sales: finished products ────────────────────────────────────────────────
-function salesCatalogue(products, tallyRows) {
-  const tally = tallyIndex(tallyRows);
+/**
+ * @param products     StockItem documents
+ * @param bills        billHistory over SALES voucher lines
+ * @param piLines      every PI line, latest first: { stockItemId, itemName,
+ *                     hsnCode, unitPrice, gstPercentage, quotationNumber,
+ *                     forCustomer (true when the chosen customer's) }
+ */
+function salesCatalogue(products, bills, piLines = []) {
+  const piHsn = new Map(); // product id → an HSN some PI recorded
+  for (const l of piLines)
+    if (l.stockItemId && l.hsnCode && !piHsn.has(String(l.stockItemId)))
+      piHsn.set(String(l.stockItemId), String(l.hsnCode).trim());
+
   const out = [];
+  const live = new Map();
   for (const p of products) {
     if (p.deletedAt || p.isActive === false) continue;
-    const twin = tally.find([p.name, ...(p.additionalNames || [])]);
+    live.set(String(p._id), p);
+  }
+
+  // 1. The chosen customer's PI lines, first: what was agreed with them.
+  const seenPi = new Set();
+  for (const l of piLines) {
+    if (!l.forCustomer) continue;
+    const key = `${l.stockItemId}|${norm(l.itemName)}`;
+    if (seenPi.has(key)) continue;
+    seenPi.add(key);
+    const p = live.get(String(l.stockItemId || ""));
+    const hist = bills.of(l.stockItemId, [l.itemName, p?.name].filter(Boolean));
+    const hsn = l.hsnCode || p?.hsnCode || piHsn.get(String(l.stockItemId)) || hist.hsnCode || "";
+    out.push({
+      _id: l.stockItemId || null,
+      name: l.itemName,
+      productName: p?.name || l.description || l.itemName,
+      aliases: [],
+      hsnCode: hsn,
+      hsnSource: l.hsnCode ? "pi" : p?.hsnCode ? "product" : piHsn.get(String(l.stockItemId)) ? "pi" : hist.hsnCode ? "bill" : null,
+      baseUnit: p?.unit || "Pcs",
+      standardSellingPrice: num(l.unitPrice),
+      priceSource: "pi",
+      taxRate: typeof l.gstPercentage === "number" ? l.gstPercentage : garmentSlabRate(l.unitPrice),
+      taxRateSource: typeof l.gstPercentage === "number" ? "pi" : "slab",
+      piNumber: l.quotationNumber || "",
+      detail: `On this customer's PI${l.quotationNumber ? " " + l.quotationNumber : ""}`,
+      source: "pi",
+    });
+  }
+
+  // 2. Every live product.
+  for (const p of live.values()) {
     const ownRate = parseTaxRate(p.salesTax);
-    const hsn = p.hsnCode || twin?.hsnCode || "";
-    const detail = [p.genderCategory, p.category, p.reference].filter(Boolean).join(" · ");
+    const hist = bills.of(p._id, [p.name, ...(p.additionalNames || [])]);
+    const hsn = p.hsnCode || piHsn.get(String(p._id)) || hist.hsnCode || "";
     const base = {
       _id: p._id,
       aliases: p.additionalNames || [],
       hsnCode: hsn,
-      hsnSource: p.hsnCode ? "product" : twin?.hsnCode ? "tally" : null,
-      baseUnit: p.unit || twin?.baseUnit || "Nos",
+      hsnSource: p.hsnCode ? "product" : piHsn.get(String(p._id)) ? "pi" : hist.hsnCode ? "bill" : null,
+      baseUnit: p.unit || "Nos",
       standardCost: num(p.baseCost),
       closingQuantity: p.totalQuantityOnHand || 0,
       category: p.category,
       reference: p.reference,
       gender: p.genderCategory || "",
-      detail,
-      source: twin ? "cms+tally" : "cms",
+      detail: [p.genderCategory, p.category, p.reference].filter(Boolean).join(" · "),
+      source: "cms",
     };
     const rateFor = (price) => {
       if (ownRate !== null) return { taxRate: ownRate, taxRateSource: "product" };
-      if (twin && typeof twin.taxRate === "number" && twin.taxRate > 0)
-        return { taxRate: twin.taxRate, taxRateSource: "tally" };
+      if (num(hist.taxRate)) return { taxRate: hist.taxRate, taxRateSource: "bill" };
       const slab = garmentSlabRate(price);
       return { taxRate: slab, taxRateSource: slab === null ? null : "slab" };
     };
-
     const variants = (p.variants || []).filter((v) => v && v.status !== "inactive");
     const priced = variants.filter((v) => num(v.salesPrice));
     const distinct = new Set(priced.map((v) => num(v.salesPrice)));
 
     if (distinct.size > 1) {
-      /* Sizes priced differently: one row per size, so the line takes the
-         price of the size sold. The line still points at the product. */
       for (const v of priced) {
         const label = variantLabelOf(v);
         const price = num(v.salesPrice);
@@ -171,30 +205,29 @@ function salesCatalogue(products, tallyRows) {
       }
       continue;
     }
-    const price = [...distinct][0] || num(p.baseSalesPrice);
+    const price = [...distinct][0] || num(p.baseSalesPrice) || num(hist.rate);
     out.push({
       ...base,
       name: p.name,
       productName: p.name,
       standardSellingPrice: price,
-      priceSource: distinct.size ? "variant" : price ? "product" : null,
+      priceSource: distinct.size ? "variant" : num(p.baseSalesPrice) ? "product" : price ? "bill" : null,
       ...rateFor(price),
     });
   }
-  for (const t of tallyRows)
-    if (!tally.used.has(String(t._id))) out.push(tallyOnlyRow(t, "standardSellingPrice"));
   return out;
 }
 
 // ── Purchase: raw materials ─────────────────────────────────────────────────
 /**
- * `poLines` is the latest-first list of purchase-order lines:
- * { rawItem, variantId, unitPrice, gstRate }.
+ * @param rawItems  RawItem documents
+ * @param bills     billHistory over PURCHASE voucher lines
+ * @param poLines   purchase-order lines, latest first:
+ *                  { rawItem, variantId, unitPrice, gstRate }
  */
-function purchaseCatalogue(rawItems, tallyRows, poLines) {
-  const tally = tallyIndex(tallyRows);
-  const lastPrice = new Map(); // "raw|variant" and "raw|" → price
-  const lastGst = new Map(); // "raw" → rate
+function purchaseCatalogue(rawItems, bills, poLines = []) {
+  const lastPrice = new Map();
+  const lastGst = new Map();
   for (const l of poLines) {
     const raw = String(l.rawItem || "");
     if (!raw) continue;
@@ -213,23 +246,22 @@ function purchaseCatalogue(rawItems, tallyRows, poLines) {
     const nick = (r.vendorNicknames || [])
       .map((v) => (typeof v === "string" ? v : v?.name || v?.nickname || ""))
       .filter(Boolean);
-    const twin = tally.find([r.name, ...nick]);
-    const gst =
-      twin && typeof twin.taxRate === "number" && twin.taxRate > 0
-        ? { taxRate: twin.taxRate, taxRateSource: "tally" }
-        : lastGst.has(raw)
-          ? { taxRate: lastGst.get(raw), taxRateSource: "purchase_order" }
-          : { taxRate: null, taxRateSource: null };
+    const hist = bills.of(r._id, [r.name, ...nick]);
+    const gst = lastGst.has(raw)
+      ? { taxRate: lastGst.get(raw), taxRateSource: "purchase_order" }
+      : num(hist.taxRate)
+        ? { taxRate: hist.taxRate, taxRateSource: "bill" }
+        : { taxRate: null, taxRateSource: null };
     const base = {
       _id: r._id,
       sku: r.sku || "",
       aliases: nick,
-      hsnCode: twin?.hsnCode || "",
-      hsnSource: twin?.hsnCode ? "tally" : null,
-      baseUnit: r.customUnit || r.unit || twin?.baseUnit || "Nos",
+      hsnCode: hist.hsnCode || "",
+      hsnSource: hist.hsnCode ? "bill" : null,
+      baseUnit: r.customUnit || r.unit || "Nos",
       category: r.customCategory || r.category || "",
       detail: [r.customCategory || r.category, r.sku].filter(Boolean).join(" · "),
-      source: twin ? "cms_raw+tally" : "cms_raw",
+      source: "cms_raw",
       ...gst,
     };
     const supplierPrice = (v) => {
@@ -237,19 +269,17 @@ function purchaseCatalogue(rawItems, tallyRows, poLines) {
       const primary = r.primaryVendor
         ? list.find((n) => String(n.vendor) === String(r.primaryVendor) && num(n.price))
         : null;
-      const any = list.find((n) => num(n.price));
-      return num((primary || any)?.price);
+      return num((primary || list.find((n) => num(n.price)))?.price);
     };
     const priceOf = (v) => {
       const vid = v?._id ? String(v._id) : "";
       if (vid && lastPrice.has(`${raw}|${vid}`))
         return { standardCost: lastPrice.get(`${raw}|${vid}`), priceSource: "purchase_order" };
-      const sp = v ? supplierPrice(v) : null;
-      if (sp) return { standardCost: sp, priceSource: "supplier" };
       if (lastPrice.has(`${raw}|`))
         return { standardCost: lastPrice.get(`${raw}|`), priceSource: "purchase_order" };
-      if (twin && num(twin.standardCost))
-        return { standardCost: num(twin.standardCost), priceSource: "tally" };
+      const sp = v ? supplierPrice(v) : null;
+      if (sp) return { standardCost: sp, priceSource: "supplier" };
+      if (num(hist.rate)) return { standardCost: hist.rate, priceSource: "bill" };
       return { standardCost: null, priceSource: null };
     };
 
@@ -271,7 +301,7 @@ function purchaseCatalogue(rawItems, tallyRows, poLines) {
       }
       continue;
     }
-    const one = priced.find((p) => p.standardCost) || { ...priceOf(variants[0]) };
+    const one = priced.find((p) => p.standardCost) || priceOf(variants[0]);
     out.push({
       ...base,
       name: r.name,
@@ -281,22 +311,21 @@ function purchaseCatalogue(rawItems, tallyRows, poLines) {
       priceSource: one.priceSource ?? null,
     });
   }
-  for (const t of tallyRows)
-    if (!tally.used.has(String(t._id))) out.push(tallyOnlyRow(t, "standardCost"));
   return out;
 }
 
-/** A search box filter over the built rows (names, aliases, HSN, SKU, reference). */
+/** A search box filter over the built rows (names, aliases, HSN, SKU, reference, PI). */
 function matchesQuery(row, q) {
   if (!q) return true;
   const needle = String(q).toLowerCase();
-  return [row.name, row.productName, row.hsnCode, row.sku, row.reference, ...(row.aliases || [])]
+  return [row.name, row.productName, row.hsnCode, row.sku, row.reference, row.piNumber, ...(row.aliases || [])]
     .some((v) => String(v || "").toLowerCase().includes(needle));
 }
 
 module.exports = {
   salesCatalogue,
   purchaseCatalogue,
+  billHistory,
   garmentSlabRate,
   parseTaxRate,
   variantLabelOf,

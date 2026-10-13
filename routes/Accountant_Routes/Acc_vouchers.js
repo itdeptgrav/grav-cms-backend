@@ -469,7 +469,9 @@ function pickGstRate(candidates, fallback = 18) {
 const {
   salesCatalogue,
   purchaseCatalogue,
+  billHistory,
   matchesQuery,
+  norm,
 } = require("../../services/accounting/voucherItemCatalogue");
 
 function loadCMSStockItem() {
@@ -649,33 +651,91 @@ async function applyPurchaseOrderProvenance(body) {
   };
 }
 
-/* The sales-side item list. Built by services/accounting/voucherItemCatalogue
-   — read its header for where each figure comes from and why (13 Oct 2026). */
+/* The sales-side item list, from the CMS only — services/accounting/
+   voucherItemCatalogue says where each figure comes from (13 Oct 2026).
+   ?customerLedgerId= puts that customer's PI lines first. */
+
+/** The latest bills' item lines for this company, latest first. */
+async function voucherLinesFor(companyId, types) {
+  const vouchers = await Acc_Voucher.find({
+    companyId,
+    voucherType: { $in: types },
+    status: { $nin: ["cancelled", "void"] },
+    "inventoryEntries.0": { $exists: true },
+  })
+    .sort({ voucherDate: -1, createdAt: -1 })
+    .limit(3000)
+    .select("inventoryEntries.stockItemId inventoryEntries.stockItemName inventoryEntries.rate inventoryEntries.taxRate inventoryEntries.taxAmount inventoryEntries.hsnCode inventoryEntries.isCharge")
+    .lean();
+  const lines = [];
+  for (const v of vouchers) for (const l of v.inventoryEntries || []) lines.push(l);
+  return lines;
+}
+
+/** The CMS customer behind an accounting customer ledger, if any. */
+async function cmsCustomerOf(companyId, ledgerId) {
+  if (!ledgerId || !mongoose.Types.ObjectId.isValid(String(ledgerId))) return null;
+  const led = await Acc_Ledger.findOne({ _id: ledgerId, companyId })
+    .select("name linkedCustomerId")
+    .lean();
+  if (!led) return null;
+  return { customerId: led.linkedCustomerId ? String(led.linkedCustomerId) : null, name: led.name || "" };
+}
+
 router.get("/stock-items", auth, companyScope, async (req, res) => {
   try {
-    const { companyId, q, limit = 2000 } = req.query;
+    const { companyId, q, limit = 3000, customerLedgerId } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
-    const lim = parseInt(limit) || 2000;
-
+    const lim = parseInt(limit) || 3000;
     const CMSStockItem = loadCMSStockItem();
-    const products = CMSStockItem
-      ? await CMSStockItem.find({})
-          .sort({ name: 1 })
-          .select(
-            "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory isActive deletedAt variants._id variants.attributes variants.salesPrice variants.status",
-          )
-          .lean()
-      : [];
-    const tallyRows = await Acc_StockItem.find({ companyId, isActive: true })
-      .sort({ name: 1 })
-      .select("name aliases hsnCode taxRate baseUnit standardSellingPrice standardCost closingQuantity")
-      .lean();
+    let CustomerRequest = null;
+    try {
+      CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+    } catch { /* no PI module in this deployment */ }
 
-    const items = salesCatalogue(products, tallyRows)
-      .filter((r) => matchesQuery(r, q))
+    const [products, lines, requests, customer] = await Promise.all([
+      CMSStockItem
+        ? CMSStockItem.find({})
+            .sort({ name: 1 })
+            .select(
+              "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory isActive deletedAt variants._id variants.attributes variants.salesPrice variants.status",
+            )
+            .lean()
+        : [],
+      voucherLinesFor(companyId, ["sales", "credit_note"]),
+      CustomerRequest
+        ? CustomerRequest.find({ "quotations.0": { $exists: true } })
+            .sort({ createdAt: -1 })
+            .limit(2000)
+            .select("customerId customerInfo.name quotations.quotationNumber quotations.status quotations.createdAt quotations.items.stockItemId quotations.items.itemName quotations.items.description quotations.items.hsnCode quotations.items.unitPrice quotations.items.gstPercentage")
+            .lean()
+        : [],
+      cmsCustomerOf(companyId, customerLedgerId),
+    ]);
+
+    /* A customer's PI is theirs by the CMS customer the ledger is linked to,
+       or — for a ledger never linked — by the same name. */
+    const isCustomers = (r) =>
+      !!customer &&
+      ((customer.customerId && String(r.customerId || "") === customer.customerId) ||
+        (!customer.customerId && norm(r.customerInfo?.name) && norm(r.customerInfo?.name) === norm(customer.name)));
+    const piLines = [];
+    const quotes = [];
+    for (const r of requests)
+      for (const qt of r.quotations || []) {
+        if (qt.status === "rejected") continue;
+        quotes.push({ r, qt });
+      }
+    quotes.sort((a, b) => new Date(b.qt.createdAt || 0) - new Date(a.qt.createdAt || 0));
+    for (const { r, qt } of quotes)
+      for (const it of qt.items || [])
+        piLines.push({ ...it, quotationNumber: qt.quotationNumber || "", forCustomer: isCustomers(r) });
+
+    const items = salesCatalogue(products, billHistory(lines), piLines)
+      .filter((row) => matchesQuery(row, q))
       .slice(0, lim);
-    res.json({ items, count: items.length });
+    res.json({ items, count: items.length, customerLinked: !!customer });
   } catch (e) {
     console.error("[stock-items]", e);
     res.status(500).json({ error: e.message });
@@ -2779,28 +2839,22 @@ router.post("/:id/link-po", auth, companyScopeOptional, async (req, res) => {
   }
 });
 
-/* GET /raw-materials — the purchase-side item list. Built by
-   services/accounting/voucherItemCatalogue (13 Oct 2026). */
+/* GET /raw-materials — the purchase-side item list, from the CMS only
+   (services/accounting/voucherItemCatalogue, 13 Oct 2026). */
 router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
   try {
-    const { companyId, q, limit = 2000 } = req.query;
-    const lim = parseInt(limit) || 2000;
+    const { companyId, q, limit = 3000 } = req.query;
+    const lim = parseInt(limit) || 3000;
     const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
     const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
 
-    const [rawItems, tallyRows, orders] = await Promise.all([
+    const [rawItems, orders, lines] = await Promise.all([
       RawItem.find({})
         .sort({ name: 1 })
         .select(
           "name sku unit customUnit category customCategory vendorNicknames primaryVendor variants._id variants.combination variants.vendorNicknames",
         )
         .lean(),
-      companyId
-        ? Acc_StockItem.find({ companyId, isActive: true })
-            .sort({ name: 1 })
-            .select("name aliases hsnCode taxRate baseUnit standardCost")
-            .lean()
-        : [],
       /* The latest purchase rate per material is what it costs now. Live
          orders only — a cancelled or draft order's rate was never paid. */
       PurchaseOrder.find({ status: { $nin: ["CANCELLED", "Cancelled", "DRAFT", "Draft"] } })
@@ -2808,11 +2862,12 @@ router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
         .select("items.rawItem items.variantId items.unitPrice items.gstRate")
         .limit(1000)
         .lean(),
+      companyId ? voucherLinesFor(companyId, ["purchase", "debit_note"]) : [],
     ]);
     const poLines = [];
     for (const o of orders) for (const l of o.items || []) poLines.push(l);
 
-    const items = purchaseCatalogue(rawItems, tallyRows, poLines)
+    const items = purchaseCatalogue(rawItems, billHistory(lines), poLines)
       .filter((r) => matchesQuery(r, q))
       .slice(0, lim);
     res.json({ items, count: items.length });
