@@ -2182,3 +2182,42 @@ list, the GRN book and my-day were read with such a record present.
 Checked 13 Oct 2026 on the owner's STAR CRATE label (GRN/2026-27/0001,
 PO/2026-27/0013): accepted as "SL CR-1 · 5 Nos", the record carried no
 order and the GRN number, then it was deleted.
+
+## Split one requested MRF line into several (13 Oct 2026, owner)
+
+"Button (18L & 14L), 2 Pcs" is one line to the requester and two products to
+the Store. `services/mrfItemSplit.service.js` is every rule; two routes on
+`mrfRoutes.js` (MRF_FULFIL, idempotent, `may(req, "MATCH")`, store-actionable
+requests only):
+
+- `POST /:id/items/:itemId/split` `{ parts: [{ quantity, rawItemId?, variantId? }] }`
+  → the line keeps its `_id`, history and approval and becomes part 1; parts
+  2..N are new lines spliced in right after it. Quantities must add up to the
+  line's `requestedQty` (2–20 parts). A part naming a product is matched on
+  the way with `applyCatalogueMatch` — the SAME assignment the match route now
+  calls (matched unit wins, APPROVED, free-text category/attributes dropped);
+  a product with variants needs one of ITS variants. Matched parts get an
+  auto-reservation attempt (`LINE_MATCHED`). Event `ITEM_SPLIT`, one
+  `SpActionHistory` entry, a notification to the requester.
+- `POST /:id/items/:itemId/unsplit` (any part names the group) → the original
+  line back exactly (`split.original` snapshot), the other parts removed.
+  Event `ITEM_SPLIT_UNDONE`.
+- **Refused** (`splitRefusal` / `undoRefusal`, each with what to do): not
+  UNMATCHED/APPROVED, not approved, anything issued/returned/consumed,
+  customer-supplied, a purchase form / `buyQty`, a live PO line
+  (`sourceMrfLineId`), an ACTIVE `StockReservation` (release it first).
+  Undo also needs every part untouched.
+- **`MRF.items[].split`** `{ groupId, originalQty, originalUnit, originalName,
+  at, by, byName, original? }` — `groupId` is the original line's `_id` on every
+  part; `original` only on that line. A part split again joins the same group.
+- **Approval stays true across parts**: approved quantities add up to what was
+  approved; what was asked and what was cut stay on the original line (part 1's
+  `approval.requestedQty` = asked − the other parts). Lines with no recorded
+  approval keep deriving it from the request.
+- Every part restarts its availability report and auto-reservation record.
+- `/stock-check` adds `splitCheck` per line (`canSplit`, `reason`, and on the
+  original `canUndo`, `undoReason`) — the server alone knows the
+  reservations and PO lines (`lineBlockers`).
+
+Tests: `test/store-purchase/mrf-item-split.route.test.js` (10). The four
+failures in `mrf-chat-legacy-numbering` and `mrf-tenancy` are identical at HEAD.
