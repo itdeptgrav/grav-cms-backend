@@ -45,7 +45,10 @@ const schema = new mongoose.Schema(
     hourKey: { type: String, default: "" },                   // shiftHours bucket key
 
     /* against which order */
-    manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", required: true, index: true },
+    /* OPTIONAL since 13 Oct 2026 (owner): a roll from an ordinary purchase
+       GRN, or a label printed from stock, is checked too — recorded against
+       the goods receipt (below) or the label alone, with no order. */
+    manufacturingOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "CustomerRequest", default: null, index: true },
     moNumber:     { type: String, default: "", trim: true },
     customerName: { type: String, default: "", trim: true },
     isJobWork:    { type: Boolean, default: false },

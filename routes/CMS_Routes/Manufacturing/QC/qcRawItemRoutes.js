@@ -586,17 +586,22 @@ router.post("/lookup", requireOwnerOrChecker, async (req, res) => {
     if (!mo) {
       const priors = await QCRawItemInspection.find({ barcodeId: b._id, superseded: { $ne: true } })
         .select("moNumber status inspectedAt inspectedByName").lean();
+      /* A verdict recorded with NO order (13 Oct 2026, owner): the standing
+         one for this label alone, so a re-check replaces it rather than
+         stacking a second. The ceiling travels too, as on the order path. */
+      const labelPrior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: null, superseded: { $ne: true } });
+      const ceiling0 = b.rawItem ? await RawItem.findById(b.rawItem).select("maxDefectPoints").lean().catch(() => null) : null;
       return res.json({
         success: true,
-        sticker: { ...stickerView(b), ...src },
+        sticker: { ...stickerView(b), ...src, maxDefectPoints: ceiling0?.maxDefectPoints ?? null },
         goodsReceipt: receipt,
         grnChoices: resolution?.grnChoices || (receipt ? [] : await qcGrns.grnsForMaterial({ rawItemId: b.rawItem, variantId: b.variantId })),
         order: null,
         orders: resolution?.candidates || [],
         orderResolution: resolution?.resolution || "none",
         orderReason: resolution?.reason || "",
-        prior: null,
-        warnings: priors.length ? [`Already checked on ${priors.map((p) => p.moNumber).join(", ")}.`] : [],
+        prior: labelPrior ? recordView(labelPrior) : null,
+        warnings: priors.filter((p) => p.moNumber).length ? [`Already checked on ${priors.filter((p) => p.moNumber).map((p) => p.moNumber).join(", ")}.`] : [],
       });
     }
 
@@ -656,10 +661,16 @@ router.post("/save", requireChecker, async (req, res) => {
   let session = null;
   try {
     const { moId, barcodeId, status, defects, defectiveQuantity, note, recheck, goodsReceiptId, serialNo, actualQuantity } = req.body || {};
-    if (!isId(moId)) return res.status(400).json({ success: false, message: "Choose the order first." });
+    /* ── NO ORDER IS NOT A REFUSAL ANY MORE (13 Oct 2026, owner) ─────────
+       "Even a normal PO-based GRN from the Store still needs its QC." A label
+       that no live order needs is checked all the same: the verdict is
+       recorded against its goods receipt when it has one, else against the
+       label alone, with `manufacturingOrderId: null`. When an order IS
+       named it must exist. */
+    if (moId !== undefined && moId !== null && moId !== "" && !isId(moId)) return res.status(400).json({ success: false, message: "That order reference is not valid." });
     if (!isId(barcodeId)) return res.status(400).json({ success: false, message: "Scan the raw item first." });
     if (!["passed", "defective"].includes(status)) return res.status(400).json({ success: false, message: "Pass the raw item, or mark a defect." });
-    const [b, mo, who] = await Promise.all([Barcode.findById(barcodeId).lean(), CustomerRequest.findById(moId).select(MO_SELECT).lean(), whoAmI(req)]);
+    const [b, mo, who] = await Promise.all([Barcode.findById(barcodeId).lean(), isId(moId) ? CustomerRequest.findById(moId).select(MO_SELECT).lean() : null, whoAmI(req)]);
     if (!b) return res.status(404).json({ success: false, message: "No raw item with that label is on record." });
     let receipt = await qcGrns.receiptOfLabel(b);
     /* ── A GOODS RECEIPT THE CHECKER CHOSE (8 Oct 2026, owner) ────────────────
@@ -676,10 +687,14 @@ router.post("/save", requireChecker, async (req, res) => {
       receipt = await qcGrns.receiptById(goodsReceiptId, b);
       linkLabel = Boolean(receipt);
     }
-    if (!mo) return res.status(404).json({ success: false, message: "That order was not found." });
+    if (isId(moId) && !mo) return res.status(404).json({ success: false, message: "That order was not found." });
+    /* the order the verdict is against — the named one, else the receipt's (a material-request GRN), else none */
+    const orderDoc = mo || (receipt?.order?.manufacturingOrderId && isId(receipt.order.manufacturingOrderId)
+      ? await CustomerRequest.findById(receipt.order.manufacturingOrderId).select(MO_SELECT).lean().catch(() => null) : null);
+    const against = orderDoc ? moNumberOf(orderDoc) : (receipt?.receiptNumber || "this label");
 
-    const prior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: mo._id, superseded: { $ne: true } });
-    if (prior && !recheck) return res.status(409).json({ success: false, code: "ALREADY_CHECKED", message: `This raw item was already ${prior.status} on ${moNumberOf(mo)} by ${prior.inspectedByName || "QC"}. Check it again to replace that verdict.`, prior: recordView(prior) });
+    const prior = await QCRawItemInspection.findOne({ barcodeId: b._id, manufacturingOrderId: orderDoc ? orderDoc._id : null, superseded: { $ne: true } });
+    if (prior && !recheck) return res.status(409).json({ success: false, code: "ALREADY_CHECKED", message: `This raw item was already ${prior.status} on ${against} by ${prior.inspectedByName || "QC"}. Check it again to replace that verdict.`, prior: recordView(prior) });
 
     /* The label's figure already had the earlier verdict's defect taken off
        it. A re-check judges the WHOLE label again, so that figure is put back
@@ -739,7 +754,7 @@ router.post("/save", requireChecker, async (req, res) => {
     const actor = { id: who.id || req.qcUser?.id, name: who.name, email: who.email };
     const fields = {
       date: shift.istDayKeyOf(now), hourKey: shift.shiftBuckets()[shift.bucketIndexOf(now)]?.key || "",
-      manufacturingOrderId: mo._id, moNumber: moNumberOf(mo), customerName: mo.customerInfo?.name || "", isJobWork: isJobWork(mo),
+      manufacturingOrderId: orderDoc ? orderDoc._id : null, moNumber: orderDoc ? moNumberOf(orderDoc) : "", customerName: orderDoc ? (orderDoc.customerInfo?.name || "") : (receipt?.order?.customerName || receipt?.supplierName || ""), isJobWork: orderDoc ? isJobWork(orderDoc) : false,
       barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantId: b.variantId || null, variantLabel: (b.variantCombination || []).join(" · "), quantity: actual, unit: b.unit || "", purchaseOrderNumber: b.purchaseOrderNumber || "", vendorName: b.vendorName || "",
       /* the GRN the label was received under (8 Oct 2026), so the GRN book can
          say how much of each receipt is checked */
@@ -782,7 +797,7 @@ router.post("/save", requireChecker, async (req, res) => {
     };
     if (session) await session.withTransaction(work); else await work();
 
-    const rl = (await rollups([String(mo._id)])).get(String(mo._id)) || ZERO;
+    const rl = orderDoc ? ((await rollups([String(orderDoc._id)])).get(String(orderDoc._id)) || ZERO) : ZERO;
     const sd = doc.stockDebit;
     const warnings = [];
     let stockLine = "";

@@ -1958,3 +1958,21 @@ defect points; QC shows it and suggests Accept or Reject."
   temporary ceiling of 10 and two temporary reasons: SL R-7, actual 18 of
   20, 10 points, Reject; the record read back with every field, then it,
   the reasons and the ceiling were removed.
+
+## A raw-material verdict no longer needs an order (13 Oct 2026, owner)
+
+"Even a normal PO-based GRN from the Store still needs its QC." A label that
+no live order needs — a purchase GRN's roll, or one printed from stock — is
+checked all the same. `QCRawItemInspection.manufacturingOrderId` is
+optional (default null). `POST /raw-items/save` takes no `moId`: the
+verdict is recorded against the label's goods receipt (`goodsReceipt*`
+fields, `customerName` = the receipt's order's customer or the supplier),
+or against the label alone; a named order must still exist. The standing
+verdict for a re-check is keyed on `{ barcodeId, manufacturingOrderId:
+null }` when there is no order. `POST /lookup`'s no-order answer now
+carries `sticker.maxDefectPoints` and that label-level `prior`. The order
+rollups are skipped (`ZERO`) when there is no order; the report, the order
+list, the GRN book and my-day were read with such a record present.
+Checked 13 Oct 2026 on the owner's STAR CRATE label (GRN/2026-27/0001,
+PO/2026-27/0013): accepted as "SL CR-1 · 5 Nos", the record carried no
+order and the GRN number, then it was deleted.
