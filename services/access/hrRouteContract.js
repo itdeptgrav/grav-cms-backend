@@ -322,6 +322,10 @@ const DECLARATIONS = [
 
   /* Shift Management (routes/HrRoutes/ShiftMaster_section.js) — named shift
      definitions. The page shipped calling these and they did not exist. */
+  /* Overtime: HR decides after the manager (13 Oct 2026). Deciding writes the next day's attendance (the grace), so it is the correction capability, and an editor's decision is held for an approver. */
+  D("GET", "/api/hr/overtime", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
+  D("PATCH", "/api/hr/overtime/:id/hr-approve", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
+  D("PATCH", "/api/hr/overtime/:id/hr-reject", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("GET", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
   D("POST", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("PUT", "/api/hr/attendance/shifts/:id", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
@@ -422,6 +426,9 @@ const DECLARATIONS = [
   /* Prototype only: advisory output is never persisted and cannot move a
      candidate or make a hiring decision. Running inference is a manage action. */
   D("GET", "/api/hr/ai-interview-lab/health", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter" }),
+  /* The interview's opening question. It shipped undeclared, so the contract
+     refused it for everybody and the lab could not start (found 13 Oct 2026). */
+  D("POST", "/api/hr/ai-interview-lab/opening", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/follow-up", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/score", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/turn", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),

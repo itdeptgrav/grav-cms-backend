@@ -29,6 +29,7 @@ const Employee = require("../../models/Employee");
 const OvertimeReport = require("../../models/HR_Models/OvertimeReport");
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const { uploadToGoogleDrive } = require("../../services/mediaUpload.service");
+const { cctvProofUpload, storeCctvProof, CCTV_REQUIRED } = require("../../services/approvalProof");
 const {
   dateStrIST,
   minsSinceMidnightIST,
@@ -187,6 +188,71 @@ async function detectStayOver(biometricId, dateStr) {
 //  GET /overtime/check — Employee checks pending OT reports
 //  Looks back 7 days INCLUDING today. Skips submitted + expired.
 // ════════════════════════════════════════════════════════════════════════════
+/**
+ * Apply an approved report's grace to the NEXT day's attendance (13 Oct 2026:
+ * moved out of the manager route — HR's approval is what applies it now).
+ * Sets report.graceApplied / graceAppliedAt; the caller saves the report.
+ */
+async function applyOvertimeGrace(report, approverName) {
+  if (report.graceMinutes > 0 && report.nextDateStr) {
+    try {
+      const nextDay = await DailyAttendance.findOne({
+        dateStr: report.nextDateStr,
+      });
+      if (nextDay) {
+        const idx = (nextDay.employees || []).findIndex(
+          (e) => e.biometricId === report.biometricId,
+        );
+        if (idx !== -1) {
+          const entry = nextDay.employees[idx];
+          entry.overtimeGraceMinutes = report.graceMinutes;
+          entry.overtimeGraceFrom = report.dateStr;
+          entry.overtimeReportId = report._id;
+
+          const wasLate =
+            entry.isLate ||
+            entry.systemPrediction === "LT" ||
+            entry.systemPrediction === "L";
+          const lateByMins = entry.lateMins || 0;
+
+          if (wasLate && lateByMins <= report.graceMinutes) {
+            entry.isLate = false;
+            entry.lateMins = 0;
+            entry.lateAdjusted = true;
+            entry.systemPrediction = "P";
+            entry.hrFinalStatus = "P";
+            entry.hrReviewedAt = new Date();
+            entry.hrRemarks = `Overtime grace: ${report.graceMinutes}min grace from OT on ${report.dateStr} (approved by ${approverName})`;
+            console.log(
+              `[OT-GRACE] ✓ ${report.employeeName}: Late ${lateByMins}min ≤ grace ${report.graceMinutes}min → PRESENT on ${report.nextDateStr}`,
+            );
+          } else if (wasLate && lateByMins > report.graceMinutes) {
+            const adjustedLate = lateByMins - report.graceMinutes;
+            entry.lateMins = adjustedLate;
+            entry.lateAdjusted = true;
+            entry.hrRemarks = `Overtime grace: ${report.graceMinutes}min grace, remaining late: ${adjustedLate}min (OT ${report.dateStr}, approved by ${approverName})`;
+            console.log(
+              `[OT-GRACE] ~ ${report.employeeName}: reduced to ${adjustedLate}min late on ${report.nextDateStr}`,
+            );
+          } else {
+            entry.hrRemarks =
+              (entry.hrRemarks || "") +
+              ` | Overtime grace: ${report.graceMinutes}min from OT ${report.dateStr}`;
+          }
+
+          nextDay.markModified("employees");
+          await nextDay.save();
+          report.graceApplied = true;
+          report.graceAppliedAt = new Date();
+        }
+      }
+    } catch (e) {
+      console.error("[OT-GRACE] Apply failed:", e.message);
+    }
+  }
+
+}
+
 router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const emp = await Employee.findById(req.user.id)
@@ -477,7 +543,9 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
     })
       .sort({ createdAt: -1 })
       .lean();
-    res.json({ success: true, data: reports });
+    /* Every manager on an overtime report decides alone, so whoever approves
+       hands it to HR — and must attach the CCTV proof (13 Oct 2026). */
+    res.json({ success: true, data: reports.map((r) => ({ ...r, needsCctvProof: true })) });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
   }
@@ -489,6 +557,7 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
 router.patch(
   "/manager/:id/approve",
   AllEmployeeAppMiddleware,
+  cctvProofUpload,
   async (req, res) => {
     try {
       const report = await OvertimeReport.findOne({
@@ -507,130 +576,63 @@ router.patch(
         .lean();
       const mgrName = mgr ? `${mgr.firstName} ${mgr.lastName}`.trim() : "HOD";
 
+      /* CCTV proof is required from the approving manager (13 Oct 2026). */
+      if (!req.file && !report.cctvProof?.url) return res.status(400).json(CCTV_REQUIRED);
+      if (req.file) {
+        report.cctvProof = await storeCctvProof(req.file, {
+          prefix: "OT",
+          who: report.employeeName,
+          dateStr: report.dateStr,
+          approverId: req.user.id,
+          approverName: mgrName,
+        });
+      }
+
+      /* 13 Oct 2026, owner: "HR should always ask for approval". The
+         manager's approval no longer applies the grace — the report waits for
+         HR (HR › Attendance › Overtime, routes/HrRoutes/Overtime_HR.js), and
+         HR's approval is what applies it to the next day. */
       const beforeStatus = report.status;
-      report.status = "manager_approved";
+      report.status = "awaiting_hr";
       report.approvedBy = req.user.id;
       report.approvedByName = mgrName;
       report.approvedAt = new Date();
-      report.approvalRemarks = req.body.remarks || "";
-
-      if (report.graceMinutes > 0 && report.nextDateStr) {
-        try {
-          const nextDay = await DailyAttendance.findOne({
-            dateStr: report.nextDateStr,
-          });
-          if (nextDay) {
-            const idx = (nextDay.employees || []).findIndex(
-              (e) => e.biometricId === report.biometricId,
-            );
-            if (idx !== -1) {
-              const entry = nextDay.employees[idx];
-              entry.overtimeGraceMinutes = report.graceMinutes;
-              entry.overtimeGraceFrom = report.dateStr;
-              entry.overtimeReportId = report._id;
-
-              const wasLate =
-                entry.isLate ||
-                entry.systemPrediction === "LT" ||
-                entry.systemPrediction === "L";
-              const lateByMins = entry.lateMins || 0;
-
-              if (wasLate && lateByMins <= report.graceMinutes) {
-                entry.isLate = false;
-                entry.lateMins = 0;
-                entry.lateAdjusted = true;
-                entry.systemPrediction = "P";
-                entry.hrFinalStatus = "P";
-                entry.hrReviewedAt = new Date();
-                entry.hrRemarks = `HOD overwrite: ${report.graceMinutes}min grace from OT on ${report.dateStr} (approved by ${mgrName})`;
-                console.log(
-                  `[OT-GRACE] ✓ ${report.employeeName}: Late ${lateByMins}min ≤ grace ${report.graceMinutes}min → PRESENT on ${report.nextDateStr}`,
-                );
-              } else if (wasLate && lateByMins > report.graceMinutes) {
-                const adjustedLate = lateByMins - report.graceMinutes;
-                entry.lateMins = adjustedLate;
-                entry.lateAdjusted = true;
-                entry.hrRemarks = `HOD overwrite: ${report.graceMinutes}min grace, remaining late: ${adjustedLate}min (OT ${report.dateStr}, approved by ${mgrName})`;
-                console.log(
-                  `[OT-GRACE] ~ ${report.employeeName}: reduced to ${adjustedLate}min late on ${report.nextDateStr}`,
-                );
-              } else {
-                entry.hrRemarks =
-                  (entry.hrRemarks || "") +
-                  ` | HOD grace: ${report.graceMinutes}min from OT ${report.dateStr}`;
-              }
-
-              nextDay.markModified("employees");
-              await nextDay.save();
-              report.graceApplied = true;
-              report.graceAppliedAt = new Date();
-            }
-          }
-        } catch (e) {
-          console.error("[OT-GRACE] Apply failed:", e.message);
-        }
-      }
-
+      report.approvalRemarks = req.body?.remarks || "";
       await report.save();
 
       try {
         const io = req.app.get("io");
         if (io) {
           io.to(String(report.employeeId)).emit("overtime_notification", {
-            type: "overtime_approved",
+            type: "overtime_manager_approved",
             reportId: report._id.toString(),
             dateStr: report.dateStr,
-            graceMinutes: report.graceMinutes,
-            graceApplied: report.graceApplied,
-            message: report.graceApplied
-              ? `Overtime approved! ${report.graceMinutes}min grace applied to ${report.nextDateStr}.`
-              : `Overtime report for ${report.dateStr} approved.`,
+            message: `Your overtime for ${report.dateStr} was approved by ${mgrName}. It now waits for the final approval.`,
           });
         }
       } catch (_) {}
 
-      // Whether the grace actually reached the attendance record is the half
-      // that matters and the half that is invisible afterwards: a report can be
-      // approved and apply to nothing (no next-day record yet, the day already
-      // closed), and the employee is then marked late on a morning they were
-      // told they had grace for.
       await auditOvertime(req, {
         entityId: String(report._id),
         entityLabel: otLabel(report),
         action: "approve",
         summary:
           `${mgrName} approved ${report.employeeName}'s overtime for ${report.dateStr} ` +
-          `(${report.stayOverMins} minute(s) over). ` +
-          (report.graceApplied
-            ? `${report.graceMinutes}min grace was applied to ${report.nextDateStr} — they may report by ${report.adjustedReportTime}.`
-            : report.graceMinutes > 0
-              ? `The ${report.graceMinutes}min grace was NOT applied to ${report.nextDateStr}; that day's attendance is unchanged.`
-              : "No grace was due.") +
+          `(${report.stayOverMins} minute(s) over) and attached the CCTV proof. It is with HR now — no grace is applied until HR approves.` +
           `${report.approvalRemarks ? ` Remarks: ${report.approvalRemarks}` : ""}`,
-        before: { status: beforeStatus, graceApplied: false },
-        after: {
-          status: "manager_approved",
-          approvedByName: mgrName,
-          graceApplied: Boolean(report.graceApplied),
-          graceMinutes: report.graceMinutes,
-          approvalRemarks: report.approvalRemarks || "",
-        },
+        before: { status: beforeStatus },
+        after: { status: "awaiting_hr", approvedByName: mgrName, approvalRemarks: report.approvalRemarks || "" },
       });
 
-      // O2 — employee. Fire-and-forget.
       notifyOvertimeApproved(report.employeeId, {
-        body: report.graceApplied
-          ? `${report.graceMinutes}min grace applied for ${report.nextDateStr}. You're marked Present.`
-          : `Your overtime report for ${report.dateStr} was approved by ${mgrName}.`,
+        body: `Your overtime for ${report.dateStr} was approved by ${mgrName}. It now waits for the final approval.`,
         reportId: report._id,
       });
 
       res.json({
         success: true,
         data: report,
-        message: report.graceApplied
-          ? `Approved by HOD. ${report.graceMinutes}min grace applied to ${report.nextDateStr}.`
-          : `Approved. Grace will apply when ${report.nextDateStr} attendance syncs.`,
+        message: "Approved. It now waits for the final approval.",
       });
     } catch (err) {
       res.status(500).json({ success: false, message: err.message });
@@ -887,7 +889,8 @@ async function applyPendingGrace(dateStr) {
   try {
     const reports = await OvertimeReport.find({
       nextDateStr: dateStr,
-      status: "manager_approved",
+      /* Approved by HR (13 Oct 2026) or, before that, by a manager. */
+      status: { $in: ["hr_approved", "manager_approved"] },
       graceApplied: false,
     });
     if (reports.length === 0) return { applied: 0 };
@@ -952,3 +955,4 @@ router.stopOvertimeReminders = stopOvertimeReminders;
 router.applyPendingGrace = applyPendingGrace;
 
 module.exports = router;
+module.exports.applyOvertimeGrace = applyOvertimeGrace;

@@ -311,7 +311,8 @@ describe("9 — employee self-service is record-scoped", () => {
 
 describe("12-16 — the capability separations, end to end", () => {
   test("compensation endpoints require the compensation capability", async () => {
-    const editor = await hrUser("editor");     // has people.read.private, not compensation
+    /* Since 13 Oct 2026 an editor holds compensation.read; a viewer does not. */
+    const editor = await hrUser("viewer");     // no compensation
     const approver = await hrUser("approver"); // has compensation.read
 
     for (const path of [

@@ -1384,6 +1384,8 @@ app.use("/api/hr/overview", hrOverviewRoutes);
 
 // HR › Attendance › Shift Management — named shift definitions.
 app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_section"));
+/* HR's decision on overtime reports — the manager's approval hands them to HR (13 Oct 2026). */
+app.use("/api/hr/overtime", require("./routes/HrRoutes/Overtime_HR"));
 
 // The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
 // /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central

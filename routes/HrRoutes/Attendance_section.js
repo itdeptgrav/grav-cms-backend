@@ -8198,6 +8198,7 @@ router.get("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       pending: all.filter((a) => a.status === "pending").length,
       manager_approved: all.filter((a) => a.status === "manager_approved")
         .length,
+      awaiting_hr: all.filter((a) => a.status === "awaiting_hr").length,
       manager_rejected: all.filter((a) => a.status === "manager_rejected")
         .length,
       hr_approved: all.filter((a) => a.status === "hr_approved").length,
@@ -8383,7 +8384,10 @@ router.patch(
 
       // Only an undecided request can be finalised. Without this gate HR could
       // approve a request no manager has ever seen, or resurrect a rejected one.
-      if (!["pending", "manager_approved"].includes(r.status))
+      /* "awaiting_hr" (13 Oct 2026) is the normal case now: every manager
+         approved, and HR's approval is the one that applies it. HR may still
+         decide one the managers have not finished. */
+      if (!["pending", "manager_approved", "awaiting_hr"].includes(r.status))
         return res.status(400).json({
           success: false,
           code: "INVALID_TRANSITION",
