@@ -9,6 +9,7 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+const { assertYearsOpen } = require("../../services/accounting/fyLock");
 const router = express.Router();
 const {
   Acc_Voucher,
@@ -314,6 +315,10 @@ async function liveNumberClash(
  * so older drafts saved before the rename still apply correctly.
  */
 async function applyLedgerBalances(voucher, direction = 1, session = null) {
+  /* A frozen year's balances never move (13 Oct 2026) — checked here too, so
+     a route that adjusts balances BEFORE the voucher save (which the model
+     guard would refuse) cannot leave a balance changed behind a refusal. */
+  await assertYearsOpen(voucher.companyId, [voucher.voucherDate], "A voucher");
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;

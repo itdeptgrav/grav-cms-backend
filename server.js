@@ -2900,6 +2900,10 @@ app.use(
 );
 const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
 app.use("/api/accountant/bank-recon", bankReconRoutes);
+/* Freeze / unfreeze financial years (13 Oct 2026). */
+app.use("/api/accountant/fy-locks", require("./routes/Accountant_Routes/Acc_fyLocks"));
+/* The inventory's stock by day / month / year end, for accounts (13 Oct 2026). */
+app.use("/api/accountant/stock-summary", require("./routes/Accountant_Routes/Acc_stockSummary"));
 
 app.use(
   "/api/accountant/voucher-files",
