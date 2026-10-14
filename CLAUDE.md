@@ -2221,3 +2221,29 @@ requests only):
 
 Tests: `test/store-purchase/mrf-item-split.route.test.js` (10). The four
 failures in `mrf-chat-legacy-numbering` and `mrf-tenancy` are identical at HEAD.
+
+## Scan a barcode to match an MRF line (14 Oct 2026, owner)
+
+`GET /api/cms/inventory/mrf/data/raw-items/scan?code=` (mrfRoutes, behind
+`requireTenant`; reads only) turns what the Store's scanner read into the
+product for the Match to Inventory popup, in the same shape as
+`/data/raw-items` (`pickerItem`, now shared by both). Every rule is
+`services/mrfScanMatch.service.js`:
+
+- **our raw-item label** — `itemid=`, `RawItem=`, the label URL, the bare id —
+  parsed with QC's `rawMaterialIdOf`; answers the label's material AND
+  variant (`via: "label"`, `label: {quantity, unit}`; `variantGone` when the
+  item lost that variant). A **VOIDED** label is refused with
+  `identityRefusal`'s message.
+- a **raw item's own id** (`via: "item-id"`).
+- an **exact SKU**, item or variant, case and surrounding spaces ignored, the
+  code regex-escaped (`via: "item-sku" | "variant-sku"`). Variant SKUs are
+  NOT unique (20 repeats on 14 Oct 2026): several matches answer
+  `reason: "AMBIGUOUS"` with `candidates`, never a guess.
+- a shelf `loc=LOC-` label → `LOCATION_LABEL`; anything else → `NOT_FOUND`
+  with the code in the message. Empty → 400.
+
+Scoped with `tenantFilter` folded into `$and` (the read-through filter is an
+`$or`, so it must not be spread beside another `$or`) — another company's
+label or SKU is not found. Tests:
+`test/store-purchase/mrf-scan-match.route.test.js` (8).

@@ -80,6 +80,7 @@ const customerSuppliedRouting = require("../../../../services/storePurchase/cust
 const reservationSvc = require("../../../../services/storePurchase/reservation.service");
 const StockReservation = require("../../../../models/CMS_Models/Inventory/Operations/StockReservation");
 const itemSplit = require("../../../../services/mrfItemSplit.service");
+const scanMatch = require("../../../../services/mrfScanMatch.service");
 const { resolveConversion } = require("../../../../services/storePurchase/goodsReceipt.service");
 
 const MRF_ENTITY = "MRF";
@@ -478,20 +479,46 @@ router.get("/data/raw-items", async (req, res) => {
       .select("name sku unit customUnit quantity variants")
       .sort({ name: 1 }).limit(50).lean();
     const unitMap = await buildUnitConversions();
-    const formatted = items.map(item => {
-      const baseUnit = item.customUnit || item.unit || "unit";
-      return {
-        _id: item._id, name: item.name, sku: item.sku, baseUnit,
-        quantity: item.quantity || 0,
-        conversions: unitMap[baseUnit] || [],
-        variants: (item.variants || []).map(v => ({
-          _id: v._id, combination: v.combination || [],
-          quantity: v.quantity || 0, sku: v.sku || "", status: v.status || "Out of Stock",
-        })),
-      };
-    });
+    const formatted = items.map(item => pickerItem(item, unitMap));
     res.json({ success: true, rawItems: formatted });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+/* One product as the Match to Inventory popup reads it — the search above and
+   the scan below answer in the same shape. */
+function pickerItem(item, unitMap) {
+  const baseUnit = item.customUnit || item.unit || "unit";
+  return {
+    _id: item._id, name: item.name, sku: item.sku, baseUnit,
+    quantity: item.quantity || 0,
+    conversions: unitMap[baseUnit] || [],
+    variants: (item.variants || []).map(v => ({
+      _id: v._id, combination: v.combination || [],
+      quantity: v.quantity || 0, sku: v.sku || "", status: v.status || "Out of Stock",
+    })),
+  };
+}
+
+// ── GET /data/raw-items/scan?code= ────────────────────────────────────────────
+/* A scanned barcode → the product (and variant) for the Match to Inventory
+   popup (14 Oct 2026, owner). A raw-item label, a raw item's id, or an exact
+   item / variant SKU; several products on one SKU come back as candidates.
+   Reads only, scoped to the caller's company. services/mrfScanMatch.service.js
+   holds every rule. */
+router.get("/data/raw-items/scan", async (req, res) => {
+  try {
+    const code = String(req.query.code || "").trim();
+    if (!code) return res.status(400).json({ success: false, message: "Scan a barcode first." });
+    if (code.length > 300) return res.status(400).json({ success: false, message: "That code is too long to be a barcode." });
+    const unitMap = await buildUnitConversions();
+    const answer = await scanMatch.matchScannedCode({
+      code,
+      tenantFilter: tenantContext.tenantFilter(req.tenant),
+      RawItem, Barcode,
+      format: (item) => pickerItem(item, unitMap),
+    });
+    res.json({ success: true, ...answer });
+  } catch (e) { sendError(res, e); }
 });
 
 // ── GET /data/employees ───────────────────────────────────────────────────────
