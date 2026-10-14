@@ -15,6 +15,14 @@
  * disclosure and not a caching bug: if `conditionalGet` hashed the body before
  * the scrub, two callers with different capabilities would share an ETag and a
  * 304 could hand one of them the other's body.
+ *
+ * (14 Oct 2026, owner: no role tiers in the employee section) On the employee
+ * routes (/api/employees/*) every HR user now receives the same body — pay,
+ * bank details, identifiers and medical fields included — so the "a viewer
+ * gets less" assertions there became "a viewer gets it all, never a
+ * credential", and the tier-separation assertions moved to routes outside the
+ * section (attendance, leaves) where the tiers still apply. The CEO projection
+ * is not an HR user and still receives none of it, on the employee routes too.
  */
 
 const express = require("express");
@@ -113,9 +121,12 @@ async function get(path, token, headers = {}) {
 }
 
 describe("the response scrub", () => {
-  test("a viewer's directory response carries no protected value", async () => {
+  test("a viewer's response OUTSIDE the employee section carries no protected value", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) This was
+       pinned on /api/employees/all, which now gives a viewer everything. The
+       floor is unchanged everywhere else, so it is pinned on attendance. */
     const token = await hrUser("viewer");
-    const r = await get("/api/employees/all", token);
+    const r = await get("/hr/attendance/daily", token);
 
     expect(r.status).toBe(200);
     expect(r.text).not.toMatch(/45000|1234567890|1111 2222 3333|ABCDE1234F|Welcome@123|\$2a\$10/);
@@ -132,19 +143,57 @@ describe("the response scrub", () => {
     expect(r.body.data.documents.resumeFile.url).toBe("https://example.test/cv.pdf");
   });
 
-  /* Since 13 Oct 2026 an editor reads pay too (owner request); a viewer does not. */
-  test("an editor gets identity, identifiers and pay; a viewer gets no pay", async () => {
-    const token = await hrUser("editor");
-    const r = await get("/api/employees/60c0000000000000000000aa", token);
+  test.each(["viewer", "editor", "approver", "owner"])(
+    "an HR %s receives the whole employee — pay, bank, identifiers, medical — and never a credential",
+    async (role) => {
+      /* (14 Oct 2026, owner: no role tiers in the employee section) Until today
+         a viewer got no pay here. */
+      const token = await hrUser(role);
+      for (const path of ["/api/employees/all", "/api/employees/60c0000000000000000000aa"]) {
+        const r = await get(path, token);
+        expect({ path, status: r.status }).toEqual({ path, status: 200 });
+        expect(r.body.data.salary.gross).toBe("enc:45000");
+        expect(r.body.data.salaryCustomFields[0].value).toBe("enc:1000");
+        expect(r.body.data.bankDetails.accountNumber).toBe("1234567890");
+        expect(r.body.data.documents.aadharNumber).toBe("1111 2222 3333");
+        expect(r.body.data.documents.panNumber).toBe("ABCDE1234F");
+        expect(r.body.data.bloodGroup).toBe("O+");
+        /* The credential floor is not part of "everything". */
+        expect(r.body.data.password).toBeUndefined();
+        expect(r.body.data.temporaryPassword).toBeUndefined();
+      }
+    },
+  );
 
-    expect(r.body.data.documents.aadharNumber).toBe("1111 2222 3333");
-    expect(r.body.data.bloodGroup).toBe("O+");
-    expect(r.body.data.bankDetails.accountNumber).toBe("1234567890");
-    expect(r.body.data.password).toBeUndefined();
-
-    const v = await get("/api/employees/60c0000000000000000000aa", await hrUser("viewer"));
+  test("a viewer still gets no pay on a route outside the employee section", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) The
+       viewer's widened reads are for the employee routes only. */
+    const v = await get("/api/hr/leaves", await hrUser("viewer"));
+    expect(v.status).toBe(200);
     expect(v.body.data?.salary).toBeUndefined();
     expect(v.body.data?.bankDetails).toBeUndefined();
+  });
+
+  test("the CEO projection receives no pay, bank detail or identifier on the employee routes", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) The CEO
+       projection is not an HR user, so the section's capabilities are not
+       given to it: the directory it reads is scrubbed as before. */
+    const ceo = await makeDepartment("ceo", "CEO", "/ceo/dashboard");
+    const emp = await makeEmployee({ biometricId: "GRCEO", email: "cyra@grav.in", accessDepartmentId: ceo._id });
+    resetAccessCaches();
+    const token = cmsToken({ id: String(emp._id), email: "cyra@grav.in", employeeId: "GRCEO", role: "ceo" });
+
+    const r = await get("/api/employees/all", token);
+    expect(r.status).toBe(200);
+    expect(r.text).not.toMatch(/45000|enc:1000|1234567890|1111 2222 3333|ABCDE1234F|Welcome@123|\$2a\$10/);
+    expect(r.body.data.salary).toBeUndefined();
+    expect(r.body.data.bankDetails).toBeUndefined();
+    expect(r.body.data.documents.aadharNumber).toBeUndefined();
+    expect(r.body.data.bloodGroup).toBeUndefined();
+    expect(r.body.data.firstName).toBe("Asha");
+
+    /* And the private record itself is not the projection's to read. */
+    expect((await get("/api/employees/60c0000000000000000000aa", token)).status).toBe(403);
   });
 
   test("an approver gets pay, and still never a credential", async () => {
@@ -190,21 +239,35 @@ describe("the response scrub", () => {
 });
 
 describe("the ETag covers what the caller actually receives", () => {
-  /* `/api/employees/all` is the directory read BOTH of these people may make —
-     so the only thing that differs between their two responses is what the
-     scrub removed, which is exactly what the ETag has to notice.
+  /* The route is one BOTH people may read — so the only thing that differs
+     between their two responses is what the scrub removed, which is exactly
+     what the ETag has to notice.
+
+     (14 Oct 2026, owner: no role tiers in the employee section) This used
+     /api/employees/all with a viewer and an approver. Every HR tier now gets
+     the same body there, so the same ETag is correct and discloses nothing
+     (pinned below). The separation is pinned on /api/hr/leaves, where the
+     tiers still differ, and on the employee directory between the CEO
+     projection and an HR user, which still differ.
 
      Asserted as a STRONG tag (no `W/` prefix) because Express attaches a weak
      one of its own to any res.send; matching on the strong form is what proves
      the tag under test is conditionalGet's, computed over the scrubbed body. */
   const strong = (tag) => typeof tag === "string" && tag.startsWith('"');
 
+  async function ceoUser() {
+    const ceo = await makeDepartment("ceo", "CEO", "/ceo/dashboard");
+    const emp = await makeEmployee({ biometricId: "GRCEO", email: "cyra@grav.in", accessDepartmentId: ceo._id });
+    resetAccessCaches();
+    return cmsToken({ id: String(emp._id), email: "cyra@grav.in", employeeId: "GRCEO", role: "ceo" });
+  }
+
   test("two capability levels do not share an ETag for the same route", async () => {
     const viewer = await hrUser("viewer");
     const approver = await hrUser("approver");
 
-    const a = await get("/api/employees/all", approver);
-    const v = await get("/api/employees/all", viewer);
+    const a = await get("/api/hr/leaves", approver);
+    const v = await get("/api/hr/leaves", viewer);
 
     expect(strong(a.etag)).toBe(true);
     expect(strong(v.etag)).toBe(true);
@@ -214,12 +277,44 @@ describe("the ETag covers what the caller actually receives", () => {
     expect(v.text).not.toMatch(/1234567890/);
   });
 
+  test("the CEO projection and an HR user do not share an ETag on the employee directory", async () => {
+    const viewer = await hrUser("viewer");
+    const ceo = await ceoUser();
+
+    const h = await get("/api/employees/all", viewer);
+    const c = await get("/api/employees/all", ceo);
+
+    expect(strong(h.etag)).toBe(true);
+    expect(strong(c.etag)).toBe(true);
+    expect(c.etag).not.toBe(h.etag);
+    expect(h.text).toMatch(/1234567890/);
+    expect(c.text).not.toMatch(/1234567890/);
+  });
+
+  test("every HR tier gets the same employee directory, so the same ETag", async () => {
+    /* Not a leak: the bodies are identical byte for byte, which is what the
+       owner asked for. */
+    const v = await get("/api/employees/all", await hrUser("viewer"));
+    const a = await get("/api/employees/all", await hrUser("approver"));
+    expect(v.text).toBe(a.text);
+    expect(v.etag).toBe(a.etag);
+  });
+
   test("replaying an approver's ETag as a viewer does NOT get a 304", async () => {
     const viewer = await hrUser("viewer");
     const approver = await hrUser("approver");
 
-    const a = await get("/api/employees/all", approver);
-    const replay = await get("/api/employees/all", viewer, { "If-None-Match": a.etag });
+    const a = await get("/api/hr/leaves", approver);
+    const replay = await get("/api/hr/leaves", viewer, { "If-None-Match": a.etag });
+
+    expect(replay.status).toBe(200);
+    expect(replay.text).not.toMatch(/1234567890|45000/);
+  });
+
+  test("replaying an HR user's ETag as the CEO projection does NOT get a 304", async () => {
+    const viewer = await hrUser("viewer");
+    const h = await get("/api/employees/all", viewer);
+    const replay = await get("/api/employees/all", await ceoUser(), { "If-None-Match": h.etag });
 
     expect(replay.status).toBe(200);
     expect(replay.text).not.toMatch(/1234567890|45000/);

@@ -14,6 +14,13 @@
  * declared directory class. The unknown field is the important one: it stands
  * in for the column somebody adds to Employee next week, and it must be
  * withheld by default rather than published by default.
+ *
+ * (14 Oct 2026, owner: no role tiers in the employee section) An HR VIEWER is
+ * no longer a directory reader on this route: every HR user receives the whole
+ * employee, pay and bank details included. The directory-class assertions are
+ * now made against the CEO projection, which is still a directory reader here,
+ * and the HR-tier assertions say every tier receives the same thing. A field
+ * nobody has classified, and the credentials, are still withheld from everyone.
  */
 
 const express = require("express");
@@ -129,8 +136,18 @@ async function getAll(token) {
 }
 
 describe("the real directory route", () => {
-  test("a viewer receives ONLY the declared directory fields", async () => {
-    const token = await hrUser("viewer");
+  async function ceoUser() {
+    const ceoDept = await makeDepartment("ceo", "CEO", "/ceo/dashboard");
+    const emp = await makeEmployee({ biometricId: "GRCEO", email: "ceo@grav.in", accessDepartmentId: ceoDept._id });
+    resetAccessCaches();
+    return cmsToken({ id: String(emp._id), email: "ceo@grav.in", employeeId: "GRCEO", role: "ceo" });
+  }
+
+  test("a directory reader (the CEO projection) receives ONLY the declared directory fields", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) This was an
+       HR viewer, who now receives everything here (below). The CEO projection
+       is the directory reader this route still has. */
+    const token = await ceoUser();
     const r = await getAll(token);
 
     expect(r.status).toBe(200);
@@ -146,6 +163,19 @@ describe("the real directory route", () => {
     for (const [name, value] of Object.entries(SECRETS)) {
       expect({ name, leaked: r.text.includes(value) }).toEqual({ name, leaked: false });
     }
+    expect(r.text).not.toMatch(/Welcome@123|\$2a\$10/);
+  });
+
+  test("an HR viewer receives the whole employee — but never a credential", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) Until today
+       the viewer got the directory class only. */
+    const token = await hrUser("viewer");
+    const r = await getAll(token);
+
+    expect(r.status).toBe(200);
+    expect(r.text).toMatch(new RegExp(SECRETS.accountNumber));
+    expect(r.text).toMatch(/45000/);
+    expect(r.text).toMatch(new RegExp(SECRETS.phone));
     expect(r.text).not.toMatch(/Welcome@123|\$2a\$10/);
   });
 
@@ -186,23 +216,26 @@ describe("the real directory route", () => {
   });
 
   /* Since 13 Oct 2026 an editor READS pay (owner: "the salary of an employee
-     is not visible to the HR editor"); a viewer still does not. */
-  test("an editor and an approver see compensation; a viewer does not", async () => {
+     is not visible to the HR editor"). (14 Oct 2026, owner: no role tiers in
+     the employee section) A viewer does too, and every tier receives the same
+     body byte for byte. */
+  test("a viewer, an editor and an approver all see compensation — the same response", async () => {
+    /* All three exist before the first read, so the list is the same list. */
     const viewer = await hrUser("viewer");
     const editor = await hrUser("editor");
     const approver = await hrUser("approver");
 
     const asViewer = await getAll(viewer);
-    expect(asViewer.text).not.toMatch(new RegExp(SECRETS.accountNumber));
-    expect(asViewer.text).not.toMatch(/45000/);
-
     const asEditor = await getAll(editor);
-    expect(asEditor.text).toMatch(new RegExp(SECRETS.accountNumber));
-    /* An editor holds people.read.private too. */
-    expect(asEditor.text).toMatch(new RegExp(SECRETS.phone));
-
     const asApprover = await getAll(approver);
-    expect(asApprover.text).toMatch(new RegExp(SECRETS.accountNumber));
+
+    for (const r of [asViewer, asEditor, asApprover]) {
+      expect(r.text).toMatch(new RegExp(SECRETS.accountNumber));
+      expect(r.text).toMatch(/45000/);
+      expect(r.text).toMatch(new RegExp(SECRETS.phone));
+    }
+    expect(asViewer.text).toBe(asEditor.text);
+    expect(asViewer.text).toBe(asApprover.text);
   });
 
   test("the CEO/management projection is the directory class too", async () => {

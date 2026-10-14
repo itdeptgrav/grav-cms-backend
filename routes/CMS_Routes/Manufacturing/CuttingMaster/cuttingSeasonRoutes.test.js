@@ -15,7 +15,7 @@ const routes = router.stack.filter((l) => l.route).map((l) => ({ path: l.route.p
 const find = (m, p) => routes.find((r) => r.path === p && r.methods.includes(m));
 
 test("every season route the page uses is mounted with its method", () => {
-  for (const [m, p] of [["get", "/seasons"], ["get", "/seasons/open"], ["post", "/seasons"], ["get", "/seasons/:id"], ["post", "/seasons/:id/raw-items"], ["delete", "/seasons/:id/raw-items/:barcodeId"], ["post", "/seasons/:id/start"], ["post", "/seasons/:id/pieces"], ["delete", "/seasons/:id/pieces/:barcode"], ["post", "/seasons/:id/close"], ["post", "/seasons/:id/discard"], ["get", "/seasons/:id/report"], ["get", "/find-piece"], ["get", "/seasons/ping"], ["post", "/seasons/:id/raw-items/batch"], ["post", "/seasons/:id/pieces/batch"]]) assert.ok(find(m, p), `${m.toUpperCase()} ${p}`);
+  for (const [m, p] of [["get", "/seasons"], ["get", "/seasons/open"], ["post", "/seasons"], ["get", "/seasons/:id"], ["post", "/seasons/:id/raw-items"], ["delete", "/seasons/:id/raw-items/:barcodeId"], ["post", "/seasons/:id/start"], ["post", "/seasons/:id/pieces"], ["delete", "/seasons/:id/pieces/:barcode"], ["post", "/seasons/:id/close"], ["post", "/seasons/:id/discard"], ["get", "/seasons/:id/report"], ["get", "/find-piece"], ["get", "/seasons/ping"], ["post", "/seasons/:id/raw-items/batch"], ["post", "/seasons/:id/pieces/batch"], ["put", "/seasons/:id/header"], ["post", "/seasons/:id/lays"], ["put", "/seasons/:id/lays/:layId"], ["delete", "/seasons/:id/lays/:layId"], ["get", "/seasons/:id/sticker"], ["get", "/seasons/po-options"], ["get", "/seasons/report-range"]]) assert.ok(find(m, p), `${m.toUpperCase()} ${p}`);
 });
 
 test("reads carry the viewer guard and the company resolver; writes the editor guard", () => {

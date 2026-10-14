@@ -193,6 +193,14 @@ function departmentWrites(slug, opts = {}) {
       return next();
     }
 
+    /* HR's employee section has no role tiers (14 Oct 2026, owner): the HR
+       contract has already proved this caller is an HR user and given them
+       the whole employee capability set (Middlewear/hrContract.js). Every
+       write there commits — except removing an employee, which still goes
+       through the role guard and the approval queue below because it cannot
+       be reviewed afterwards. The change history is written by the routes. */
+    if (req.hrEmployeeSection && req.method !== "DELETE") return next();
+
     // A POST to an /:id/… sub-action is a change TO an existing record, not a
     // new one. Getting this right matters because the queue groups by action.
     const approval =

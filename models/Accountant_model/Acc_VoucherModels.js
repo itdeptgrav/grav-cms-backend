@@ -61,6 +61,10 @@ const ledgerEntrySchema = new mongoose.Schema(
     gstClassification: { type: String, trim: true }, // "Taxable", "Exempt", "Nil-Rated", "Non-GST"
     isPartyLedger: { type: Boolean, default: false },
     isDeemedPositive: { type: Boolean, default: true },
+    /* A line the accountant added by hand ("Add another ledger line") to move
+       an amount from one ledger to another — not built from the bill's items.
+       The purchase form reads it back into its own editable rows on edit. */
+    isAdjustment: { type: Boolean, default: false },
 
     narration: { type: String, trim: true },
   },

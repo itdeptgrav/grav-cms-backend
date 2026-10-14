@@ -253,6 +253,10 @@ const DECLARATIONS = [
   D("GET", "/hr/attendance/export-daily", [C.HR_ACCESS, C.ATTENDANCE_READ, C.ANALYTICS_WORKFORCE], { persona: "time office" }),
   D("GET", "/hr/attendance/export-muster-roll", [C.HR_ACCESS, C.ATTENDANCE_READ, C.ANALYTICS_WORKFORCE], { persona: "time office" }),
 
+  D("GET", "/hr/attendance/override-window", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "time office",
+    note: "Whether the attendance override is still open (until its sunset) or only a worked rest day can be credited (services/attendanceOverrideWindow.js). A read.",
+  }),
   D("PUT", "/hr/attendance/day-override", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("PUT", "/hr/attendance/bulk-day-override", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("POST", "/hr/attendance/punch-correction", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
@@ -797,6 +801,34 @@ function specificity(path) {
   return segs.length * 100 + literals;
 }
 
+/* ── THE EMPLOYEE SECTION HAS NO ROLE TIERS (14 Oct 2026, owner) ───────────
+ *
+ * "In the employee section there should be no variation of access — salary
+ * shown to the owner but not the editor — show everything to everyone, and
+ * everyone can edit." So on these routes every HR user (viewer, editor,
+ * approver, owner, platform admin) acts with the full employee capability set
+ * (Middlewear/hrContract.js, EMPLOYEE_SECTION_CAPABILITIES): pay, bank details,
+ * identifiers and medical fields are read and written alike and nothing is
+ * held for the owner. Deleting an employee still goes to an approver: it is
+ * the one change that cannot be reviewed afterwards. Not covered: the
+ * company-wide salary RULES (PUT …/config/salary, an HR settings page) and the
+ * payroll preview, which belong to payroll. The CEO projection and the
+ * employee app are not HR users and are unaffected. */
+const EMPLOYEE_SECTION_EXCLUDED = new Set([
+  "PUT /api/employees/config/salary",
+  "POST /api/employees/config/salary/preview",
+]);
+function isEmployeeSection(d) {
+  if (d.scope !== "hr" || EMPLOYEE_SECTION_EXCLUDED.has(`${d.method} ${d.path}`)) return false;
+  return (
+    d.path === "/api/employees" ||
+    d.path.startsWith("/api/employees/") ||
+    d.path.startsWith("/hr/face-registration/") ||
+    d.path.startsWith("/hr/face-enroll/invite/")
+  );
+}
+for (const d of DECLARATIONS) if (isEmployeeSection(d)) d.employeeSection = true;
+
 const COMPILED = DECLARATIONS.map((d) => ({
   ...d,
   regex: compile(d.path),
@@ -868,4 +900,5 @@ module.exports = {
   extractParams,
   validateDeclarations,
   compile,
+  isEmployeeSection,
 };

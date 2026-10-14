@@ -112,8 +112,12 @@ describe("the contract and the approval queue compose", () => {
   });
 
   test("a viewer is refused by the CONTRACT, before the queue ever sees it", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) This used
+       POST /api/employees, which a viewer may now make (below). The property
+       is unchanged outside the employee section, so it is pinned on an
+       attendance override instead. */
     const token = await hrUser("viewer");
-    const r = await send("POST", "/api/employees", token, { firstName: "New" });
+    const r = await send("PUT", "/hr/attendance/day-override", token, { dateStr: "2026-09-01", biometricId: "GR0001", hrFinalStatus: "P" });
 
     expect(r.status).toBe(403);
     expect(r.body.code).toBe("HR_MISSING_CAPABILITY");
@@ -133,6 +137,61 @@ describe("the contract and the approval queue compose", () => {
     const held = await ChangeRequest.find({ departmentSlug: "hr" }).lean();
     expect(held).toHaveLength(1);
     expect(held[0].intent.path).toContain("/payroll/mark-paid");
+  });
+});
+
+describe("the employee section has no role tiers (14 Oct 2026, owner)", () => {
+  /* (14 Oct 2026, owner: no role tiers in the employee section) Every HR user
+     writes an employee — pay, bank details, a transfer — and it commits: no
+     approval, no hold for the owner. Removing an employee is the exception and
+     still goes through the role guard and the queue. */
+  test("a viewer's NEW employee, with pay and bank details, commits directly", async () => {
+    const token = await hrUser("viewer");
+    const r = await send("POST", "/api/employees", token, {
+      firstName: "New", lastName: "Joiner", salary: { gross: 20000 }, bankDetails: { bankName: "SBI" },
+    });
+    expect(r.status).toBe(200);
+    expect(r.body.committed).toBe(true);
+    expect(await ChangeRequest.countDocuments({})).toBe(0);
+  });
+
+  test("an editor's and a viewer's pay change and transfer commit directly — nothing is held", async () => {
+    for (const role of ["viewer", "editor", "approver"]) {
+      const token = await hrUser(role);
+      const r = await send("PUT", "/api/employees/60c0000000000000000000aa", token, {
+        salary: { gross: 99999 }, department: "Stores", status: "Terminated",
+      });
+      expect({ role, status: r.status, committed: r.body.committed }).toEqual({ role, status: 200, committed: true });
+    }
+    expect(await ChangeRequest.countDocuments({})).toBe(0);
+  });
+
+  test("a viewer's DELETE of an employee is still refused by the role guard", async () => {
+    const token = await hrUser("viewer");
+    const r = await send("DELETE", "/api/employees/60c0000000000000000000aa", token);
+    expect(r.status).toBe(403);
+    expect(r.body.code).toBe("INSUFFICIENT_DEPARTMENT_ROLE");
+    expect(r.body.committed).toBeUndefined();
+    expect(await ChangeRequest.countDocuments({})).toBe(0);
+  });
+
+  test("an editor's DELETE of an employee is HELD for an approver", async () => {
+    const token = await hrUser("editor");
+    const r = await send("DELETE", "/api/employees/60c0000000000000000000aa", token);
+    expect(r.status).toBe(202);
+    expect(r.body.committed).toBeUndefined();
+    const held = await ChangeRequest.find({ departmentSlug: "hr" }).lean();
+    expect(held).toHaveLength(1);
+    expect(held[0].intent.method).toBe("DELETE");
+    expect(held[0].intent.path).toContain("/api/employees/60c0000000000000000000aa");
+  });
+
+  test("an approver's DELETE of an employee commits", async () => {
+    const token = await hrUser("approver");
+    const r = await send("DELETE", "/api/employees/60c0000000000000000000aa", token);
+    expect(r.status).toBe(200);
+    expect(r.body.committed).toBe(true);
+    expect(await ChangeRequest.countDocuments({})).toBe(0);
   });
 });
 

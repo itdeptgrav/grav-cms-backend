@@ -61,6 +61,31 @@ const APPROVER_CAPABILITIES = new Set(
   (Array.isArray(ROLE_TEMPLATES.hr_approver) ? ROLE_TEMPLATES.hr_approver : ROLE_TEMPLATES.hr_approver?.capabilities) || [],
 );
 const { classifyEmployeeWrite } = require("../services/access/hrWritePolicy");
+
+/* THE EMPLOYEE SECTION HAS NO ROLE TIERS (14 Oct 2026, owner). On a
+   declaration marked `employeeSection` (services/access/hrRouteContract.js)
+   every HR user acts with this whole set, so pay, bank, identifiers and
+   medical fields are read and written by viewers, editors, approvers and the
+   owner alike, and no pay change is held for the owner. Only these templates
+   are HR users; the CEO projection and the employee app are not. */
+const EMPLOYEE_SECTION_TEMPLATES = new Set(["hr_viewer", "hr_editor", "hr_approver", "hr_owner", "platform_admin"]);
+const EMPLOYEE_SECTION_CAPABILITIES = [
+  CAPABILITIES.HR_ACCESS,
+  CAPABILITIES.PEOPLE_READ_DIRECTORY,
+  CAPABILITIES.PEOPLE_READ_PRIVATE,
+  CAPABILITIES.PEOPLE_READ_IDENTIFIERS,
+  CAPABILITIES.PEOPLE_READ_MEDICAL,
+  CAPABILITIES.PEOPLE_WRITE,
+  CAPABILITIES.EMPLOYMENT_CHANGE,
+  CAPABILITIES.COMPENSATION_READ,
+  CAPABILITIES.COMPENSATION_WRITE,
+  CAPABILITIES.AUDIT_READ,
+];
+async function employeeSectionActor(user) {
+  const actor = await resolveHrActor(user);
+  if (!actor?.authenticated || !actor.hasHrApplicationAccess || !EMPLOYEE_SECTION_TEMPLATES.has(actor.template)) return null;
+  return { ...actor, capabilities: new Set([...(actor.capabilities || []), ...EMPLOYEE_SECTION_CAPABILITIES]) };
+}
 const { projectEmployee, projectEmployees, scrubResponse } = require("../services/access/hrFieldPolicy");
 
 /* ── Identity ────────────────────────────────────────────────────────────────*/
@@ -211,8 +236,14 @@ function hrContract(opts = {}) {
          /api/employee/payslip/<somebody-else>. */
       req.hrParams = extractParams(declaration, fullPath);
 
+      const sectionActor = declaration.employeeSection ? await employeeSectionActor(req.user) : null;
+      /* No tiers here: the department write guard lets every HR user through
+         and holds only an employee's deletion (Middlewear/departmentWriteGuard.js). */
+      if (sectionActor) req.hrEmployeeSection = true;
+
       let result = await authorizeHr({
         user: req.user,
+        ...(sectionActor ? { actor: sectionActor } : {}),
         capabilities: declaration.capabilities,
         scope: declaration.scope,
         selfParams: declaration.selfParams,
