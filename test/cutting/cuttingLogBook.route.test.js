@@ -193,3 +193,38 @@ test("PO No suggests every order cut in this company, with its PO, buyer, MO and
   expect(byMo["MO-REQ-0099"]).toBeUndefined(); // another company's order is never offered
   expect(r.body.withoutPo).toBe(1);
 });
+
+test("the marker is typed in feet; an older lay in metres is shown in feet and both report alike (15 Oct 2026)", async () => {
+  const { body } = await call("POST", "/seasons", {});
+  const id = body.season.id;
+  /* 28.2152 ft is 8.6 m: the same marker as the metre lay in the first test */
+  const ft = await call("POST", `/seasons/${id}/lays`, { ...LAY, markerLength: 28.2152, markerWidth: 4.8333, markerUnit: "ft" });
+  expect(ft.status).toBe(201);
+  expect(ft.body.lay).toMatchObject({ markerLength: 28.2152, markerWidth: 4.8333, markerUnit: "ft" });
+  expect(ft.body.lay.markerReq).toBeCloseTo(516, 2);
+  /* an older lay, stored in metres and inches, reads back in feet */
+  await CuttingSeason.updateOne({ _id: id }, { $set: { "lays.0.markerLength": 8.6, "lays.0.markerWidth": 58 }, $unset: { "lays.0.markerUnit": 1 } });
+  const old = (await call("GET", `/seasons/${id}`)).body.season.lays[0];
+  expect(old).toMatchObject({ markerLength: 28.2152, markerWidth: 4.8333, markerUnit: "ft" });
+  expect(old.markerReq).toBeCloseTo(516, 6);
+});
+
+test("a season can be removed while it is open or inside its 24 hours; it then leaves every list (15 Oct 2026)", async () => {
+  const open = (await call("POST", "/seasons", {})).body.season.id;
+  await call("POST", `/seasons/${open}/lays`, LAY);
+  expect((await call("DELETE", `/seasons/${open}`)).status).toBe(200);
+  expect((await call("GET", `/seasons/${open}`)).status).toBe(404);
+  expect((await call("GET", "/seasons/open")).body.seasons.some((x) => x.id === open)).toBe(false);
+  const range = await call("GET", "/seasons/report-range?from=2026-01-01&to=2026-12-31");
+  expect(range.body.lays.some((l) => l.seasonId === open)).toBe(false);
+  expect(await CuttingSeason.exists({ _id: open })).toBeTruthy(); // kept, only marked
+
+  const closed = (await call("POST", "/seasons", {})).body.season.id;
+  await call("POST", `/seasons/${closed}/lays`, LAY);
+  await call("POST", `/seasons/${closed}/close`, {});
+  await CuttingSeason.updateOne({ _id: closed }, { $set: { closedAt: new Date(Date.now() - 25 * 3600 * 1000) } });
+  const late = await call("DELETE", `/seasons/${closed}`);
+  expect(late.status).toBe(409);
+  expect(late.body.code).toBe("SEASON_FINAL");
+  expect((await call("GET", "/seasons?status=closed")).body.seasons.some((x) => x.id === closed)).toBe(true);
+});

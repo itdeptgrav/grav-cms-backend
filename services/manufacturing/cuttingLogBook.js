@@ -38,6 +38,29 @@ const num = (v) => {
 const round = (n, dp = 4) => (n === null ? null : Math.round(n * 10 ** dp) / 10 ** dp);
 const str = (v, max = 120) => (typeof v === "string" ? v.trim() : v == null ? "" : String(v).trim()).slice(0, max);
 
+/* MARKER LENGTH AND WIDTH ARE TYPED IN FEET (15 Oct 2026, owner). A lay
+   saved since carries `markerUnit: "ft"`; one saved before has none and its
+   figures are metres (length) and inches (width). The arithmetic always works
+   in metres, so the two kinds of lay sit in one report. */
+const FOOT_M = 0.3048;
+/** The marker length in metres, whatever unit the lay was typed in. */
+function markerLengthM(l = {}) {
+  const n = num(l.markerLength);
+  if (n === null) return null;
+  return l.markerUnit === "ft" ? n * FOOT_M : n;
+}
+/** The lay's marker as shown and reported: in feet, converted for an older lay. */
+function inFeet(l = {}) {
+  if (l.markerUnit === "ft") return { markerLength: l.markerLength ?? null, markerWidth: l.markerWidth ?? null, markerUnit: "ft" };
+  const len = num(l.markerLength);
+  const wid = num(l.markerWidth);
+  return {
+    markerLength: len === null ? null : Math.round((len / FOOT_M) * 10000) / 10000,
+    markerWidth: wid === null ? null : Math.round((wid / 12) * 10000) / 10000,
+    markerUnit: "ft",
+  };
+}
+
 /** A lay as typed → the stored shape, or { error } naming the first problem. */
 function normaliseLay(input = {}) {
   const ratio = {};
@@ -54,9 +77,10 @@ function normaliseLay(input = {}) {
   if (plies === null || plies <= 0 || !Number.isInteger(plies)) return { error: "No. of plies must be a whole number above 0." };
   if (!SIZES.some((s) => ratio[s] > 0)) return { error: "Give the size ratio — how many garments of each size the marker holds." };
   const markerLength = num(input.markerLength);
-  if (markerLength === null || markerLength <= 0) return { error: "Marker length (m) must be above 0." };
+  const markerUnit = input.markerUnit === "ft" ? "ft" : "m";
+  if (markerLength === null || markerLength <= 0) return { error: `Marker length (${markerUnit === "ft" ? "ft" : "m"}) must be above 0.` };
   const markerWidth = num(input.markerWidth);
-  if (markerWidth !== null && markerWidth <= 0) return { error: "Marker width (in) must be above 0." };
+  if (markerWidth !== null && markerWidth <= 0) return { error: `Marker width (${markerUnit === "ft" ? "ft" : "in"}) must be above 0.` };
   /* Typed as a percentage on the screen (84) and stored as the workbook stores it (0.84). */
   let markerEff = num(input.markerEff);
   if (markerEff !== null) {
@@ -82,6 +106,7 @@ function normaliseLay(input = {}) {
       fabricLot: str(input.fabricLot, 80),
       markerLength: round(markerLength),
       markerWidth: markerWidth === null ? null : round(markerWidth),
+      markerUnit,
       markerEff: markerEff === null ? null : round(markerEff),
       ratio,
       plies,
@@ -102,7 +127,8 @@ function computeLay(l = {}) {
   const issued = num(l.fabricIssued);
   const returned = num(l.fabricReturned);
   const consumed = issued === null ? null : issued - (returned || 0);
-  const markerReq = num(l.markerLength) === null || !plies ? null : num(l.markerLength) * plies;
+  const mlM = markerLengthM(l);
+  const markerReq = mlM === null || !plies ? null : mlM * plies;
   const wastage = consumed === null || markerReq === null ? null : consumed - markerReq;
   const wastagePct = wastage === null || !consumed ? null : wastage / consumed;
   const actualCons = consumed === null || !pcsCut ? null : consumed / pcsCut;
@@ -208,4 +234,4 @@ function normaliseHeader(input = {}) {
   };
 }
 
-module.exports = { SIZES, STATUS_TOLERANCE, normaliseLay, normaliseHeader, computeLay, summarize, seasonDay, seasonName, dayFrom };
+module.exports = { SIZES, STATUS_TOLERANCE, FOOT_M, normaliseLay, normaliseHeader, computeLay, summarize, seasonDay, seasonName, dayFrom, inFeet, markerLengthM };

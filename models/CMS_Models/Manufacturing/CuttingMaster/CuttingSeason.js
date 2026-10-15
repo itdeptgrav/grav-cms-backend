@@ -82,6 +82,8 @@ const laySchema = new mongoose.Schema({
   fabricLot: { type: String, default: "" },
   markerLength: { type: Number, required: true },
   markerWidth: { type: Number, default: null },
+  /* "ft" since 15 Oct 2026; absent on an older lay = metres (length) and inches (width) */
+  markerUnit: { type: String, enum: ["m", "ft"] },
   /* a fraction, as the workbook stores it: 0.84 is 84% */
   markerEff: { type: Number, default: null },
   ratio: { type: sizeRatio, default: () => ({}) },
@@ -106,6 +108,11 @@ const cuttingSeasonSchema = new mongoose.Schema({
   startedBy: who,
   closedAt: { type: Date, default: null },
   closedBy: who,
+  /* Removed from the list (15 Oct 2026, owner: "a delete button in each
+     season"). Kept, not erased: every read leaves out a season with
+     `deletedAt` set, and a removed season can be found again by id. */
+  deletedAt: { type: Date, default: null },
+  deletedBy: who,
   note: { type: String, default: "", maxlength: 1000 },
   /* The daily report's header line — Buyer Name, PO No, Style No, Colour, Date. */
   header: {

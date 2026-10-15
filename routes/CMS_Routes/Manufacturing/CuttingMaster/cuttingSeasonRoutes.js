@@ -129,11 +129,11 @@ const seasonView = (s, products) => ({
 });
 function layView(l) {
   const { _id, createdBy, updatedBy, createdAt, updatedAt, ...typed } = l;
-  return { id: String(_id), ...typed, ratio: { ...Object.fromEntries(logBook.SIZES.map((k) => [k, Number(l.ratio?.[k]) || 0])) }, ...logBook.computeLay(l), createdBy: createdBy || {}, updatedBy: updatedBy || {}, createdAt, updatedAt };
+  return { id: String(_id), ...typed, ...logBook.inFeet(l), ratio: { ...Object.fromEntries(logBook.SIZES.map((k) => [k, Number(l.ratio?.[k]) || 0])) }, ...logBook.computeLay(l), createdBy: createdBy || {}, updatedBy: updatedBy || {}, createdAt, updatedAt };
 }
 async function loadSeason(req, res, { forWrite = false } = {}) {
   if (!isId(req.params.id)) { fail(res, 404, "Season not found"); return null; }
-  const q = CuttingSeason.findOne({ _id: oid(req.params.id), companyId: companyOf(req) });
+  const q = CuttingSeason.findOne({ _id: oid(req.params.id), companyId: companyOf(req), deletedAt: null });
   const s = forWrite ? await q : await q.lean();
   if (!s) { fail(res, 404, "Season not found"); return null; }
   return s;
@@ -185,7 +185,7 @@ router.get("/seasons/ping", (_req, res) => res.json({ success: true, at: new Dat
 /* ── seasons ───────────────────────────────────────────────────────────── */
 router.get("/seasons", ...canRead, async (req, res) => {
   try {
-    const f = { companyId: companyOf(req) };
+    const f = { companyId: companyOf(req), deletedAt: null };
     if (["draft", "active", "closed"].includes(req.query.status)) f.status = req.query.status;
     const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
     const rows = await CuttingSeason.find(f).sort({ createdAt: -1 }).limit(limit).select("-pieces").lean();
@@ -195,7 +195,7 @@ router.get("/seasons", ...canRead, async (req, res) => {
 /* live counts for open seasons are cheap to add here: the list above strips pieces */
 router.get("/seasons/open", ...canRead, async (req, res) => {
   try {
-    const rows = await CuttingSeason.find({ companyId: companyOf(req), status: { $ne: "closed" } }).sort({ createdAt: -1 }).lean();
+    const rows = await CuttingSeason.find({ companyId: companyOf(req), status: { $ne: "closed" }, deletedAt: null }).sort({ createdAt: -1 }).lean();
     return res.json({ success: true, seasons: rows.map((s) => ({ ...seasonView(s), lays: undefined })) });
   } catch (err) { console.error("[cutting-seasons] open:", err); return fail(res, 500, err.message); }
 });
@@ -244,7 +244,7 @@ router.get("/seasons/report-range", ...canRead, async (req, res) => {
     if (to < from) return fail(res, 400, "The To date is before the From date.");
     if ((to - from) / 86400000 > 366) return fail(res, 400, "Choose a range of a year or less.");
     const end = new Date(to.getTime() + 86400000);
-    const rows = await CuttingSeason.find({ companyId: companyOf(req), "lays.date": { $gte: from, $lt: end } })
+    const rows = await CuttingSeason.find({ companyId: companyOf(req), deletedAt: null, "lays.date": { $gte: from, $lt: end } })
       .select("name status header lays createdAt createdBy closedAt")
       .lean();
     const lays = [];
@@ -564,6 +564,21 @@ router.post("/seasons/:id/close", ...canWrite, async (req, res) => {
     await s.save();
     return res.json({ success: true, season: seasonView(s.toObject()) });
   } catch (err) { console.error("[cutting-seasons] close:", err); return fail(res, 500, err.message); }
+});
+/* Remove a season (15 Oct 2026, owner): open, or closed and still inside
+   its 24 hours. A season scanned before the log book moved fabric on its
+   stickers, so it is not removable here. The season is marked, not erased. */
+router.delete("/seasons/:id", ...canWrite, async (req, res) => {
+  try {
+    const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;
+    if ((s.rawItems || []).length || (s.pieces || []).length)
+      return fail(res, 409, "This season was scanned before the log book and moved fabric on its stickers — it cannot be removed.");
+    if (!editable(s, res)) return;
+    s.deletedAt = new Date();
+    s.deletedBy = actorOf(req);
+    await s.save();
+    return res.json({ success: true });
+  } catch (err) { console.error("[cutting-seasons] remove:", err); return fail(res, 500, err.message); }
 });
 router.post("/seasons/:id/discard", ...canWrite, async (req, res) => {
   try {
