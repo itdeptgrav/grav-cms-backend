@@ -187,8 +187,8 @@ function orgFilter(req) {
 async function applyLedgerBalances(voucher, direction, session) {
   /* A frozen year's balances never move (13 Oct 2026): approving, voiding or
      cancelling a voucher dated in one is refused before anything changes. */
-  await require("../../services/accounting/fyLock").assertYearsOpen(
-    voucher.companyId,
+  await require("../../services/accounting/fyLock").assertVoucherOpen(
+    voucher,
     [voucher.voucherDate],
     "A voucher",
   );
@@ -576,6 +576,10 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
       throw new Error(
         `Cannot merge a ${source.nature} ledger into a ${dest.nature} ledger`,
       );
+
+    /* refused up front when a voucher of the source ledger is locked */
+    await require("../../services/accounting/fyLock").assertLedgersOpen([source._id], "A voucher of the ledger being merged in it");
+    if (Number(source.openingBalance || 0) !== 0) await require("../../services/accounting/fyLock").assertOpeningOpen(source.companyId);
 
     const counts = { ledgerEntries: 0, partyVouchers: 0, bankVouchers: 0 };
 
@@ -975,6 +979,14 @@ router.post(
           .status(400)
           .json({ success: false, message: `Already ${item.status}` });
 
+      /* The voucher this would cancel must be outside a locked period —
+         checked before the request is closed, so a refusal leaves both as
+         they were (15 Oct 2026). */
+      if (item.kind === "voucher" && item.target?.id) {
+        const pv = await Acc_Voucher.findById(item.target.id).select("companyId voucherDate status voucherType sourceSystem").lean();
+        if (pv && pv.status === "pending_approval")
+          await require("../../services/accounting/fyLock").assertVoucherOpen(pv, [pv.voucherDate], "A voucher in it");
+      }
       item.status = "rejected";
       item.reviewedBy = req.user.id;
       item.reviewedByName = req.user.name;
@@ -1026,6 +1038,14 @@ router.post("/:id/cancel", async (req, res) => {
         success: false,
         message: "Only the requester or the owner can cancel",
       });
+    }
+    /* The voucher this would cancel must be outside a locked period —
+       checked before the request is closed, so a refusal leaves both as
+       they were (15 Oct 2026). */
+    if (item.kind === "voucher" && item.target?.id) {
+      const pv = await Acc_Voucher.findById(item.target.id).select("companyId voucherDate status voucherType sourceSystem").lean();
+      if (pv && pv.status === "pending_approval")
+        await require("../../services/accounting/fyLock").assertVoucherOpen(pv, [pv.voucherDate], "A voucher in it");
     }
     item.status = "cancelled";
     item.reviewedAt = new Date();

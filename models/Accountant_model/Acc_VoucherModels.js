@@ -943,6 +943,9 @@ tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
 tallyVoucherSchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
   dateField: "voucherDate",
   label: "A voucher",
+  /* each voucher is in its own section (sales, receipts, expenses, payroll …),
+     so a lock can close some sections and leave others open (16 Oct 2026) */
+  voucher: true,
 });
 const Acc_Voucher = mongoose.model("Acc_Voucher", tallyVoucherSchema);
 const Acc_Godown = mongoose.model("Acc_Godown", tallyGodownSchema);

@@ -2475,6 +2475,24 @@ router.post("/:id/merge", verifyAccountantToken, async (req, res) => {
       ghost = await Customer.findById(mergeFromId);
     } catch (_) {}
 
+    /* Refused BEFORE the first write when a voucher of the ghost's ledger is
+       in a locked period (15 Oct 2026). Candidates: the ledgers below may pick. */
+    {
+      const cands = [];
+      if (ghost) {
+        const linked = await Acc_Ledger.findOne({ linkedCustomerId: ghost._id }).select("_id").lean().catch(() => null);
+        const ghostName = (ghost.name || ghost.companyName || "").trim();
+        const byName = !linked && ghostName
+          ? await Acc_Ledger.findOne({ name: new RegExp("^" + ghostName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "$", "i"), isActive: { $ne: false } }).select("_id").lean().catch(() => null)
+          : null;
+        if (linked || byName) cands.push((linked || byName)._id);
+      } else if (require("mongoose").Types.ObjectId.isValid(String(mergeFromId))) cands.push(String(mergeFromId));
+      await require("../../services/accounting/fyLock").assertLedgersOpen(
+        cands.map((x) => new (require("mongoose").Types.ObjectId)(String(x))),
+        "A voucher of the customer being merged in it",
+      );
+    }
+
     if (ghost) {
       // Path A: Ghost is a CRM Customer
       const reqResult = await CustomerRequest.updateMany(

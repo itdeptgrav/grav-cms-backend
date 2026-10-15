@@ -77,6 +77,9 @@ function computeFY(dateInput) {
  * +1 to post, -1 to reverse. Mirrors the helper in tallyVouchers.js.
  */
 async function applyLedgerBalances(voucher, direction = 1) {
+  /* no balance moves for a voucher in a locked period — checked before the
+     ledgers, not after (15 Oct 2026) */
+  await require("../../services/accounting/fyLock").assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;

@@ -163,6 +163,10 @@ const sessionSchema = new mongoose.Schema(
   { timestamps: true, collection: "acc_bank_recon_sessions" },
 );
 
+/* A reconciliation touching a locked period is refused (16 Oct 2026, owner:
+   "lock bank reconciliation too") — services/accounting/fyLock.js. */
+sessionSchema.plugin(require("../../services/accounting/fyLock").bankReconGuard);
+
 const Acc_BankReconSession =
   mongoose.models.Acc_BankReconSession ||
   mongoose.model("Acc_BankReconSession", sessionSchema);
@@ -969,7 +973,8 @@ router.put("/sessions/:id/unmatch", blockViewerWrite, async (req, res) => {
 // Mark a ledger voucher reconciled WITHOUT a bank line (a timing or bundled
 // item), or undo that. Body: { voucherId, cleared: true|false, note? }
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/clear-ledger", async (req, res) => {
+/* blockViewerWrite was missing here — a viewer could clear ledger lines (16 Oct 2026) */
+router.put("/sessions/:id/clear-ledger", blockViewerWrite, async (req, res) => {
   try {
     const { voucherId, cleared, note } = req.body;
     if (!voucherId)

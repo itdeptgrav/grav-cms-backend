@@ -829,6 +829,9 @@ async function ensureBillReference(sourceVoucherId, referenceLedgerId = null) {
     },
   ];
   invoice.markModified("ledgerEntries");
+  /* only a bill reference is added — allowed on an invoice of a locked period,
+     so money can still be received against it (services/accounting/fyLock.js) */
+  invoice.$locals.periodLockExempt = true;
   await invoice.save();
   return true;
 }

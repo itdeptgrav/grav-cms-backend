@@ -273,8 +273,11 @@ router.post("/import-statement", async (req, res) => {
           .lean()
       ).map((d) => d.externalId),
     );
-    const fresh = prepared.filter((t) => !existingIds.has(t.externalId));
-    const skipped = prepared.length - fresh.length;
+    /* lines dated in a locked period are left out and counted (16 Oct 2026) */
+    const { open: fresh, locked: lockedLines } = await require("../../services/accounting/fyLock").splitBankLines(
+      prepared.filter((t) => !existingIds.has(t.externalId)),
+    );
+    const skipped = prepared.length - fresh.length - lockedLines.length;
 
     let inserted = 0;
     if (fresh.length > 0) {
@@ -300,7 +303,7 @@ router.post("/import-statement", async (req, res) => {
       provider: "csv",
       status: "ok",
       lastSyncAt: new Date(),
-      notes: `Imported ${inserted} transactions; ${skipped} duplicates skipped.`,
+      notes: `Imported ${inserted} transactions; ${skipped} duplicates skipped.${require("../../services/accounting/fyLock").lockedLinesNote(lockedLines.length)}`,
     };
     if (connIdx >= 0) settings.bankConnectors[connIdx] = connectorRow;
     else settings.bankConnectors.push(connectorRow);
@@ -309,9 +312,10 @@ router.post("/import-statement", async (req, res) => {
 
     res.status(201).json({
       success: true,
-      message: `Imported ${inserted} transactions; ${skipped} duplicates skipped`,
+      message: `Imported ${inserted} transactions; ${skipped} duplicates skipped.${require("../../services/accounting/fyLock").lockedLinesNote(lockedLines.length)}`,
       inserted,
       skipped,
+      lockedSkipped: lockedLines.length,
       total: prepared.length,
     });
   } catch (error) {
@@ -375,7 +379,10 @@ router.post("/webhook/:provider/:secret", async (req, res) => {
           .lean()
       ).map((d) => d.externalId),
     );
-    const fresh = prepared.filter((t) => !existingIds.has(t.externalId));
+    /* lines dated in a locked period are left out and counted (16 Oct 2026) */
+    const { open: fresh, locked: lockedLines } = await require("../../services/accounting/fyLock").splitBankLines(
+      prepared.filter((t) => !existingIds.has(t.externalId)),
+    );
     let inserted = 0;
     if (fresh.length > 0) {
       try {
@@ -393,7 +400,7 @@ router.post("/webhook/:provider/:secret", async (req, res) => {
     settings.markModified("bankConnectors");
     await settings.save();
 
-    res.json({ success: true, inserted, skipped: prepared.length - inserted });
+    res.json({ success: true, inserted, skipped: prepared.length - inserted, lockedSkipped: lockedLines.length });
   } catch (error) {
     console.error("Webhook error:", error);
     res

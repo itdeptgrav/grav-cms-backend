@@ -9,7 +9,7 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
-const { assertYearsOpen } = require("../../services/accounting/fyLock");
+const { assertYearsOpen, assertVoucherOpen } = require("../../services/accounting/fyLock");
 const router = express.Router();
 const {
   Acc_Voucher,
@@ -318,7 +318,7 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
   /* A frozen year's balances never move (13 Oct 2026) — checked here too, so
      a route that adjusts balances BEFORE the voucher save (which the model
      guard would refuse) cannot leave a balance changed behind a refusal. */
-  await assertYearsOpen(voucher.companyId, [voucher.voucherDate], "A voucher");
+  await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher");
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;
@@ -3242,6 +3242,9 @@ router.post("/:id/match", auth, async (req, res) => {
 
     const voucher = await Acc_Voucher.findById(req.params.id);
     billMatching.assertMatchable(voucher);
+    /* a voucher in a locked period is not re-matched — checked before any
+       bill reference is written on the invoices it names (15 Oct 2026) */
+    await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
 
     const state = await billMatching.applyAllocations(
       voucher,
@@ -3281,6 +3284,9 @@ router.delete("/:id/match", auth, async (req, res) => {
 
     const voucher = await Acc_Voucher.findById(req.params.id);
     billMatching.assertMatchable(voucher);
+    /* a voucher in a locked period is not re-matched — checked before any
+       bill reference is written on the invoices it names (15 Oct 2026) */
+    await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
 
     const state = await billMatching.clearAllocations(voucher, {
       partyLedgerId: req.body?.partyLedgerId || req.query?.partyLedgerId || null,
@@ -3774,6 +3780,8 @@ router.post("/", auth, companyScope, async (req, res) => {
           "That voucher number is already in use by an active voucher. Pick a different number.",
       });
     }
+    /* A frozen year or a locked month answers 423 with its code. */
+    if (e && e.code === "FY_LOCKED") return res.status(423).json({ error: e.message, code: e.code, period: e.period });
     res.status(400).json({ error: e.message });
   }
 });
@@ -3799,6 +3807,11 @@ router.put("/:id", auth, companyScope, async (req, res) => {
 
     const body = req.body || {};
     const wasPosted = existing.status === "posted";
+    /* A locked period — the voucher's date now or the one it is being moved
+       to — is refused HERE, before the old balances are reversed below: the
+       model would refuse the save anyway, but only after the reversal had
+       already moved the ledgers (15 Oct 2026). */
+    await assertVoucherOpen(existing, [existing.voucherDate, body.voucherDate], "A voucher in it");
 
     // Strip fields the client must not be able to overwrite directly.
     delete body._id;
@@ -4030,6 +4043,7 @@ router.put("/:id", auth, companyScope, async (req, res) => {
         error: "That voucher number is already in use by an active voucher.",
       });
     }
+    if (e && e.code === "FY_LOCKED") return res.status(423).json({ error: e.message, code: e.code, period: e.period });
     res.status(400).json({ error: e.message });
   }
 });

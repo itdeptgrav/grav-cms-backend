@@ -1728,6 +1728,12 @@ accountantSettingsSchema.statics.getSingleton = async function () {
 // ═══════════════════════════════════════════════════════════════
 const Acc_Expense = mongoose.model("Acc_Expense", expenseSchema);
 const Acc_Invoice = mongoose.model("Acc_Invoice", invoiceSchema);
+bankTransactionSchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
+  dateField: "transactionDate",
+  label: "A bank statement line",
+  section: "bank_transactions",
+  scope: "everywhere",
+});
 const Acc_BankTransaction = mongoose.model(
   "Acc_BankTransaction",
   bankTransactionSchema,
@@ -1736,6 +1742,16 @@ const Acc_Budget = mongoose.model("Acc_Budget", budgetSchema);
 journalEntrySchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
   dateField: "entryDate",
   label: "A journal entry",
+  section: "journal_entries",
+});
+/* Bank statement lines and tax filings carry no company, so they answer to
+   every company's locks (16 Oct 2026, owner: "lock bank reconciliation too
+   and anything left"). */
+taxFilingSchema.plugin(require("../../services/accounting/fyLock").rangeLockPlugin, {
+  label: "A tax filing",
+  section: "tax_filings",
+  rangeOf: require("../../services/accounting/fyLock").taxFilingRange,
+  locksFor: () => require("../../services/accounting/fyLock").lockedPeriodsEverywhere(),
 });
 const Acc_JournalEntry = mongoose.model("Acc_JournalEntry", journalEntrySchema);
 const Acc_TaxFiling = mongoose.model("Acc_TaxFiling", taxFilingSchema);

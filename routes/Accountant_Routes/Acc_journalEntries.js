@@ -409,7 +409,7 @@ router.post("/:id/cancel", async (req, res) => {
     });
   } catch (error) {
     console.error("Error cancelling journal entry:", error);
-    res.status(500).json({ success: false, message: "Error cancelling entry" });
+    res.status(500).json({ success: false, message: (error && error.code === "FY_LOCKED" && error.message) || "Error cancelling entry" });
   }
 });
 
@@ -438,7 +438,7 @@ router.post("/:id/void", async (req, res) => {
     });
   } catch (error) {
     console.error("Error voiding journal entry:", error);
-    res.status(500).json({ success: false, message: "Error voiding entry" });
+    res.status(500).json({ success: false, message: (error && error.code === "FY_LOCKED" && error.message) || "Error voiding entry" });
   }
 });
 
@@ -460,7 +460,7 @@ router.delete("/:id", async (req, res) => {
     await entry.deleteOne();
     res.json({ success: true, message: "Entry deleted" });
   } catch (error) {
-    res.status(500).json({ success: false, message: "Error deleting entry" });
+    res.status(500).json({ success: false, message: (error && error.code === "FY_LOCKED" && error.message) || "Error deleting entry" });
   }
 });
 

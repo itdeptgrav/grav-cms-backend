@@ -113,4 +113,13 @@ const cashFlowAdjustmentSchema = new mongoose.Schema(
 // hot path.
 cashFlowAdjustmentSchema.index({ organizationId: 1, status: 1, periodStart: 1 });
 
+/* An adjustment for a locked period is not changed (16 Oct 2026); it
+   belongs to an organisation, so its companies' locks apply. */
+cashFlowAdjustmentSchema.plugin(require("../../services/accounting/fyLock").rangeLockPlugin, {
+  label: "A cash-flow adjustment",
+  section: "cash_flow",
+  rangeOf: require("../../services/accounting/fyLock").cashFlowRange,
+  locksFor: (doc) => require("../../services/accounting/fyLock").lockedPeriodsForOrg(doc && doc.organizationId),
+});
+
 module.exports = mongoose.model("Acc_CashFlowAdjustment", cashFlowAdjustmentSchema);

@@ -395,7 +395,10 @@ router.post("/sync/:bankAccount", async (req, res) => {
           .lean()
       ).map((d) => d.externalId),
     );
-    const fresh = prepared.filter((t) => !existingIds.has(t.externalId));
+    /* lines dated in a locked period are left out and counted (16 Oct 2026) */
+    const { open: fresh, locked: lockedLines } = await require("../../services/accounting/fyLock").splitBankLines(
+      prepared.filter((t) => !existingIds.has(t.externalId)),
+    );
 
     let inserted = 0;
     if (fresh.length > 0) {
@@ -419,6 +422,7 @@ router.post("/sync/:bankAccount", async (req, res) => {
       success: true,
       inserted,
       skipped: prepared.length - inserted,
+      lockedSkipped: lockedLines.length,
       total: prepared.length,
     });
   } catch (e) {

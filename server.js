@@ -1254,6 +1254,9 @@ app.use("/api/hr", conditionalGet);
 app.use("/hr", conditionalGet);
 app.use("/api/employees", conditionalGet);
 app.use("/api/accountant", conditionalGet);
+/* A write refused because its period is locked answers 423 FY_LOCKED from
+   every accounting route, whatever its own catch says (15 Oct 2026). */
+app.use("/api/accountant", require("./Middlewear/lockedPeriodStatus").lockedPeriodStatus);
 
 /* ─── HR AUTHORISATION CONTRACT — part 2 of 2 ─────────────────────────────
  *
