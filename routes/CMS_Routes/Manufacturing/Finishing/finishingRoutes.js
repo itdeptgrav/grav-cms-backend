@@ -17,6 +17,9 @@
 //   GET  /:stage/orders/:id           one order's work orders with stage progress and photos
 //   GET  /:stage/find-piece?barcode=  one garment through every stage and packing
 //   GET  /:stage/report?from=&to=     everything the stage's Excel workbook shows
+//   POST /:stage/remote/pair-token    the QR a hand-scanner device scans to become this dashboard's input
+//   GET  /:stage/remote/devices       the devices paired to this stage, who is on them, today's pieces
+//   DELETE|PATCH /:stage/remote/devices/:deviceId   unpair / rename
 //
 // ── OFFLINE IS THE NORMAL CASE ──────────────────────────────────────────────
 // The scan tab keeps every scan on the device and sends them when it can, so
@@ -39,6 +42,9 @@ const { buildStageReport, reportWindow } = require("../../../../services/manufac
 const shift = require("../../../../services/manufacturing/shiftHours");
 const { STAGES, STAGE_KEYS } = require("../../../../services/manufacturing/finishingStages");
 const access = require("./finishingAccess");
+const { resolveBarcodes, existingScans, pieceView, recordDone } = require("../../../../services/manufacturing/finishingPieces");
+const station = require("../../../../services/manufacturing/finishingStation");
+const DeviceHeartbeat = require("../../../../models/CMS_Models/Manufacturing/Production/Barcode/DeviceHeartbeat");
 
 router.use(EmployeeAuthMiddleware);
 router.param("stage", (req, res, next) => access.resolveStage(req, res, next));
@@ -50,16 +56,11 @@ const companyOf = (req) => req.finishing.companyId;
 // ═════════════════════════════════════════════════════════════════════════════
 // HELPERS
 // ═════════════════════════════════════════════════════════════════════════════
-
-/** WO-<short id>-<unit>, the form the scanners write. Case-insensitive on the id. */
-function parseBarcode(raw) {
-  const parts = String(raw || "").trim().split("-");
-  if (parts.length < 3 || parts[0].toUpperCase() !== "WO") return null;
-  const unit = parseInt(parts[2], 10);
-  if (!Number.isFinite(unit) || unit <= 0) return null;
-  const shortId = parts[1].toLowerCase();
-  return { shortId, unit, barcode: `WO-${shortId}-${String(unit).padStart(3, "0")}` };
-}
+// parseBarcode / resolveBarcodes / existingScans / pieceView / plausibleAt and
+// the write itself (recordDone) moved to services/manufacturing/
+// finishingPieces.js on 15 Oct 2026, because a paired hand-scanner device
+// (routes/Barcode_Scan_Punchings/remoteStationRoutes.js) records into the same
+// book and must resolve a barcode by the same rule. Nothing changed in them.
 
 /** Who this is, from the session — never from the body. */
 const actorOf = (req) => ({
@@ -69,100 +70,6 @@ const actorOf = (req) => ({
   email: access.str(req.user?.email).toLowerCase(),
   role: access.str(req.user?.role),
 });
-
-/**
- * This company's work orders, indexed by the short id a barcode carries. A
- * short id two work orders share resolves to NOTHING — an ambiguous scan is a
- * question for a person, never a guess.
- */
-async function workOrderIndex(companyId, select) {
-  const wos = await access.findWorkOrders(companyId, {}, select).lean();
-  const byShort = new Map();
-  for (const wo of wos) {
-    const s = String(wo._id).slice(-8).toLowerCase();
-    byShort.set(s, byShort.has(s) ? null : wo);
-  }
-  return byShort;
-}
-
-const WO_SELECT = "_id workOrderNumber quantity customerRequestId stockItemId stockItemName stockItemReference variantId variantAttributes";
-
-async function orderInfo(ids) {
-  const clean = [...new Set(ids.filter(Boolean).map(String))].filter(access.isId);
-  if (!clean.length) return new Map();
-  const mos = await CustomerRequest.find({ _id: { $in: clean.map(access.oid) } })
-    .select("requestId requestType customerInfo.name").lean();
-  return new Map(mos.map((m) => [String(m._id), { moNumber: `MO-${m.requestId}`, customerName: m.customerInfo?.name || "", requestType: m.requestType || "" }]));
-}
-
-/**
- * Resolve a list of raw barcodes against this company's work orders.
- * Returns rows in input order, each either resolved (wo, unit, order) or
- * invalid (reason). Duplicates within the list are collapsed to the first.
- */
-async function resolveBarcodes(companyId, rawList) {
-  const seen = new Set();
-  const rows = [];
-  for (const raw of rawList) {
-    const p = parseBarcode(raw);
-    const key = p ? p.barcode : String(raw || "").trim();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    rows.push(p ? { input: String(raw).trim(), ...p } : { input: String(raw).trim(), barcode: key, invalid: "Not a piece barcode — expected WO-<id>-<unit>." });
-  }
-  const need = rows.some((r) => !r.invalid);
-  const index = need ? await workOrderIndex(companyId, WO_SELECT) : new Map();
-  for (const r of rows) {
-    if (r.invalid) continue;
-    const wo = index.get(r.shortId);
-    if (wo === null) { r.invalid = `Two work orders share the id ${r.shortId} — this barcode cannot be resolved.`; continue; }
-    if (!wo) { r.invalid = `No work order of this company matches ${r.shortId}.`; continue; }
-    if (r.unit > (wo.quantity || 0)) { r.invalid = `Piece ${r.unit} is past the ${wo.quantity || 0} ordered on ${displayWorkOrderNumber(wo)}.`; continue; }
-    r.wo = wo;
-  }
-  const orders = await orderInfo(rows.filter((r) => r.wo).map((r) => r.wo.customerRequestId));
-  for (const r of rows) if (r.wo) r.order = orders.get(String(r.wo.customerRequestId || "")) || null;
-  return rows;
-}
-
-/** Existing scans of this stage for the resolved rows, keyed "woId|unit". */
-async function existingScans(stage, rows) {
-  const resolved = rows.filter((r) => r.wo);
-  if (!resolved.length) return new Map();
-  const or = resolved.map((r) => ({ workOrderId: r.wo._id, unitNumber: r.unit }));
-  const docs = await FinishingScan.find({ stage, $or: or })
-    .select("workOrderId unitNumber doneAt doneBy source").lean();
-  return new Map(docs.map((d) => [`${d.workOrderId}|${d.unitNumber}`, d]));
-}
-
-const pieceView = (r) => ({
-  barcode: r.barcode,
-  input: r.input,
-  unit: r.unit ?? null,
-  workOrder: r.wo ? {
-    _id: r.wo._id,
-    workOrderNumber: displayWorkOrderNumber(r.wo),
-    shortId: r.shortId,
-    quantity: r.wo.quantity || 0,
-    productName: r.wo.stockItemName || "",
-    productReference: r.wo.stockItemReference || "",
-    variantAttributes: r.wo.variantAttributes || [],
-    productImage: r.photo || null,
-  } : null,
-  order: r.order || null,
-});
-
-/** A device clock is a hint: nothing from the future, nothing older than 30 days. */
-function plausibleAt(value, fallback) {
-  const t = value ? new Date(value) : null;
-  if (!t || Number.isNaN(t.getTime())) return fallback;
-  const ms = t.getTime();
-  if (ms > fallback.getTime() + 5 * 60 * 1000) return fallback;
-  if (ms < fallback.getTime() - 30 * 24 * 60 * 60 * 1000) return fallback;
-  return t;
-}
-
-const SOURCES = new Set(["scanner", "camera", "manual", "sync"]);
 
 // ═════════════════════════════════════════════════════════════════════════════
 // GET /:stage/ping
@@ -216,66 +123,11 @@ router.post("/:stage/done", ...canRecord, async (req, res) => {
       : Array.isArray(body.barcodes) ? body.barcodes.map((b) => ({ barcode: b })) : [];
     if (!scans.length) return res.status(400).json({ success: false, message: "scans array is required" });
 
-    const now = new Date();
     const stage = req.stage.slug;
-    const who = actorOf(req);
-    const rows = await resolveBarcodes(companyOf(req), scans.slice(0, 500).map((s) => s?.barcode));
-    const byBarcode = new Map(rows.map((r) => [r.barcode, r]));
-    const done = await existingScans(stage, rows);
-
-    const results = [];
-    const toInsert = [];
-    const seenKey = new Set();
-    for (const s of scans) {
-      const p = parseBarcode(s?.barcode);
-      const r = p ? byBarcode.get(p.barcode) : null;
-      const input = String(s?.barcode || "").trim();
-      if (!r || r.invalid) { results.push({ barcode: input, status: "invalid", reason: r?.invalid || "Not a piece barcode — expected WO-<id>-<unit>." }); continue; }
-      const key = `${r.wo._id}|${r.unit}`;
-      const prior = done.get(key);
-      if (prior) { results.push({ ...pieceView(r), status: "already", doneAt: prior.doneAt, doneBy: prior.doneBy }); continue; }
-      if (seenKey.has(key)) { results.push({ ...pieceView(r), status: "already", duplicateInBatch: true }); continue; }
-      seenKey.add(key);
-      toInsert.push({
-        stage, companyId: companyOf(req),
-        workOrderId: r.wo._id, workOrderShortId: r.shortId, workOrderNumber: displayWorkOrderNumber(r.wo),
-        unitNumber: r.unit, barcode: r.barcode,
-        manufacturingOrderId: r.wo.customerRequestId || null,
-        moNumber: r.order?.moNumber || "", customerName: r.order?.customerName || "",
-        stockItemId: r.wo.stockItemId || null, productName: r.wo.stockItemName || "",
-        variantId: r.wo.variantId || "", variantAttributes: r.wo.variantAttributes || [],
-        doneAt: plausibleAt(s?.at, now), recordedAt: now, doneBy: who,
-        source: SOURCES.has(s?.source) ? s.source : "scanner",
-        notes: access.str(s?.notes).slice(0, 200),
-      });
-      results.push({ ...pieceView(r), status: "saved", doneAt: null, _pending: true });
-    }
-
-    let saved = 0;
-    if (toInsert.length) {
-      try {
-        const out = await FinishingScan.insertMany(toInsert, { ordered: false });
-        saved = out.length;
-        for (const d of out) {
-          const row = results.find((x) => x._pending && x.workOrder && String(x.workOrder._id) === String(d.workOrderId) && x.unit === d.unitNumber);
-          if (row) { row.doneAt = d.doneAt; row.doneBy = d.doneBy; delete row._pending; }
-        }
-      } catch (e) {
-        /* A race with another device on the same pieces: the index refused
-           some; the rest were written. Report each precisely. */
-        if (e?.code !== 11000 && !(e?.writeErrors?.length)) throw e;
-        const inserted = new Set((e.insertedDocs || []).map((d) => `${d.workOrderId}|${d.unitNumber}`));
-        saved = inserted.size;
-        for (const row of results) {
-          if (!row._pending) continue;
-          delete row._pending;
-          if (!inserted.has(`${row.workOrder._id}|${row.unit}`)) { row.status = "already"; row.raced = true; }
-        }
-      }
-    }
-    for (const row of results) delete row._pending;
-
-    const counts = { saved, already: results.filter((r) => r.status === "already").length, invalid: results.filter((r) => r.status === "invalid").length };
+    /* `doneBy` is the session. A body may not attribute a scan to somebody
+       else — only a paired device may, and that is a different router. */
+    const clean = scans.map((s) => ({ barcode: s?.barcode, at: s?.at, source: s?.source === "device" ? "scanner" : s?.source, notes: s?.notes }));
+    const { results, counts, saved } = await recordDone({ stage, companyId: companyOf(req), scans: clean, who: actorOf(req) });
     return res.json({
       success: true,
       stage,
@@ -320,7 +172,10 @@ router.get("/:stage/overview", ...canRead, async (req, res) => {
       b.pieces++;
       const pk = s.doneBy?.userId || s.doneBy?.name || "Unknown";
       bump(b.people, pk, { name: s.doneBy?.name || "Unknown" }, s.doneAt);
-      bump(people, pk, { name: s.doneBy?.name || "Unknown", employeeId: s.doneBy?.employeeId || "" }, s.doneAt);
+      bump(people, pk, { name: s.doneBy?.name || "Unknown", employeeId: s.doneBy?.employeeId || "", viaDevice: 0 }, s.doneAt);
+      /* How many of this person's pieces came through a paired hand scanner
+         (15 Oct 2026) — the overview says "via scanner device" beside them. */
+      if (s.source === "device") people.get(pk).viaDevice++;
       const ok = String(s.manufacturingOrderId || "");
       bump(orders, ok, { manufacturingOrderId: s.manufacturingOrderId, moNumber: s.moNumber || "(no order)", customerName: s.customerName || "" }, s.doneAt);
     }
@@ -756,6 +611,139 @@ router.get("/:stage/report", ...canRead, async (req, res) => {
     });
   } catch (err) {
     console.error("Finishing report error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// REMOTE ACCESS — a hand-scanner device as this dashboard's input (15 Oct 2026)
+// ═════════════════════════════════════════════════════════════════════════════
+// The device side is routes/Barcode_Scan_Punchings/remoteStationRoutes.js
+// (no session; a station key). These three are the DASHBOARD side, by a
+// signed-in person with a session, and they are what the Scan page's
+// "Access this dashboard remotely" panel calls.
+//
+//   POST   /:stage/remote/pair-token           a fresh QR (10 minutes)
+//   GET    /:stage/remote/devices              every device paired to this stage
+//   DELETE /:stage/remote/devices/:deviceId    let a device go
+//   PATCH  /:stage/remote/devices/:deviceId    rename it
+
+/** The QR the device scans. Recording rights, because what the device will do is record. */
+router.post("/:stage/remote/pair-token", ...canRecord, async (req, res) => {
+  try {
+    const who = actorOf(req);
+    const minted = station.mintPairToken({ stage: req.stage, companyId: companyOf(req), issuedBy: who });
+    /* Drawn here rather than in the browser, for the reason scannerAdminRoutes
+       gives: a hand-rolled QR that is subtly wrong still looks like a QR. */
+    const QRCode = require("qrcode");
+    const svg = await QRCode.toString(minted.text, { type: "svg", errorCorrectionLevel: "M", margin: 2, width: 280 });
+    return res.json({
+      success: true,
+      stage: req.stage.slug,
+      text: minted.text,
+      expiresAt: minted.expiresAt,
+      ttlSeconds: station.PAIR_TTL_SEC,
+      svg,
+    });
+  } catch (err) {
+    console.error("Finishing remote pair-token error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+/** The devices paired to this stage, with who is on them and today's figures. */
+router.get("/:stage/remote/devices", ...canRead, async (req, res) => {
+  try {
+    const stage = req.stage.slug;
+    const companyId = companyOf(req);
+    const docs = await DeviceHeartbeat.find({ "station.stage": stage, "station.companyId": companyId })
+      .select("deviceId firmwareVersion ipAddress wifiSSID rssi queueDepth bootCount uptimeSec resetReason lastHeartbeatAt station")
+      .sort({ "station.pairedAt": 1 })
+      .lean();
+
+    /* Today's pieces per device, and per device's current operator, from the
+       book itself — the same figures the overview shows. */
+    const { start, end } = shift.istDayWindow();
+    const ids = docs.map((d) => d.deviceId);
+    /* Grouped here rather than in an aggregate: a day's device scans at one
+       stage are a few hundred rows, and the overview above already reads the
+       whole day the same way. */
+    const rows = ids.length ? await FinishingScan.find({ companyId, stage, source: "device", "device.deviceId": { $in: ids }, doneAt: { $gte: start, $lt: end } })
+      .select("device.deviceId doneBy.userId doneBy.employeeId doneAt").lean() : [];
+    const perDevice = new Map();
+    for (const s of rows) {
+      const did = s.device?.deviceId;
+      const row = perDevice.get(did) || { pieces: 0, byOperator: new Map(), lastAt: null };
+      row.pieces++;
+      const key = s.doneBy?.userId || s.doneBy?.employeeId || "";
+      row.byOperator.set(key, (row.byOperator.get(key) || 0) + 1);
+      if (!row.lastAt || s.doneAt > row.lastAt) row.lastAt = s.doneAt;
+      perDevice.set(did, row);
+    }
+
+    const now = Date.now();
+    const devices = docs.map((d) => {
+      const st = d.station || {};
+      const today = perDevice.get(d.deviceId) || { pieces: 0, byOperator: new Map(), lastAt: null };
+      const op = st.operator?.badge ? st.operator : null;
+      const opPieces = op ? (today.byOperator.get(op.userId || "") ?? today.byOperator.get(op.badge) ?? 0) : 0;
+      return {
+        deviceId: d.deviceId,
+        name: st.name || d.deviceId,
+        online: station.isOnline(d.lastHeartbeatAt, now),
+        lastHeartbeatAt: d.lastHeartbeatAt || null,
+        firmwareVersion: d.firmwareVersion || "",
+        ipAddress: d.ipAddress || "",
+        rssi: d.rssi ?? null,
+        queueDepth: d.queueDepth || 0,
+        resetReason: d.resetReason || "",
+        pairedAt: st.pairedAt || null,
+        pairedBy: st.pairedBy || null,
+        keyExpiresAt: st.keyExpiresAt || null,
+        operator: op ? { badge: op.badge, name: op.name, known: op.known, signedInAt: op.signedInAt, piecesToday: opPieces } : null,
+        piecesToday: today.pieces,
+        lastScanAt: st.lastScanAt || today.lastAt || null,
+        lastScanBarcode: st.lastScanBarcode || "",
+        sessions: [...(st.sessionLog || [])].reverse().slice(0, 12),
+      };
+    });
+    return res.json({ success: true, stage, onlineWindowSec: station.ONLINE_WINDOW_MS / 1000, devices });
+  } catch (err) {
+    console.error("Finishing remote devices error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+/** Unpair. The device learns on its next heartbeat and goes back to "scan the QR". */
+router.delete("/:stage/remote/devices/:deviceId", ...canRecord, async (req, res) => {
+  try {
+    const deviceId = access.str(req.params.deviceId).toUpperCase();
+    const r = await DeviceHeartbeat.updateOne(
+      { deviceId, "station.stage": req.stage.slug, "station.companyId": companyOf(req) },
+      { $set: { station: null } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "No such device is paired to this dashboard." });
+    try { require("../../../../services/barcodeScanner/realtime").emitStation({ stage: req.stage.slug, deviceId, type: "unpaired" }); } catch {}
+    return res.json({ success: true, deviceId });
+  } catch (err) {
+    console.error("Finishing remote unpair error:", err);
+    return res.status(500).json({ success: false, message: "Server error", error: err.message });
+  }
+});
+
+/** A name for the device — "Ironing table 2" — so the list reads as the floor does. */
+router.patch("/:stage/remote/devices/:deviceId", ...canRecord, async (req, res) => {
+  try {
+    const deviceId = access.str(req.params.deviceId).toUpperCase();
+    const name = access.str(req.body?.name).slice(0, 40);
+    const r = await DeviceHeartbeat.updateOne(
+      { deviceId, "station.stage": req.stage.slug, "station.companyId": companyOf(req) },
+      { $set: { "station.name": name } },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "No such device is paired to this dashboard." });
+    return res.json({ success: true, deviceId, name });
+  } catch (err) {
+    console.error("Finishing remote rename error:", err);
     return res.status(500).json({ success: false, message: "Server error", error: err.message });
   }
 });

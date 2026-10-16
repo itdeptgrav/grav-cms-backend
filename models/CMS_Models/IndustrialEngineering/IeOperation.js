@@ -238,6 +238,13 @@ const ieOperationSchema = new mongoose.Schema(
       default: () => [],
     },
 
+    /* THE OPERATION REGISTER ROW THIS MIRRORS (15 Oct 2026, owner). The
+       factory's operations live in the global register (`Operation`, what
+       stock items, the floor and costing read); the library is filled from it
+       and kept in step (services/industrialEngineering/ieOperationRegisterSync.js).
+       Null for an operation created in the library alone. */
+    legacyOperationId: { type: mongoose.Schema.Types.ObjectId, ref: "Operation", default: null },
+
     status: { type: String, enum: STATUSES, default: "ACTIVE", required: true },
     statusChangedAt: { type: Date, default: null },
     statusChangedBy: { type: mongoose.Schema.Types.ObjectId, default: null },
@@ -310,6 +317,7 @@ ieOperationSchema.index(
 
 /* The register's own listing order: a company's operations by name. */
 ieOperationSchema.index({ companyId: 1, status: 1, name: 1, _id: 1 });
+ieOperationSchema.index({ companyId: 1, legacyOperationId: 1 });
 
 module.exports = mongoose.models.IeOperation
   || mongoose.model("IeOperation", ieOperationSchema);

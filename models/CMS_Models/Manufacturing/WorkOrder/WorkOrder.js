@@ -407,6 +407,86 @@ const workOrderSchema = new mongoose.Schema(
     // Operations — name + code + timing only. No machine assignment at planning.
     operations: [operationAssignmentSchema],
 
+    /* ── WHO LAST SET THE OPERATIONS, AND FROM WHERE (16 Oct 2026, IE) ────
+       Industrial Engineering assigns and changes a work order's operations
+       from its own order page (one work order or several at once, typed,
+       from the registered operations, from the style's route, or copied from
+       another work order). This is the stamp; the operations themselves stay
+       in `operations[]` above, which every scanner and report already reads.
+       NO DEFAULT: a work order routed before this carries none. */
+    operationsPlan: {
+      type: new mongoose.Schema({
+        source: { type: String, trim: true, default: "" }, // ie-typed | ie-registered | ie-style | ie-copy | ie-library
+        copiedFromWorkOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: null },
+        copiedFromWorkOrderNumber: { type: String, trim: true, default: "" },
+        updatedAt: { type: Date },
+        updatedBy: {
+          userId: { type: String, trim: true, default: "" },
+          name: { type: String, trim: true, default: "" },
+          email: { type: String, trim: true, default: "" },
+        },
+        version: { type: Number, default: 1 },
+      }, { _id: false }),
+      default: undefined,
+    },
+
+    /* ── THE LINE PLAN FOR THIS WORK ORDER (16 Oct 2026, IE) ──────────────
+       Which sewing line of the floor (CanvasLayout.lines[]) this work order
+       is planned on, and station by station — a slot on that line — which of
+       the work order's operations is done there, by which machine (the one
+       standing in the slot when the plan was made, snapshotted by name so a
+       later floor change does not silently rewrite the plan) and, when IE
+       names one, which operator. Stored ON the work order: the cluster is at
+       its collection cap, and the plan is a fact about this work order that
+       PPC and the floor read beside its operations. Several work orders may
+       carry the same plan (IE applies one plan to many); each keeps its own
+       copy, so a later change to one is not a change to the others.
+       NO DEFAULT: an unplanned work order carries nothing. */
+    linePlan: {
+      type: new mongoose.Schema({
+        lineId: { type: String, trim: true, required: true },
+        lineName: { type: String, trim: true, default: "" },
+        slotsPerSide: { type: Number, default: 13 },
+        pitch: { type: Number, default: 175 },
+        tableWidth: { type: Number, default: 120 },
+        stations: [new mongoose.Schema({
+          side: { type: String, enum: ["L", "R"], required: true },
+          index: { type: Number, required: true, min: 1 },
+          /* what the floor had in the slot when planned */
+          item: { type: String, enum: ["machine", "table", "empty"], default: "empty" },
+          machineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine", default: null },
+          machineName: { type: String, trim: true, default: "" },
+          machineType: { type: String, trim: true, default: "" },
+          /* the operation of THIS work order done at this station */
+          operationId: { type: mongoose.Schema.Types.ObjectId, default: null }, // operations[]._id
+          operationCode: { type: String, trim: true, default: "" },
+          operationType: { type: String, trim: true, default: "" },
+          plannedTimeSeconds: { type: Number, default: 0, min: 0 },
+          /* optional: the person IE expects there */
+          operatorId: { type: String, trim: true, default: "" },
+          operatorName: { type: String, trim: true, default: "" },
+          notes: { type: String, trim: true, default: "" },
+        }, { _id: false })],
+        summary: {
+          stations: { type: Number, default: 0 },
+          operationsPlaced: { type: Number, default: 0 },
+          operationsTotal: { type: Number, default: 0 },
+          samMinutes: { type: Number, default: 0 },
+        },
+        notes: { type: String, trim: true, default: "" },
+        copiedFromWorkOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: null },
+        copiedFromWorkOrderNumber: { type: String, trim: true, default: "" },
+        version: { type: Number, default: 1 },
+        plannedAt: { type: Date },
+        plannedBy: {
+          userId: { type: String, trim: true, default: "" },
+          name: { type: String, trim: true, default: "" },
+          email: { type: String, trim: true, default: "" },
+        },
+      }, { _id: false }),
+      default: undefined,
+    },
+
     rawMaterials: [rawMaterialAllocationSchema],
     timeline: timelineSchema,
 

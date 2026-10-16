@@ -280,6 +280,9 @@ function otaDownloadBase(req) {
 router.post('/check-update', async (req, res) => {
   try {
     const { deviceId, machineId, currentVersion, ipAddress, wifiSSID } = req.body;
+    /* Which firmware family this device runs. The station firmware says so;
+       the machine firmware predates the field and says nothing. */
+    const product = req.body.product === 'station' ? 'station' : 'machine';
 
     if (!deviceId || !isValidDeviceId(deviceId)) {
       return res.status(400).json({
@@ -302,6 +305,7 @@ router.post('/check-update', async (req, res) => {
         machineId:   machineId   || '',
         machineName: machineName || '',
         currentFirmwareVersion: currentVersion || '1.0.0',
+        product,
         lastIpAddress: ipAddress,
         wifiSSID,
         status: 'online',
@@ -312,6 +316,7 @@ router.post('/check-update', async (req, res) => {
       device.lastIpAddress = ipAddress;
       device.wifiSSID   = wifiSSID;
       device.status     = 'online';
+      device.product    = product;
 
       // Keep machineId / machineName current in case the user
       // reconfigured the device with a new machine assignment.
@@ -324,7 +329,13 @@ router.post('/check-update', async (req, res) => {
     await device.save();
 
     // ── Firmware update check ─────────────────────────────────────────
-    const latestFirmware = await Firmware.findOne({ isActive: true })
+    /* Only a build of this device's own family. A machine scanner also takes
+       the records written before `product` existed — they are all machine
+       builds; a station never does. */
+    const familyFilter = product === 'station'
+      ? { isActive: true, product: 'station' }
+      : { isActive: true, $or: [{ product: 'machine' }, { product: { $exists: false } }, { product: null }] };
+    const latestFirmware = await Firmware.findOne(familyFilter)
       .sort({ releasedAt: -1 });
 
     let updateAvailable = false;
@@ -495,6 +506,7 @@ router.get('/:deviceId', async (req, res) => {
 router.post('/firmware', upload.single('firmware'), async (req, res) => {
   try {
     const { version, description, targetDevices } = req.body;
+    const product = req.body.product === 'station' ? 'station' : 'machine';
     const file = req.file;
 
     console.log('Firmware upload — version:', version, '| file:', file?.originalname ?? 'none');
@@ -586,6 +598,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
           fileSize:      file.size,
           description,
           isActive:      true,
+          product,
           targetDevices: targetDevicesArray,
           releasedAt:    new Date()
         }
@@ -596,7 +609,7 @@ router.post('/firmware', upload.single('firmware'), async (req, res) => {
     return res.json({
       success: true,
       message: 'Firmware uploaded successfully',
-      firmware: { version, url: firmwareUrl, fileSize: file.size, description }
+      firmware: { version, url: firmwareUrl, fileSize: file.size, description, product }
     });
 
   } catch (error) {
@@ -613,11 +626,41 @@ router.get('/firmware/list', async (_req, res) => {
   try {
     const firmwareList = await Firmware.find({})
       .sort({ releasedAt: -1 })
-      .select('version cloudinaryUrl fileSize description releasedAt isActive targetDevices');
+      .select('version cloudinaryUrl fileSize description releasedAt isActive targetDevices product');
 
     return res.json({ success: true, firmwareList });
   } catch (error) {
     console.error('Error fetching firmware list:', error);
+    return res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+/* ── REMOVE A BUILD (16 Oct 2026, owner: "keep a feature for removing the
+   firmware update") ───────────────────────────────────────────────────────
+   DELETE /firmware/:version removes the record AND the .bin on this server's
+   disk. The list is what devices are offered from, so a removed build is
+   never offered again; a device that already installed it is untouched (it
+   runs the binary it has). A missing file is not an error — the record may
+   have been uploaded to another server — the record still goes. */
+router.delete('/firmware/:version', async (req, res) => {
+  try {
+    const version = String(req.params.version || '').trim();
+    if (!version) return res.status(400).json({ success: false, message: 'Version is required' });
+    const record = await Firmware.findOne({ version });
+    if (!record) return res.status(404).json({ success: false, message: `No build ${version} on the server` });
+    let fileRemoved = false;
+    const filePath = firmwarePathFor(version);
+    try {
+      if (fs.existsSync(filePath)) { fs.unlinkSync(filePath); fileRemoved = true; }
+    } catch (err) {
+      console.error('Firmware file could not be removed:', filePath, err.message);
+      return res.status(500).json({ success: false, message: `The file could not be removed: ${err.message}` });
+    }
+    await Firmware.deleteOne({ _id: record._id });
+    console.log('Firmware removed —', version, fileRemoved ? '(file deleted)' : '(no file on this server)');
+    return res.json({ success: true, version, fileRemoved, product: record.product || 'machine' });
+  } catch (error) {
+    console.error('Error removing firmware:', error);
     return res.status(500).json({ success: false, message: 'Server error' });
   }
 });

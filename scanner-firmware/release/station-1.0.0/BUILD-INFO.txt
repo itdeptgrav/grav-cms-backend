@@ -1,0 +1,17 @@
+GRAV Remote Station firmware 1.0.0 — first build (16 Oct 2026)
+
+Sketch     : GRAV_Station_v1_0_0/GRAV_Station_v1_0_0.ino  (FW_VERSION "1.0.0", FW_PRODUCT "station")
+Board      : esp32:esp32:esp32:PartitionScheme=default  (Default 4MB with spiffs — 1.2MB APP / 1.5MB SPIFFS)
+Core       : esp32 3.2.0 (arduino-cli 1.3.1)
+Libraries  : Adafruit GFX 1.11.11, Adafruit ST7735/ST7789 1.10.4, Adafruit BusIO 1.17.1, ArduinoJson 6.21.5
+Image      : 1,231,650 bytes (93% of the app slot); globals 80,944 bytes
+
+Built on a clean machine from the source in ./source — NOT on the factory PC.
+Before uploading it as the OTA build (Production Supervisor → Firmware,
+device type "Remote finishing station", version 1.0.0), flash ONE device over
+USB from the sketch with the IDE/core you normally use and confirm it pairs
+and records, or simply rebuild from the sketch and upload that binary. Either
+way the version typed into the form must be exactly 1.0.0.
+
+What it is: a hand-scanner device paired (by QR) to the Ironing or Trimming
+dashboard as its remote input. See FIRMWARE-README.md.

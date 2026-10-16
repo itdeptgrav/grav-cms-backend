@@ -11,6 +11,7 @@ const ProductionCompletionScanRecord = require("../../../../models/CMS_Models/Ma
    the Project Manager's production tab did. See
    services/manufacturing/workOrderNumber.js. */
 const { displayWorkOrderNumber } = require("../../../../services/manufacturing/workOrderNumber");
+const { recordSewingCompletion } = require("../../../../services/manufacturing/sewingCompletion");
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 /* A piece barcode is `WO-<8 or 24 hex>-<unit>`. The hex is the work order's
@@ -337,137 +338,34 @@ router.post("/mark-done", async (req, res) => {
       return res.status(400).json({ success: false, message: "barcodes array is required" });
     }
 
-    const uniqueBarcodes = [...new Set(barcodes.map((b) => canonicalOf(b)).filter(Boolean))];
+    /* 15 Oct 2026 (owner): the supervisor's Sewing Completion page is gone —
+       a pass at the first QC checkpoint records completion now
+       (services/manufacturing/sewingCompletion.js). This route stays for any
+       older device still posting to it, and writes through the same
+       service, so the two can never disagree about what a record is. */
+    const out = await recordSewingCompletion({ barcodes, scannedBy, scannedAt });
 
-    // Validate format and collect invalid ones for response
-    const invalidBarcodes = [];
-    let validBarcodes = [];
-    for (const bc of uniqueBarcodes) {
-      const parsed = parseBarcode(bc);
-      if (!parsed.success) invalidBarcodes.push(bc);
-      else validBarcodes.push(bc);
+    if (!out.invalidBarcodes.length && !out.savedBarcodes.length && !out.alreadyScannedBarcodes.length
+        && !out.unroutedBarcodes.length && !out.notInOrderBarcodes.length && !out.beyondQuantityBarcodes.length) {
+      return res.status(400).json({ success: false, message: "No valid barcodes in request", invalidBarcodes: [] });
+    }
+    const onlyInvalid = out.invalidBarcodes.length
+      && !out.savedBarcodes.length && !out.alreadyScannedBarcodes.length
+      && !out.unroutedBarcodes.length && !out.notInOrderBarcodes.length && !out.beyondQuantityBarcodes.length;
+    if (onlyInvalid) {
+      return res.status(400).json({ success: false, message: "No valid barcodes in request", invalidBarcodes: out.invalidBarcodes });
     }
 
-    if (validBarcodes.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message: "No valid barcodes in request",
-        invalidBarcodes,
-      });
-    }
-
-    /* ── AND NOT ONE OF THEM MAY BELONG TO AN UNROUTED ORDER ───────────
-       Checked again here, not only in the preview: a preview is a courtesy
-       and this is the write. A work order with no operations has nothing for
-       a completion scan to complete, and accepting one writes a log that can
-       never move the order off 0% — which is what the walkthrough produced.
-
-       Refused for the WHOLE request rather than filtered out of it: a
-       partial save on a screen that showed six barcodes is worse than a
-       refusal that names the order and what to fix. */
-    /* 13 Oct 2026 (owner): the preview and the save agree piece by piece —
-       an unrouted order's pieces, pieces of no order and pieces past the
-       quantity are SKIPPED and named, and the good pieces in the same batch
-       are saved. A whole-batch refusal left a screen full of genuine scans
-       unsaved for one bad label. */
-    const unroutedBarcodes = [];
-    const notInOrderBarcodes = [];
-    const beyondQuantityBarcodes = [];
-    const scannedShortIds = [...new Set(validBarcodes.map((bc) => parseBarcode(bc).woShortId))];
-    if (scannedShortIds.length) {
-      const orders = await WorkOrder.find({}).select("_id workOrderNumber quantity operations").lean();
-      const byShortId = indexWorkOrdersByBarcodeIdentity(orders);
-      const keep = [];
-      for (const bc of validBarcodes) {
-        const p = parseBarcode(bc);
-        const wo = byShortId.get(p.woShortId);
-        if (!wo) { notInOrderBarcodes.push(bc); continue; }
-        if (wo.quantity != null && p.unitNumber > wo.quantity) { beyondQuantityBarcodes.push(bc); continue; }
-        if (!(wo.operations || []).length && REQUIRE_ROUTE) { unroutedBarcodes.push({ barcode: bc, workOrderNumber: displayWorkOrderNumber(wo) }); continue; }
-        keep.push(bc);
-      }
-      validBarcodes = keep;
-    }
-    if (validBarcodes.length === 0) {
-      return res.json({
-        success: true,
-        message: "Nothing could be recorded: no scanned piece belongs to a routed work order.",
-        totalScansSaved: 0, alreadyScannedBarcodes: [], invalidBarcodes,
-        unroutedBarcodes, notInOrderBarcodes, beyondQuantityBarcodes,
-      });
-    }
-
-
-    // ── Reject barcodes already recorded on any previous day/session ──
-    const validSet = new Set(validBarcodes);
-    const dupDocs = await ProductionCompletionScanRecord.find(
-      { "scans.barcodeId": { $in: validBarcodes } }
-    ).select("scans.barcodeId").lean();
-    const alreadySet = new Set();
-    for (const d of dupDocs)
-      for (const s of d.scans || [])
-        if (validSet.has(s.barcodeId)) alreadySet.add(s.barcodeId);
-
-    const alreadyScannedBarcodes = [...alreadySet];
-    const newBarcodes = validBarcodes.filter((bc) => !alreadySet.has(bc));
-
-    const now = new Date();
-    const dateBucket = getISTMidnight(now);
-
-    /* WHEN each garment was actually scanned, where the device knows.
-     *
-     * Every barcode in a batch used to be stamped with one `now` taken at save
-     * time, so an operator who scanned forty pieces across the afternoon and
-     * pressed Save at 18:00 produced forty scans dated 18:00. That is fine for
-     * a daily total and wrong for anything hour-shaped — and the Overview page
-     * now draws an hourly curve off this field.
-     *
-     * The record page's offline queue has carried a real per-scan `at` on the
-     * device since it was written (components/production-supervisor/scanQueue.js);
-     * it simply never left the browser. `scannedAt` is that map, barcode -> ms.
-     *
-     * Optional and per-barcode: an older page, or a barcode typed in by hand
-     * with no queue entry, still falls back to save time. Bounds-checked
-     * because this is a client-supplied timestamp — anything not inside the
-     * last 30 days, or in the future, is a clock the server should not trust.
-     */
-    const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
-    const timeFor = (barcode) => {
-      const raw = scannedAt && scannedAt[barcode];
-      if (!raw) return now;
-      const t = new Date(raw);
-      if (Number.isNaN(t.getTime())) return now;
-      const age = now.getTime() - t.getTime();
-      if (age < -60_000 || age > THIRTY_DAYS_MS) return now;
-      return t;
-    };
-
-    if (newBarcodes.length > 0) {
-      const scanEntries = newBarcodes.map((bc) => ({
-        barcodeId: bc,
-        scannedAt: timeFor(bc),
-        scannedBy: scannedBy || "",
-      }));
-      await ProductionCompletionScanRecord.findOneAndUpdate(
-        { date: dateBucket },
-        { $push: { scans: { $each: scanEntries } }, $setOnInsert: { date: dateBucket } },
-        { upsert: true, new: true }
-      );
-    }
-
-    const skipped = alreadyScannedBarcodes.length + invalidBarcodes.length + unroutedBarcodes.length + notInOrderBarcodes.length + beyondQuantityBarcodes.length;
+    const n = out.savedBarcodes.length;
+    const skipped = out.alreadyScannedBarcodes.length + out.invalidBarcodes.length + out.unroutedBarcodes.length
+      + out.notInOrderBarcodes.length + out.beyondQuantityBarcodes.length;
     return res.json({
       success: true,
-      message: newBarcodes.length > 0
-        ? `${newBarcodes.length} piece${newBarcodes.length !== 1 ? "s" : ""} recorded${skipped ? `, ${skipped} skipped` : ""}`
-        : `Nothing new recorded — ${alreadyScannedBarcodes.length ? `${alreadyScannedBarcodes.length} already recorded earlier` : "every piece was skipped"}`,
-      totalScansSaved: newBarcodes.length,
-      savedBarcodes: newBarcodes,
-      alreadyScannedBarcodes,
-      invalidBarcodes,
-      unroutedBarcodes, notInOrderBarcodes, beyondQuantityBarcodes,
+      message: n > 0
+        ? `${n} piece${n !== 1 ? "s" : ""} recorded${skipped ? `, ${skipped} skipped` : ""}`
+        : `Nothing new recorded — ${out.alreadyScannedBarcodes.length ? `${out.alreadyScannedBarcodes.length} already recorded earlier` : "every piece was skipped"}`,
+      ...out,
     });
-
   } catch (err) {
     console.error("mark-done error:", err);
     res.status(500).json({ success: false, message: "Server error", error: err.message });

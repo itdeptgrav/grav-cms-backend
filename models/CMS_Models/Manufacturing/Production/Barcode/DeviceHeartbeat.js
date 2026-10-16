@@ -6,6 +6,56 @@
 
 const mongoose = require("mongoose");
 
+/* ── A DEVICE PAIRED TO A FINISHING DASHBOARD (15 Oct 2026) ─────────────────
+   The hand scanners are being re-purposed as remote inputs for the Ironing
+   and Trimming dashboards (services/manufacturing/finishingStation.js). The
+   pairing lives HERE, on the one-document-per-device record that already
+   exists, because the cluster is at its collection cap and a pairing is a
+   fact about a device. `stage` null means "not paired to any dashboard" —
+   the device is (or was) a machine scanner, and nothing below applies. */
+const stationOperatorSchema = new mongoose.Schema(
+  {
+    badge: { type: String, trim: true, default: "" },
+    name: { type: String, trim: true, default: "" },
+    userId: { type: String, trim: true, default: "" },
+    known: { type: Boolean, default: false },
+    signedInAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const stationSessionSchema = new mongoose.Schema(
+  {
+    badge: { type: String, trim: true, default: "" },
+    name: { type: String, trim: true, default: "" },
+    userId: { type: String, trim: true, default: "" },
+    signedInAt: { type: Date, default: null },
+    signedOutAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
+const stationSchema = new mongoose.Schema(
+  {
+    stage: { type: String, trim: true, default: null },
+    companyId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    /* A name the dashboard shows: "Ironing 2". Defaults to the device id. */
+    name: { type: String, trim: true, default: "" },
+    pairedAt: { type: Date, default: null },
+    pairedBy: {
+      type: new mongoose.Schema({ userId: String, name: String }, { _id: false }),
+      default: null,
+    },
+    keyExpiresAt: { type: Date, default: null },
+    operator: { type: stationOperatorSchema, default: null },
+    sessionLog: { type: [stationSessionSchema], default: [] },
+    lastScanAt: { type: Date, default: null },
+    lastScanBarcode: { type: String, trim: true, default: "" },
+    lastEventAt: { type: Date, default: null },
+  },
+  { _id: false },
+);
+
 const deviceHeartbeatSchema = new mongoose.Schema(
   {
     deviceId: { type: String, required: true, unique: true, trim: true },
@@ -47,12 +97,16 @@ const deviceHeartbeatSchema = new mongoose.Schema(
     // greater revision can be evidence of the scanner's post-commit state —
     // timestamps cannot prove that ordering. Historical documents read as 0.
     evidenceRevision: { type: Number, default: 0, min: 0 },
+
+    // The dashboard this device is a remote input for, if any. See above.
+    station: { type: stationSchema, default: null },
   },
   { timestamps: true }
 );
 
 deviceHeartbeatSchema.index({ machineId: 1 });
 deviceHeartbeatSchema.index({ lastHeartbeatAt: 1 });
+deviceHeartbeatSchema.index({ "station.stage": 1, "station.companyId": 1 });
 
 module.exports = mongoose.model("DeviceHeartbeat", deviceHeartbeatSchema);
 module.exports.schema = deviceHeartbeatSchema;

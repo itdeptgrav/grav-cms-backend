@@ -5,6 +5,7 @@
 //
 //   GET  /material-requests/orders/:moId            the order's requests, each line with what the Store issued against it
 //   POST /material-requests/orders/:moId            raise one  { reason, neededBy?, lines:[{rawItemId, variantId?, quantity, unit?, note?}] }
+//   PUT  /material-requests/orders/:moId/:requestId          edit it (same body as raise) — only while nothing was issued against it
 //   POST /material-requests/orders/:moId/:requestId/cancel   { reason }   — only while nothing was issued against it
 //   GET  /material-requests/orders/:moId/report     the same, shaped for the Excel export
 //
@@ -45,6 +46,12 @@ router.post("/material-requests/orders/:moId", requireCompany, canWrite, wrap(as
     notifyMaterialRequestRaised(out.order, out.created, actor(req)).catch((e) => console.error("[ppc material-requests] mail:", e?.message || e));
   } catch (e) { console.error("[ppc material-requests] mail setup:", e?.message || e); }
   res.json({ success: true, message: `${out.created?.requestNumber || "The request"} was sent to the Store.`, ...out });
+}));
+
+/* Edit while open and nothing was issued — the same rule as cancel (16 Oct 2026). */
+router.put("/material-requests/orders/:moId/:requestId", requireCompany, canWrite, wrap(async (req, res) => {
+  const out = await svc.update(companyOf(req), req.params.moId, req.params.requestId, req.body || {}, actor(req));
+  res.json({ success: true, message: `${out.updated?.requestNumber || "The request"} was updated.`, ...out });
 }));
 
 router.post("/material-requests/orders/:moId/:requestId/cancel", requireCompany, canWrite, wrap(async (req, res) => {

@@ -234,6 +234,100 @@ router.get("/companies", canRead, handle(async (req, res) => {
  *
  * Both are reads. There is still no write verb anywhere on this router. */
 
+/** GET /manufacturing-orders — the Orders tab: one row per MO (15 Oct 2026). */
+router.get("/manufacturing-orders", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieOrders.listManufacturingOrders(req.ie, { q: req.query.q });
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /manufacturing-orders/:moId — one MO and its work orders. */
+router.get("/manufacturing-orders/:moId", requireCompany, canRead, handle(async (req, res) => {
+  const out = await ieOrders.readManufacturingOrder(req.ie, { moId: req.params.moId });
+  return res.json({ success: true, ...out });
+}));
+
+/* ══ IE PLANS A WORK ORDER: OPERATIONS AND THE LINE (16 Oct 2026, owner) ═══
+ *
+ * "The IE will assign the operation against the WO … keep the shortcuts for
+ * selecting multiple WOs … the line planning will happen on the basis of WO,
+ * on the 2D/3D interface the supervisor has … copy from another WO … stored
+ * for that WO so PPC can see it."
+ *
+ * Reads need a viewer, writes an editor — the same two rungs as the rest of
+ * this router. Every write names the work orders in its body (one or many)
+ * and answers per work order. services/industrialEngineering/
+ * ieWorkOrderPlanning.service.js holds the rules. Declared before `/orders/:id`
+ * so "operations" and "line-plan" are never read as an order id. */
+const iePlanning = require("../../../services/industrialEngineering/ieWorkOrderPlanning.service");
+
+/** GET /work-orders?ids=a,b,c — the chosen work orders, with route and plan. */
+router.get("/work-orders", requireCompany, canRead, handle(async (req, res) => {
+  const ids = String(req.query.ids || "").split(",").map((s) => s.trim()).filter(Boolean);
+  const out = await iePlanning.readWorkOrders(req.ie, { ids });
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /work-orders/floor — the sewing lines and what stands in each slot. */
+router.get("/work-orders/floor", requireCompany, canRead, handle(async (req, res) => {
+  const out = await iePlanning.readFloor();
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /work-orders/plan-sources?what=line-plan|operations&q= — "copy from…" */
+router.get("/work-orders/plan-sources", requireCompany, canRead, handle(async (req, res) => {
+  const out = await iePlanning.planSources(req.ie, { q: req.query.q, what: req.query.what, limit: req.query.limit });
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /work-orders/registered-operations?q= — the operation master, for the picker. */
+router.get("/work-orders/registered-operations", requireCompany, canRead, handle(async (req, res) => {
+  const out = await iePlanning.registeredOperations({ q: req.query.q, limit: req.query.limit });
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /work-orders/operators?q= — people, for a station. */
+router.get("/work-orders/operators", requireCompany, canRead, handle(async (req, res) => {
+  const out = await iePlanning.operators({ q: req.query.q, limit: req.query.limit });
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/operations { workOrderIds, operations, mode, source } — sets (or appends) the route */
+router.post("/work-orders/operations", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.setOperations(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/operations/copy { fromWorkOrderId, workOrderIds, mode } */
+router.post("/work-orders/operations/copy", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.copyOperations(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/line-plan { workOrderIds, plan } — saves the plan */
+router.post("/work-orders/line-plan", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.saveLinePlan(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/line-plan/copy { fromWorkOrderId, workOrderIds } */
+router.post("/work-orders/line-plan/copy", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.copyLinePlan(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** GET /work-orders/:workOrderId — one work order, with route and plan. */
+router.get("/work-orders/:workOrderId", requireCompany, canRead, handle(async (req, res) => {
+  const out = await iePlanning.readWorkOrder(req.ie, { workOrderId: req.params.workOrderId });
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/line-plan/clear { workOrderId } — forget the plan (a POST,
+ *  like every other verb on this router: nothing here is a DELETE). */
+router.post("/work-orders/line-plan/clear", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.clearLinePlan(req.ie, { workOrderId: req.body?.workOrderId });
+  return res.json({ success: true, ...out });
+}));
+
 /** GET /orders — the IE Orders landing list. */
 router.get("/orders", requireCompany, canRead, handle(async (req, res) => {
   const out = await ieOrders.listOrders(req.ie, {

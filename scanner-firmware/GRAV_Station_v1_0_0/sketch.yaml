@@ -1,0 +1,4 @@
+# Arduino sketch project file — pins the board so a fresh clone builds the same
+# binary. PartitionScheme=default is the 4MB-with-SPIFFS layout: two OTA slots
+# plus the LittleFS area the offline scan queue lives in.
+default_fqbn: esp32:esp32:esp32:PartitionScheme=default

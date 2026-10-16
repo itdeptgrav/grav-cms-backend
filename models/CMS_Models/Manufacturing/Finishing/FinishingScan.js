@@ -57,9 +57,22 @@ const finishingScanSchema = new mongoose.Schema(
     recordedAt: { type: Date, default: Date.now },
     doneBy: { type: doneBySchema, default: () => ({}) },
     /* scanner = hand scanner into the field, camera = phone camera, manual =
-       typed, sync = arrived from the device's offline queue. */
-    source: { type: String, enum: ["scanner", "camera", "manual", "sync"], default: "scanner" },
+       typed, sync = arrived from the device's offline queue, device = a
+       paired hand-scanner device operated remotely (15 Oct 2026). */
+    source: { type: String, enum: ["scanner", "camera", "manual", "sync", "device"], default: "scanner" },
     notes: { type: String, trim: true, default: "" },
+
+    /* source "device" only: WHICH device, and the device's own event id —
+       <deviceId>-<bootCount>-<seq>, stable across its retries. The piece
+       index above is what makes a retry harmless; this is for the audit:
+       "who did, when did, from where". */
+    device: {
+      type: new mongoose.Schema(
+        { deviceId: { type: String, trim: true, default: "" }, eventId: { type: String, trim: true, default: "" } },
+        { _id: false },
+      ),
+      default: null,
+    },
   },
   { timestamps: false },
 );

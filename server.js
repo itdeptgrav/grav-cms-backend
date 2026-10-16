@@ -1695,6 +1695,15 @@ app.use(
  * Merged in from the standalone barcode server (11 Sep 2026), which ran as its
  * own process on port 5001 against its own MongoDB.
  * --------------------------------------------------------------------- */
+/* A hand-scanner device paired to a finishing dashboard (Ironing, Trimming —
+ * 15 Oct 2026). Same base path as the machine scanners, so one SRV: card
+ * re-points both; same reason for sitting here: a device has no session, it
+ * has a station key (routes/Barcode_Scan_Punchings/remoteStationRoutes.js).
+ * Mounted BEFORE the ingest router so `/station/*` is answered by it. */
+app.use(
+  "/api/cms/production/barcode_punchings/station",
+  require("./routes/Barcode_Scan_Punchings/remoteStationRoutes.js"),
+);
 app.use(
   "/api/cms/production/barcode_punchings",
   require("./routes/Barcode_Scan_Punchings/scannerIngestRoutes.js"),

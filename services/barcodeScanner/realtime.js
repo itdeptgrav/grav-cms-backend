@@ -105,4 +105,17 @@ function emitRollup(result) {
   });
 }
 
-module.exports = { attach, emitScans, emitRollup, clientCount };
+/**
+ * A paired finishing station did something (15 Oct 2026): a piece, a sign-in,
+ * a sign-out, a pairing, an unpairing. The Ironing / Trimming Scan pages
+ * listen for this and re-read their device list and figures. A summary, not
+ * the records — same reasoning as emitScans().
+ *
+ *   finishing-station-update   broadcast — { stage, deviceId, type, at, ... }
+ */
+function emitStation(payload) {
+  if (!io || !payload) return;
+  io.emit("finishing-station-update", { ...payload, at: new Date().toISOString() });
+}
+
+module.exports = { attach, emitScans, emitRollup, emitStation, clientCount };

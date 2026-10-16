@@ -22,6 +22,11 @@ const { displayWorkOrderNumber } = require("../../../../services/manufacturing/w
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 const { boundedRecordedAt } = require("../../../../services/manufacturing/recordedAt");
+const { resolvePhotos, resolveVariantAttributes, variantText } = require("../../../../services/manufacturing/workOrderPhoto");
+/* A pass at the FIRST checkpoint is sewing completion (15 Oct 2026, owner):
+   the supervisor's Sewing Completion scan page is gone and this is its
+   replacement. services/manufacturing/sewingCompletion.js says the rule. */
+const { completeFromQcPass } = require("../../../../services/manufacturing/sewingCompletion");
 
 const istDateString = (d = new Date()) => {
   const ist = new Date(d.getTime() + 5.5 * 60 * 60 * 1000);
@@ -772,11 +777,13 @@ router.post("/save-inspection", async (req, res) => {
 
     // Recomputed AFTER the write so the station can redraw the piece's strip
     // from the response instead of re-scanning to find out what it just did.
-    const progress = stage
-      ? await qcStages.pieceProgress(barcodeId).catch(() => null)
-      : null;
+    const [progress, sewingCompletion] = await Promise.all([
+      stage ? qcStages.pieceProgress(barcodeId).catch(() => null) : Promise.resolve(null),
+      // The verdict is already saved; this never throws (it answers `error`).
+      completeFromQcPass({ barcodeId, status, stage, inspectorName: qcName, at: record.inspectedAt || new Date() }),
+    ]);
 
-    res.json({ success: true, record, pieceProgress: progress });
+    res.json({ success: true, record, pieceProgress: progress, sewingCompletion });
   } catch (err) {
     console.error("[QC save-inspection] error:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -929,13 +936,104 @@ router.post("/save-inspection-offline", async (req, res) => {
       recordedOffline: true,
     });
 
-    const progress = stage
-      ? await qcStages.pieceProgress(barcodeId).catch(() => null)
-      : null;
+    const [progress, sewingCompletion] = await Promise.all([
+      stage ? qcStages.pieceProgress(barcodeId).catch(() => null) : Promise.resolve(null),
+      // Recorded at the moment the device made the verdict, so an offline pass
+      // synced the next morning lands on the shift that sewed the piece.
+      completeFromQcPass({ barcodeId, status, stage, inspectorName: qcName, at: recordedAt }),
+    ]);
 
-    res.json({ success: true, record, pieceProgress: progress });
+    res.json({ success: true, record, pieceProgress: progress, sewingCompletion });
   } catch (err) {
     console.error("[QC save-inspection-offline] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// ─── GET /pending-rework ─────────────────────────────────────────────────────
+//
+// THE PIECES BEHIND THE "IN REWORK" FIGURE (15 Oct 2026, owner: "keep a mini
+// text button to see these product details — the barcode id, the product
+// photo, name and all"). The overview's figure is `pendingRework.count` from
+// /inspections; this answers WHICH garments, with the same snapshot and the
+// SAME viewer scope, so the list and the number can never disagree.
+//
+// Per piece: the barcode, product, variant, photo, work order, order and
+// customer, the checkpoint(s) it is held at, how many times it has been sent
+// back, and the latest failing verdict (when, by whom, what was wrong).
+// Oldest failure first — the piece waiting longest is the one to chase.
+router.get("/pending-rework", async (req, res) => {
+  try {
+    const [viewer, deptConfigured] = await Promise.all([
+      qcViewer.resolveViewer(req),
+      qcViewer.departmentConfigured(),
+    ]);
+    const scopeClause = qcViewer.viewerFilter(viewer, { departmentConfigured: deptConfigured });
+    const snap = await qcStages.pendingReworkSnapshot(scopeClause || {});
+    if (!snap.pieces.length) return res.json({ success: true, count: 0, pieces: [] });
+
+    const barcodes = snap.pieces.map((p) => p.barcodeId);
+    const lastFails = await QCInspection.find({ ...(scopeClause || {}), barcodeId: { $in: barcodes }, status: "defective" })
+      .sort({ inspectedAt: -1 })
+      .select("barcodeId inspectedAt inspectedByQCName stageName defects defectTypes")
+      .lean();
+    const lastFailOf = new Map();
+    for (const r of lastFails) if (!lastFailOf.has(r.barcodeId)) lastFailOf.set(r.barcodeId, r);
+
+    // One work-order read per distinct short id — a handful, not one per piece.
+    const shortIds = [...new Set(barcodes.map((b) => parseBarcode(b)).filter((p) => p.success).map((p) => p.workOrderShortId))];
+    const woList = await Promise.all(shortIds.map((id) => findWorkOrderByShortId(id).catch(() => null)));
+    const woByShort = new Map(shortIds.map((id, k) => [id, woList[k]]));
+    const moIds = [...new Set(woList.filter(Boolean).map((w) => w.customerRequestId && String(w.customerRequestId)).filter(Boolean))];
+    const mos = moIds.length
+      ? await CustomerRequest.find({ _id: { $in: moIds } }).select("requestId customerInfo.name").lean()
+      : [];
+    const moById = new Map(mos.map((m) => [String(m._id), m]));
+
+    const rows = snap.pieces.map((p) => {
+      const parsed = parseBarcode(p.barcodeId);
+      const wo = parsed.success ? woByShort.get(parsed.workOrderShortId) : null;
+      return { p, parsed, wo, stockItemId: wo?.stockItemId || null, variantAttributes: wo?.variantAttributes || [] };
+    });
+    const [photos, variants] = await Promise.all([resolvePhotos(rows), resolveVariantAttributes(rows)]);
+
+    const defectWords = (r) => {
+      if (!r) return [];
+      const out = [];
+      for (const d of r.defects || []) {
+        const types = (d.types || []).map((t) => t.name || t.code).filter(Boolean);
+        out.push(`${d.operationName || d.operationCode}${types.length ? ` — ${types.join(", ")}` : ""}`);
+      }
+      for (const t of r.defectTypes || []) out.push(t.code === "OTHER" && t.note ? `Other — ${t.note}` : (t.name || t.code));
+      return out;
+    };
+
+    const pieces = rows.map(({ p, parsed, wo }, k) => {
+      const mo = wo?.customerRequestId ? moById.get(String(wo.customerRequestId)) : null;
+      const fail = lastFailOf.get(p.barcodeId) || null;
+      return {
+        barcodeId: p.barcodeId,
+        unitNumber: parsed.success ? parsed.unitNumber : null,
+        product: wo?.stockItemName || "Unknown product",
+        productReference: wo?.stockItemReference || "",
+        variant: variantText(variants[k]),
+        photo: photos[k] || null,
+        workOrderNumber: wo ? displayWorkOrderNumber(wo) : null,
+        quantity: wo?.quantity ?? null,
+        moRequestId: mo?.requestId || null,
+        manufacturingOrderId: wo?.customerRequestId || null,
+        customerName: mo?.customerInfo?.name || null,
+        heldAt: (p.openRework || []).map((s) => s.stageName).filter(Boolean),
+        reworkCount: p.reworkCount || 0,
+        lastFailedAt: fail?.inspectedAt || null,
+        lastFailedBy: fail?.inspectedByQCName || null,
+        defects: defectWords(fail),
+      };
+    }).sort((a, b) => new Date(a.lastFailedAt || 0) - new Date(b.lastFailedAt || 0));
+
+    res.json({ success: true, count: pieces.length, pieces });
+  } catch (err) {
+    console.error("[QC pending-rework] error:", err);
     res.status(500).json({ success: false, message: err.message });
   }
 });

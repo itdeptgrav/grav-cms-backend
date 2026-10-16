@@ -1,3 +1,43 @@
+# Sewing completion is QC's in-line pass; Ops QR on the Overview; orders newest first (15 Oct 2026)
+
+**Not committed.** Owner: the supervisor's Sewing Completion scan page
+duplicated a scan QC already makes — a piece that passes the FIRST QC
+checkpoint (in-line, end of the sewing line) is sewn. So:
+
+- `services/manufacturing/sewingCompletion.js` is the one writer of
+  `productioncompletionscanrecords`: `recordSewingCompletion` (the old
+  mark-done logic, moved: format, work order, quantity, optional route rule,
+  recorded-once-ever dedup, bucketed by the IST day the scan HAPPENED) and
+  `completeFromQcPass` (records when the verdict is `passed` at the
+  lowest-serial active stage, or when no stages are configured; never
+  throws). `isCompletingStage` is pure and tested
+  (`sewingCompletion.test.js`, 6/6).
+- `POST /manufacturing/qc/save-inspection` and `/save-inspection-offline`
+  call it after the verdict is written and answer `sewingCompletion:
+  {attempted, recorded, alreadyRecorded, skippedReason?}`; the offline path
+  uses the device's `recordedAt`. The CMS station toast adds "recorded as
+  sewn".
+- `POST /production-completion/mark-done` still works for any older caller,
+  through the same service. `/preview` unchanged.
+- CMS: the Sewing Completion nav entry and page are gone (the URL forwards to
+  the Overview); the Ops QR button moved from the tracker's More menu to the
+  Overview header; the Orders page opens on "Newest" (was "Deadline"), and
+  every "scanned on the Production Record page" wording now says the first
+  QC checkpoint.
+
+Checked 15 Oct 2026 against the dev server with scratch pieces of a Black
+Pant work order (all removed afterwards): P1 pass → recorded (by the
+inspector's name); P2 pass on the same piece → `not-first-stage`, no second
+row; P1 defect → `not-a-pass`; the rework pass at P1 → recorded; offline P1
+pass → recorded at the device's time; legacy mark-done of the first piece →
+"already recorded earlier", "hello" invalid. Browser: Overview shows Ops QR
+and opens the panel, nav without Sewing Completion, Orders sorted
+newest-first (10 Aug, 03 Aug, 25 Jul…), `/production-record` lands on the
+Overview, tracker More menu without Ops QR. Known, pre-existing, not changed:
+the offline QC route's own parser reads only the 8-hex barcode form.
+
+---
+
 # Cmd/Ctrl K: GRAV Music and desktop apps missing from Apps (10 Oct 2026)
 
 **Not committed.** Typing "music" in HR's Cmd/Ctrl K gave "Nothing in HR is called
@@ -2382,3 +2422,38 @@ directly and work either way, but the pages its lines open call those APIs.
   environment), so no real counts were seen, and nothing was viewed in a
   browser.
 
+
+## IE: operations assignment and per-work-order line planning (16 Oct 2026)
+
+Owner's ask: the IE order page must show the product photo etc.; IE assigns /
+changes the operations against work orders (one or many at once — "the main
+thing"); line planning per work order on the supervisor's 2D/3D floor, with
+shortcuts (multi-WO, copy / reference another WO), stored on the WO for PPC.
+
+Backend (grav-backend):
+- `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js` — `operationsPlan`
+  and `linePlan` sub-documents (additive, no default).
+- `services/industrialEngineering/ieWorkOrderPlanning.service.js` (+ `.test.js`,
+  4 node:test cases) — reads, set/append/copy operations, save/copy/clear line
+  plan, floor read, plan sources, registered operations, operators.
+- `routes/CMS_Routes/IndustrialEngineering/ieRoutes.js` — `/work-orders/*`.
+- `services/industrialEngineering/ieOrders.service.js` — MO rows carry photo,
+  variant, operation rows + plan stamp, line-plan summary.
+
+Frontend (grav-clothing):
+- `app/industrial-engineering/orders/mo/[moId]/page.js` (rebuilt),
+  `…/mo/[moId]/line-plan/page.js` (new),
+  `components/industrialEngineering/orders/{WorkOrderRow.js (rebuilt),
+  OperationsDrawer.js, LinePlanBoard.js, workOrderPlanning.mjs (+ test, 4 cases)}`,
+  `app/production-supervisor/dashboard/tracker/components/FloorCanvas1D.js`
+  (`slotBadges`, `machineSlotTap` props), `lib/industrialEngineering/api.js`,
+  `app/industrial-engineering/ieShell.test.mjs` (scope of the read-only sweep).
+
+Verification: backend unit tests pass; the FerretDB harness
+(`/home/claude/work/e2e/ie-plan.js`, real models + real service, ownership
+bound stubbed) passes 19 checks — read with photo/variant, floor read,
+register search, set / append / copy operations (closed WO skipped, version
+bumps, stamps), save one plan on two WOs each resolving its own operation
+rows, copy plan, re-save, sources, clear, refusals. Frontend: pure rules
+tests pass; every new JSX file parses (esbuild); `ieShell.test.mjs` 33 pass /
+2 fail exactly as at HEAD. Not run here: `next build`, a browser session.

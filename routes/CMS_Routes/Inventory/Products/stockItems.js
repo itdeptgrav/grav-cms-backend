@@ -518,14 +518,30 @@ router.get("/data/salary-lookup", async (req, res) => {
     const { department, designation } = req.query;
 
     if (!department && !designation) {
-      const [depts, desigs] = await Promise.all([
-        Employee.distinct("department", { isActive: true }),
-        Employee.distinct("designation", { isActive: true }),
-      ]);
+      /* 15 Oct 2026 (owner): "don't suggest every designation of every
+         department — only those of the selected department." `byDepartment`
+         maps each department to the designations its active employees hold,
+         so a form can narrow the second list to the first choice. Additive:
+         `departments` and `designations` are unchanged. */
+      const pairs = await Employee.find({ isActive: true }).select("department designation").lean()
+      const map = new Map()
+      for (const e of pairs) {
+        const d = String(e.department || "").trim()
+        const g = String(e.designation || "").trim()
+        if (!d) continue
+        if (!map.has(d)) map.set(d, new Set())
+        if (g) map.get(d).add(g)
+      }
+      const byDepartment = {}
+      for (const [d, set] of [...map.entries()].sort(([x], [y]) => x.localeCompare(y))) {
+        byDepartment[d] = [...set].sort((x, y) => x.localeCompare(y))
+      }
+      const allDesigs = new Set(pairs.map((e) => String(e.designation || "").trim()).filter(Boolean))
       return res.json({
         success: true,
-        departments: depts.filter(Boolean).sort(),
-        designations: desigs.filter(Boolean).sort(),
+        departments: Object.keys(byDepartment),
+        designations: [...allDesigs].sort(),
+        byDepartment,
       });
     }
 

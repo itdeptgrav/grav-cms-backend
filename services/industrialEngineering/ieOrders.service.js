@@ -266,7 +266,7 @@ async function styleOwnersFor(styleIds) {
  *
  * @returns {Promise<{clause, styleIds:Set<string>, decisions:Map}|null>}
  */
-async function orderOwnershipBound(companyId) {
+async function provenOwnershipBound(companyId) {
   const want = str(companyId);
   const styleBound = await styleOwnershipClause(want, OWNERSHIP_MODE);
   if (!styleBound) return null;
@@ -384,11 +384,79 @@ async function orderOwnershipBound(companyId) {
     if (decision.companyId && decision.companyId === want) admissible.add(key);
   }
 
-  if (!admissible.size) return null;
+  /* Orders a style proves belong to ANOTHER company — kept out of the legacy
+     read-through below as well. */
+  const foreign = [...decisions.entries()]
+    .filter(([, d]) => d.companyId && d.companyId !== want)
+    .map(([key]) => key);
+
   return {
-    clause: { _id: { $in: [...admissible].map(oid) } },
+    clause: admissible.size ? { _id: { $in: [...admissible].map(oid) } } : null,
     styleIds,
     decisions,
+    foreign,
+  };
+}
+
+/* ── EVERY ORDER, WHILE THE LEGACY WINDOW IS OPEN (15 Oct 2026, owner) ─────
+ * "This order section is not showing any data ... show all the orders to IE,
+ * because IE will set the line planning against the order, work-order wise."
+ *
+ * The proof above admits an order only through a sample style linked to it.
+ * Since 9 Oct 2026 orders are released without one (SALES_RELEASE_REQUIRE_STYLE
+ * is off), and 151 of 152 work orders carry no company link either, so the
+ * page listed nothing. Every other department (Cutting, Packaging, Finishing,
+ * PPC) admits unlinked work orders while `tenantContext.legacyWindowOpen()` is
+ * true; IE now does the same:
+ *
+ *   - a work order proved to be this company's by a style  → listed, as before;
+ *   - one whose sales line names this company              → listed;
+ *   - one with no company link at all                      → listed (legacy);
+ *   - one a style or its sales line proves is ANOTHER company's → never listed.
+ *
+ * An order with no style still lists; its engineering readiness reads
+ * "unknown" until a style is attached — nothing about it is invented.
+ * STORE_PURCHASE_STRICT_TENANCY=1 closes the window and IE returns to the
+ * proven-only list with every other department. */
+/* A 15-second memo per company (15 Oct 2026, owner: "the IE dashboard is
+   lagging"). The bound is several reads across styles, requests and work
+   orders, and every IE order screen asks it again — the MO list, the MO, the
+   work order, back again. Concurrent callers share one computation.
+   IE_ORDER_BOUND_CACHE_MS=0 turns it off. */
+const BOUND_CACHE_MS = Number(process.env.IE_ORDER_BOUND_CACHE_MS ?? 15000);
+const boundCache = new Map(); // companyId -> { at, promise }
+async function orderOwnershipBound(companyId) {
+  const key = str(companyId);
+  if (BOUND_CACHE_MS > 0) {
+    const hit = boundCache.get(key);
+    if (hit && Date.now() - hit.at < BOUND_CACHE_MS) return hit.promise;
+    const promise = computeOrderOwnershipBound(companyId).catch((err) => { boundCache.delete(key); throw err; });
+    boundCache.set(key, { at: Date.now(), promise });
+    return promise;
+  }
+  return computeOrderOwnershipBound(companyId);
+}
+
+async function computeOrderOwnershipBound(companyId) {
+  const want = str(companyId);
+  const proven = await provenOwnershipBound(companyId);
+  const tenantContext = require("../storePurchase/tenantContext.service");
+  if (!tenantContext.legacyWindowOpen() || !isId(want)) {
+    return proven && proven.clause ? proven : null;
+  }
+  const notForeign = (proven?.foreign || []).map(oid);
+  const legacy = {
+    $and: [
+      { $or: [{ "salesLineLink.companyId": oid(want) }, { "salesLineLink.companyId": null }] },
+      ...(notForeign.length ? [{ _id: { $nin: notForeign } }] : []),
+    ],
+  };
+  return {
+    clause: proven?.clause ? { $or: [proven.clause, legacy] } : legacy,
+    styleIds: proven?.styleIds || new Set(),
+    decisions: proven?.decisions || new Map(),
+    foreign: proven?.foreign || [],
+    legacyReadThrough: true,
   };
 }
 
@@ -697,7 +765,97 @@ const ORDER_PROJECTION = [
      the styles it resolves to are published instead, each with its provenance. */
   "sampleStyleId",
   "customerRequestId createdAt updatedAt",
+  /* 15 Oct 2026: what IE plans a line from, work order by work order. */
+  "variantAttributes operations.operationType operations.operationCode operations.plannedTimeSeconds",
+  /* 16 Oct 2026: the photo's variant, the operation ids the line plan names,
+     the plan's summary and who last set the route. */
+  "variantId operations._id operationsPlan linePlan.lineId linePlan.lineName linePlan.summary linePlan.plannedAt linePlan.plannedBy linePlan.version linePlan.copiedFromWorkOrderNumber",
 ].join(" ");
+
+/* ── WHAT IE NEEDS TO PLAN A LINE, PER WORK ORDER (15 Oct 2026, owner) ──────
+ * The row above was built for proving styles and said nothing a planner could
+ * act on: the work order number came out blank (most work orders store none;
+ * `displayWorkOrderNumber` is how every other screen prints one), and there
+ * was no order number, customer, delivery date, variant or operation list.
+ * These are added beside the existing fields, never instead of them. The
+ * customer's NAME and the order's number and delivery date are read; nothing
+ * commercial (prices, quotations, payments) is selected. */
+async function planningContextFor(orders) {
+  const { displayWorkOrderNumber } = require("../manufacturing/workOrderNumber");
+  const requestIds = [...new Set(orders.map((o) => str(o.customerRequestId)).filter(isId))];
+  const requests = requestIds.length
+    ? await CustomerRequest().find({ _id: { $in: requestIds.map(oid) } })
+      .select("_id requestId customerInfo.name customerInfo.deliveryDeadline requestType").lean()
+    : [];
+  const byId = new Map(requests.map((r) => [str(r._id), r]));
+  const out = new Map();
+  for (const o of orders) {
+    const req = byId.get(str(o.customerRequestId)) || null;
+    const ops = Array.isArray(o.operations) ? o.operations : [];
+    const totalSeconds = ops.reduce((sum, op) => sum + (Number(op.plannedTimeSeconds) || 0), 0);
+    const variant = (o.variantAttributes || [])
+      .filter((a) => a && str(a.value))
+      .map((a) => (a.name ? `${a.name}: ${a.value}` : str(a.value)))
+      .join(", ");
+    out.set(str(o._id), {
+      reference: displayWorkOrderNumber(o) || str(o.workOrderNumber),
+      variant: variant || null,
+      order: req ? {
+        moId: str(req._id),
+        number: str(req.requestId) || null,
+        customerName: str(req.customerInfo?.name) || null,
+        deliveryDate: req.customerInfo?.deliveryDeadline || null,
+        measurement: req.requestType === "measurement_conversion",
+      } : { moId: "unassigned", number: null, customerName: null, deliveryDate: null, measurement: false },
+      workOrderOperations: {
+        count: ops.length,
+        totalSeconds,
+        samMinutes: ops.length ? Math.round((totalSeconds / 60) * 100) / 100 : null,
+        rows: ops.map((op, i) => ({
+          operationId: op._id ? str(op._id) : null,
+          sequence: i + 1,
+          name: str(op.operationType),
+          code: str(op.operationCode),
+          seconds: Number(op.plannedTimeSeconds) || 0,
+        })),
+        plan: o.operationsPlan ? {
+          source: str(o.operationsPlan.source),
+          updatedAt: o.operationsPlan.updatedAt || null,
+          updatedBy: str(o.operationsPlan.updatedBy?.name),
+          copiedFromWorkOrderNumber: str(o.operationsPlan.copiedFromWorkOrderNumber),
+        } : null,
+      },
+      /* 16 Oct 2026: the line plan IE stored on the work order, summarised. */
+      linePlan: o.linePlan?.lineId ? {
+        lineId: str(o.linePlan.lineId),
+        lineName: str(o.linePlan.lineName),
+        stations: o.linePlan.summary?.stations || 0,
+        operationsPlaced: o.linePlan.summary?.operationsPlaced || 0,
+        operationsTotal: o.linePlan.summary?.operationsTotal || 0,
+        samMinutes: o.linePlan.summary?.samMinutes || 0,
+        plannedAt: o.linePlan.plannedAt || null,
+        plannedBy: str(o.linePlan.plannedBy?.name),
+        version: o.linePlan.version || 1,
+        copiedFromWorkOrderNumber: str(o.linePlan.copiedFromWorkOrderNumber),
+      } : null,
+    });
+  }
+  /* The product photo and the variant as the finishing portals resolve them
+     (variant image first; 105 of 128 products keep photos on the variant). */
+  try {
+    const { resolvePhotos, resolveVariantAttributes, variantText } = require("../manufacturing/workOrderPhoto");
+    const [photos, variants] = await Promise.all([resolvePhotos(orders), resolveVariantAttributes(orders)]);
+    orders.forEach((o, i) => {
+      const row = out.get(str(o._id));
+      if (!row) return;
+      row.photo = photos[i] || null;
+      if (!row.variant && variants[i]?.attributes?.length) row.variant = variantText(variants[i]);
+    });
+  } catch (err) {
+    console.warn("[ie orders] photos unavailable:", err?.message || err);
+  }
+  return out;
+}
 
 /**
  * WHAT AN IE ORDER ROW MAY CONTAIN.
@@ -864,8 +1022,17 @@ async function listOrders(ctx, { limit, cursor } = {}) {
     .lean();
 
   const page = found.slice(0, size);
-  const assembled = await assembleOrders(page, bound, ctx.companyId);
-  const rows = assembled.map((a) => orderRow(a.order, a));
+  const [assembled, planning] = await Promise.all([
+    assembleOrders(page, bound, ctx.companyId),
+    planningContextFor(page),
+  ]);
+  const rows = assembled.map((a) => {
+    const row = orderRow(a.order, a);
+    const extra = planning.get(row.orderId) || {};
+    /* The list carries the operation COUNT and SAM; the rows are on the order. */
+    return { ...row, ...extra, workOrderOperations: extra.workOrderOperations
+      ? { ...extra.workOrderOperations, rows: undefined } : null };
+  });
 
   const last = page[page.length - 1];
   return {
@@ -901,10 +1068,13 @@ async function readOrder(ctx, { orderId } = {}) {
     .lean();
   if (!order) throw orderNotFound();
 
-  const [assembled] = await assembleOrders([order], bound, ctx.companyId);
+  const [[assembled], planning] = await Promise.all([
+    assembleOrders([order], bound, ctx.companyId),
+    planningContextFor([order]),
+  ]);
 
   return {
-    order: orderRow(order, assembled),
+    order: { ...orderRow(order, assembled), ...(planning.get(str(order._id)) || {}) },
     /* The styles, in full engineering detail — the same shape the Chunk 1A
        style list publishes, plus how the link was proved and where to open the
        style's own record. */
@@ -976,7 +1146,127 @@ async function readOrder(ctx, { orderId } = {}) {
   };
 }
 
+/* ══ THE ORDERS TAB IS MANUFACTURING ORDERS (15 Oct 2026, owner) ═══════════
+ *
+ * "In the orders tab, showcase the MO orders, not directly the WO." IE reads
+ * its work by manufacturing order (the customer request a set of work orders
+ * was raised from) and opens one to plan its work orders. So:
+ *
+ *   listManufacturingOrders  one row per MO, from the work orders this
+ *                            company may see (the same bound as the work-order
+ *                            list), with its number, customer, delivery, how
+ *                            many work orders and pieces, the products, and
+ *                            how many work orders carry an operation route;
+ *   readManufacturingOrder   one MO and its work orders, each row exactly the
+ *                            work-order row `listOrders` publishes.
+ *
+ * The MO's customer NAME, number and delivery date are read; nothing
+ * commercial (prices, quotations, payments) is selected. Work orders raised
+ * from no request are grouped under "unassigned". */
+const MO_WORK_ORDER_PROJECTION = [
+  "_id customerRequestId quantity status stockItemName createdAt",
+  "operations.plannedTimeSeconds",
+].join(" ");
+
+async function listManufacturingOrders(ctx, { q = "" } = {}) {
+  assertContext(ctx);
+  const bound = await orderOwnershipBound(ctx.companyId);
+  if (!bound) return { rows: [], total: 0 };
+  const wos = await WorkOrder().find({ $and: [bound.clause] }).select(MO_WORK_ORDER_PROJECTION).lean();
+
+  const groups = new Map();
+  for (const wo of wos) {
+    const key = isId(wo.customerRequestId) ? str(wo.customerRequestId) : "unassigned";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(wo);
+  }
+  const ids = [...groups.keys()].filter(isId);
+  const requests = ids.length
+    ? await CustomerRequest().find({ _id: { $in: ids.map(oid) } })
+      .select("_id requestId customerInfo.name customerInfo.deliveryDeadline requestType status createdAt").lean()
+    : [];
+  const reqById = new Map(requests.map((r) => [str(r._id), r]));
+
+  let rows = [...groups.entries()].map(([moId, list]) => {
+    const req = reqById.get(moId) || null;
+    const products = [...new Set(list.map((w) => str(w.stockItemName)).filter(Boolean))];
+    const statusCounts = {};
+    for (const w of list) {
+      const st = str(w.status) || "unknown";
+      statusCounts[st] = (statusCounts[st] || 0) + 1;
+    }
+    const withOps = list.filter((w) => (w.operations || []).length > 0).length;
+    const newest = list.reduce((m, w) => (w.createdAt && (!m || w.createdAt > m) ? w.createdAt : m), null);
+    return {
+      moId,
+      number: req ? (str(req.requestId) || null) : (moId === "unassigned" ? "Unassigned" : null),
+      customerName: str(req?.customerInfo?.name) || null,
+      deliveryDate: req?.customerInfo?.deliveryDeadline || null,
+      measurement: req?.requestType === "measurement_conversion",
+      status: str(req?.status) || null,
+      createdAt: req?.createdAt || newest,
+      workOrderCount: list.length,
+      totalQuantity: list.reduce((sum, w) => sum + (Number(w.quantity) || 0), 0),
+      products: products.slice(0, 4),
+      productCount: products.length,
+      workOrdersWithOperations: withOps,
+      workOrderStatuses: statusCounts,
+    };
+  });
+
+  const term = str(q).toLowerCase();
+  if (term) {
+    rows = rows.filter((r) => [r.number, r.customerName, ...r.products].some((v) => str(v).toLowerCase().includes(term)));
+  }
+  rows.sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+  return { rows, total: rows.length };
+}
+
+async function readManufacturingOrder(ctx, { moId } = {}) {
+  assertContext(ctx);
+  const key = str(moId);
+  if (key !== "unassigned" && !isId(key)) throw orderNotFound();
+  const bound = await orderOwnershipBound(ctx.companyId);
+  if (!bound) throw orderNotFound();
+
+  const which = key === "unassigned"
+    ? { $or: [{ customerRequestId: null }, { customerRequestId: { $exists: false } }] }
+    : { customerRequestId: oid(key) };
+  const orders = await WorkOrder().find({ $and: [bound.clause, which] })
+    .select(ORDER_PROJECTION).sort({ createdAt: 1, _id: 1 }).lean();
+  if (!orders.length) throw orderNotFound();
+
+  const [assembled, planning, req] = await Promise.all([
+    assembleOrders(orders, bound, ctx.companyId),
+    planningContextFor(orders),
+    key === "unassigned" ? null : CustomerRequest().findById(oid(key))
+      .select("_id requestId customerInfo.name customerInfo.deliveryDeadline requestType status createdAt").lean(),
+  ]);
+  /* The MO page keeps the operation ROWS (16 Oct 2026): IE assigns and reads
+     the route work order by work order on that page. */
+  const workOrders = assembled.map((a) => {
+    const row = orderRow(a.order, a);
+    const extra = planning.get(row.orderId) || {};
+    return { ...row, ...extra, workOrderOperations: extra.workOrderOperations || null };
+  });
+  return {
+    manufacturingOrder: {
+      moId: key,
+      number: req ? (str(req.requestId) || null) : "Unassigned",
+      customerName: str(req?.customerInfo?.name) || null,
+      deliveryDate: req?.customerInfo?.deliveryDeadline || null,
+      measurement: req?.requestType === "measurement_conversion",
+      status: str(req?.status) || null,
+      createdAt: req?.createdAt || null,
+      workOrderCount: workOrders.length,
+      totalQuantity: workOrders.reduce((sum, w) => sum + (Number(w.plannedQuantity) || 0), 0),
+    },
+    workOrders,
+  };
+}
+
 module.exports = {
+  listManufacturingOrders, readManufacturingOrder,
   CODES, DEFAULT_LIMIT, MAX_LIMIT,
   STYLE_LINK, LINE_RESOLUTION, STYLE_LINK_STATUS, COMPANY_ATTRIBUTION,
   STYLE_READINESS, ORDER_READINESS, LINE_PLANNING, ORDER_PROJECTION, ORDER_STYLE_PROJECTION,

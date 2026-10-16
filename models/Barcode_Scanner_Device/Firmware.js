@@ -39,7 +39,22 @@ const firmwareSchema = new mongoose.Schema({
     type: String,
     default: 'all' // 'all' means all devices, otherwise specific deviceIds
   }],
-  minSupportedVersion: String
+  minSupportedVersion: String,
+
+  /* WHICH KIND OF DEVICE THIS BUILD IS FOR (15 Oct 2026).
+   *
+   * Two firmwares now share the OTA store: the sewing-machine scanner
+   * ("machine", the original) and the remote finishing station ("station" —
+   * a scanner paired to the Ironing / Trimming dashboard). The same ESP32
+   * board runs either, so a build offered to "all" devices would re-flash a
+   * station as a machine scanner, or the reverse. check-update offers a
+   * build only to devices reporting the same product; records written before
+   * this field existed are machine builds. */
+  product: {
+    type: String,
+    enum: ['machine', 'station'],
+    default: 'machine'
+  }
 }, {
   timestamps: true
 });

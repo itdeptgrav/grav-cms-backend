@@ -2218,3 +2218,52 @@ Checked 13 Oct 2026 on the owner's own codes: WO-d9f4eb87-001/002 are
 "already recorded on 2026-07-27" (which is why they were refused),
 WO-5c10f3bb-002 is new, WO-5c10f3bb-999 is past the 15 ordered, "hello" is
 not a piece barcode.
+
+## IE plans a work order: operations and the line (16 Oct 2026, owner)
+
+"The IE will assign the operation against the WO — the main thing — with
+shortcuts to select multiple WOs; the line planning happens on the basis of
+WO, on the 2D/3D interface the supervisor has; copy / reference another WO;
+stored for that WO so PPC can see it." Everything is on the IE router
+(`/api/cms/ie/work-orders/*`, viewer reads / editor writes, declared before
+`/orders/:id`) and in `services/industrialEngineering/ieWorkOrderPlanning.service.js`
+(tested: `ieWorkOrderPlanning.test.js`, plus the FerretDB harness, 19 checks).
+
+- **No new collection** (the cap). Two additive sub-documents on `WorkOrder`,
+  both `default: undefined` so older rows carry nothing: `operationsPlan`
+  (who last set `operations[]`, from where — `ie-typed | ie-registered |
+  ie-style | ie-copy | ie-mixed` — `copiedFromWorkOrderId/Number`,
+  `version`) and `linePlan` (`lineId` / `lineName` of a `CanvasLayout.lines[]`
+  line, its shape, `stations[]` = `{ side, index, item, machineId/Name/Type
+  as the floor had it, operationId → operations[]._id, operationCode,
+  operationType, plannedTimeSeconds, operatorId/Name, notes }`, `summary`,
+  `copiedFrom…`, `version`, `plannedAt/By`). `operations[]` itself is
+  unchanged — the scanner, QC and PPC read it as before.
+- **Every write names the work orders** (`workOrderIds[]`, ≤200) and answers
+  per work order (`results[]`: `saved` / `skipped` with the reason; a
+  completed / cancelled / forwarded work order is skipped, never changed).
+  Each gets its OWN copy — nothing is shared by reference.
+  - `POST /work-orders/operations { workOrderIds, operations[], mode:
+    replace|append, source }` — `normaliseOperations` (name required, time
+    ≥ 0, ≤400 rows).
+  - `POST /work-orders/operations/copy { fromWorkOrderId, workOrderIds }`.
+  - `POST /work-orders/line-plan { workOrderIds, plan }` — `planFor`
+    resolves every station's operation against THAT work order's own rows,
+    by `operationId`, then code (case-insensitive), then name; an operation
+    the work order lacks is kept by name with `operationId: null` and named
+    in `results[].notOnWorkOrder`. Stations off the line or listed twice are
+    refused before anything is written.
+  - `POST /work-orders/line-plan/copy { fromWorkOrderId, workOrderIds }`,
+    `POST /work-orders/line-plan/clear { workOrderId }` (a POST: nothing on
+    this router is a DELETE).
+- **Reads**: `GET /work-orders?ids=` and `/work-orders/:id` (route + plan +
+  photo via `workOrderPhoto`), `/work-orders/floor` (the lines with the
+  machine standing in each slot — read-only; the floor is written only by
+  `/api/cms/production/canvas-layout`), `/work-orders/plan-sources?what=
+  operations|line-plan&q=` (the "copy from" picker), `/work-orders/
+  registered-operations?q=`, `/work-orders/operators?q=`.
+  `GET /manufacturing-orders/:moId` rows now carry `photo`, `variant`,
+  `workOrderOperations.rows` (with `operationId`) and `.plan`, and a
+  `linePlan` summary.
+- Every work order is proved through the SAME `ieOrders.orderOwnershipBound`
+  the IE order pages use; a foreign one is "not found".

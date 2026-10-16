@@ -559,6 +559,57 @@ router.patch("/:id/quantity", async (req, res) => {
   }
 });
 
+// ─── GET /by-code/:code ──────────────────────────────────────────────────────
+//
+// A LABEL FOUND BY THE 8 CHARACTERS PRINTED ON IT (15 Oct 2026, owner). The
+// raw-item sticker now prints "#" + the last 8 characters of the label's id
+// under its quantity, so a person can type it when a QR will not scan. This
+// answers which label(s) end in those 8 characters, in the same company scope
+// as GET /:id. Usually one; more than one is possible (8 of 24 hex), and then
+// every match is returned so the screen can ask which.
+//
+// No index helps a suffix match, so this reads the company's label ids once;
+// the projection keeps that to a few bytes a label.
+router.get("/by-code/:code", async (req, res) => {
+  try {
+    const code = String(req.params.code || "").trim().replace(/^#/, "").toLowerCase();
+    if (!/^[0-9a-f]{8}$/.test(code)) {
+      return res.status(400).json({ success: false, code: "BAD_LABEL_CODE", message: "A label code is the 8 characters after # on the sticker, letters a–f and digits 0–9." });
+    }
+    const companyId = req.tenant?.companyId || null;
+    const companyMatch = companyId && mongoose.Types.ObjectId.isValid(String(companyId))
+      ? new mongoose.Types.ObjectId(String(companyId))
+      : companyId;
+    const matches = await Barcode.aggregate([
+      { $match: { $or: [{ companyId: companyMatch }, { companyId: null }, { companyId: { $exists: false } }] } },
+      { $match: { $expr: { $eq: [{ $substrCP: [{ $toString: "$_id" }, 16, 8] }, code] } } },
+      { $project: { rawItemName: 1, rawItemSku: 1, variantCombination: 1, quantity: 1, unit: 1, identityState: 1, voidedAt: 1, createdAt: 1 } },
+      { $sort: { createdAt: -1 } },
+      { $limit: 10 },
+    ]);
+    if (!matches.length) {
+      return res.status(404).json({ success: false, code: "LABEL_CODE_NOT_FOUND", message: `No label ends in #${code}. Check the 8 characters on the sticker.` });
+    }
+    res.json({
+      success: true,
+      code,
+      matches: matches.map((m) => ({
+        _id: String(m._id),
+        rawItemName: m.rawItemName || "",
+        rawItemSku: m.rawItemSku || "",
+        variant: (m.variantCombination || []).join(" · "),
+        quantity: m.quantity ?? null,
+        unit: m.unit || "",
+        voided: Boolean(m.voidedAt) || m.identityState === "VOIDED",
+        createdAt: m.createdAt || null,
+      })),
+    });
+  } catch (err) {
+    console.error("[barcodes by-code] error:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {

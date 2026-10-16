@@ -433,6 +433,9 @@ const codeTaken = (code, holder = null, restore = false) => fail(
  */
 async function listOperations(ctx, { q = "", status = "", limit, cursor } = {}) {
   assertContext(ctx);
+  /* The library holds the factory's operations: bring it in step with the
+     operation register first (15 Oct 2026; see ieOperationRegisterSync.js). */
+  await require("./ieOperationRegisterSync").syncLibraryFromRegister(ctx.companyId);
   const size = pageSize(limit);
   const after = decodeCursor(cursor, "name");
 
@@ -475,7 +478,8 @@ async function listOperations(ctx, { q = "", status = "", limit, cursor } = {}) 
       companyScoped: true,
       register: "IE_COMPANY_OPERATION_LIBRARY",
       message: "This library belongs to the company you are working in. "
-        + "The older global operation register is a separate list and is not shown here.",
+        + "Every operation in the operation register (the list stock items use) is here, "
+        + "kept in step with it automatically.",
     }),
     rows: page.map(publish),
     limit: size,

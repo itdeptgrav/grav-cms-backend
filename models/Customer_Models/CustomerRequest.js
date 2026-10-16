@@ -1449,6 +1449,9 @@ customerRequestSchema.add({
         ],
         createdBy: materialRequestPerson,
         createdAt: { type: Date, default: Date.now },
+        /* Edited by PPC while open and nothing issued (16 Oct 2026). */
+        updatedAt: { type: Date, default: null },
+        updatedBy: materialRequestPerson,
         cancelledAt: { type: Date, default: null },
         cancelledBy: materialRequestPerson,
         cancelReason: { type: String, trim: true, default: "" },

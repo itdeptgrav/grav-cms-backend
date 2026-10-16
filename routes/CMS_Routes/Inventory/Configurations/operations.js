@@ -156,8 +156,14 @@ router.get("/operations/:id", async (req, res) => {
 router.post("/operations", async (req, res) => {
   try {
     const { name, operationCode, totalSam, durationSeconds, machineType, salaryDept, salaryDesig } = req.body
-    if (!name || totalSam == null || !machineType) {
-      return res.status(400).json({ success: false, message: "name, totalSam, and machineType are required" })
+    const { problems } = checkOperationRow(req.body, "This operation")
+    const wantCode = String(operationCode || "").trim().toUpperCase()
+    if (wantCode) {
+      const taken = await codesTaken([wantCode])
+      if (taken.has(wantCode)) problems.push(`code ${wantCode} is already used by "${taken.get(wantCode)}"`)
+    }
+    if (problems.length) {
+      return res.status(400).json({ success: false, code: "OPERATION_INVALID", message: `Not saved. ${problems.join("; ")}.`, problems })
     }
 
     const codeUpper = (operationCode || "").trim().toUpperCase()
@@ -206,6 +212,23 @@ router.put("/operations/:id", async (req, res) => {
     const op = await Operation.findById(req.params.id)
     if (!op) return res.status(404).json({ success: false, message: "Operation not found" })
 
+    // Same checks as a new row, on the values this save would leave behind.
+    const merged = {
+      name: name !== undefined ? name : op.name,
+      operationCode: operationCode !== undefined ? operationCode : op.operationCode,
+      totalSam: totalSam != null ? totalSam : op.totalSam,
+      machineType: machineType !== undefined ? machineType : op.machineType,
+    }
+    const { problems } = checkOperationRow(merged, "This operation")
+    const newCode = String(merged.operationCode || "").trim().toUpperCase()
+    if (newCode && newCode !== String(op.operationCode || "").toUpperCase()) {
+      const taken = await codesTaken([newCode], op._id)
+      if (taken.has(newCode)) problems.push(`code ${newCode} is already used by "${taken.get(newCode)}"`)
+    }
+    if (problems.length) {
+      return res.status(400).json({ success: false, code: "OPERATION_INVALID", message: `Not saved. ${problems.join("; ")}.`, problems })
+    }
+
     if (name !== undefined) op.name = name.trim()
     if (operationCode !== undefined) op.operationCode = operationCode.trim().toUpperCase()
     if (totalSam != null) {
@@ -240,7 +263,7 @@ router.put("/operations/:id", async (req, res) => {
 
     res.json({ success: true, message: "Operation updated", operation: op })
   } catch (err) {
-    res.status(500).json({ success: false, message: "Failed to update operation" })
+    res.status(500).json({ success: false, message: `Failed to update operation: ${err.message}` })
   }
 })
 
@@ -261,6 +284,53 @@ router.delete("/operations/:id", async (req, res) => {
   }
 })
 
+/* ── CHECKING A ROW BEFORE ANYTHING IS SAVED (15 Oct 2026, owner: "so many
+   issues while creating the operations") ─────────────────────────────────
+   The multi-row save (and CSV import) used to save row by row: a row with no
+   machine type then threw half-way - rows before it already saved, the
+   message "Import failed: Machine type is required" naming no row - a SAM
+   typed as text saved NaN or crashed, a row without a name or SAM was
+   dropped in silence, and a code already in use was accepted, which is how
+   the register came to hold 15 codes twice. Now every row is checked first,
+   each problem names its row, and NOTHING is saved unless every row is good.
+   A code is refused when another operation already carries it (or another
+   row of the same save does); a blank code stays allowed. */
+function checkOperationRow(row, label) {
+  const problems = []
+  const name = String(row?.name ?? "").trim()
+  const machineType = String(row?.machineType ?? "").trim()
+  const samRaw = row?.totalSam
+  const sam = typeof samRaw === "number" ? samRaw : parseFloat(String(samRaw ?? "").trim())
+  if (!name) problems.push(`${label}: the operation name is missing`)
+  if (samRaw === "" || samRaw == null || !Number.isFinite(sam) || sam < 0) problems.push(`${label}: SAM must be a number of minutes, 0 or more`)
+  if (!machineType) problems.push(`${label}: the machine type is missing`)
+  const code = String(row?.operationCode ?? "").trim().toUpperCase()
+  return {
+    problems,
+    clean: {
+      name,
+      operationCode: code,
+      totalSam: sam,
+      durationSeconds: Number.isFinite(Number(row?.durationSeconds)) && row?.durationSeconds !== "" && row?.durationSeconds != null
+        ? Math.round(Number(row.durationSeconds))
+        : Math.round(sam * 60),
+      machineType,
+      salaryDept: String(row?.salaryDept ?? "").trim(),
+      salaryDesig: String(row?.salaryDesig ?? "").trim(),
+    },
+  }
+}
+
+/** Codes from `codes` already carried by an operation other than `exceptId`. */
+async function codesTaken(codes, exceptId = null) {
+  const wanted = [...new Set(codes.filter(Boolean))]
+  if (!wanted.length) return new Map()
+  const filter = { operationCode: { $in: wanted } }
+  if (exceptId) filter._id = { $ne: exceptId }
+  const rows = await Operation.find(filter).select("operationCode name").lean()
+  return new Map(rows.map((x) => [x.operationCode, x.name]))
+}
+
 // POST bulk import via CSV  (also handles the multi-row save from the UI)
 router.post("/operations/import", async (req, res) => {
   try {
@@ -269,20 +339,35 @@ router.post("/operations/import", async (req, res) => {
       return res.status(400).json({ success: false, message: "No operations provided" })
     }
 
-    const inserted = []
-    for (const row of operations) {
-      if (!row.name || row.totalSam == null) continue
-      const codeUpper = (row.operationCode || "").trim().toUpperCase()
-      const op = new Operation({
-        name: row.name.trim(),
-        operationCode: codeUpper,
-        totalSam: parseFloat(row.totalSam),
-        durationSeconds: row.durationSeconds ?? Math.round(parseFloat(row.totalSam) * 60),
-        machineType: (row.machineType || "").trim(),
-        salaryDept: (row.salaryDept || "").trim(),
-        salaryDesig: (row.salaryDesig || "").trim(),
-        createdBy: req.user.id,
+    // Check every row before saving any.
+    const checked = operations.map((row, i) => checkOperationRow(row, `Row ${i + 1}`))
+    const problems = checked.flatMap((c) => c.problems)
+    const seenCodes = new Map()
+    checked.forEach((c, i) => {
+      const code = c.clean.operationCode
+      if (!code) return
+      if (seenCodes.has(code)) problems.push(`Row ${i + 1}: code ${code} is also on row ${seenCodes.get(code) + 1} of this save`)
+      else seenCodes.set(code, i)
+    })
+    const taken = await codesTaken(checked.map((c) => c.clean.operationCode))
+    checked.forEach((c, i) => {
+      const code = c.clean.operationCode
+      if (code && taken.has(code)) problems.push(`Row ${i + 1}: code ${code} is already used by "${taken.get(code)}"`)
+    })
+    if (problems.length) {
+      return res.status(400).json({
+        success: false,
+        code: "OPERATION_ROWS_INVALID",
+        message: `Nothing was saved. ${problems.join("; ")}.`,
+        problems,
       })
+    }
+
+    const inserted = []
+    for (const { clean } of checked) {
+      const row = clean
+      const codeUpper = clean.operationCode
+      const op = new Operation({ ...clean, createdBy: req.user.id })
       await op.save()
       inserted.push(op)
 

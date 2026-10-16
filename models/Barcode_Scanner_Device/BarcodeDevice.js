@@ -32,6 +32,10 @@ const barcodeDeviceSchema = new mongoose.Schema({
   machineId: String,
   machineName: String,
 
+  /* "machine" (sewing-machine scanner) or "station" (remote finishing
+     station). Reported by the firmware on check-update; absent = machine. */
+  product: String,
+
   lastIpAddress: String,
   wifiSSID: String,
   status: {

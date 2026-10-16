@@ -104,6 +104,7 @@ function requestView(r, issueRows) {
     reason: str(r.reason), neededBy: r.neededBy || null,
     createdAt: r.createdAt || null, createdBy: r.createdBy || null,
     cancelledAt: r.cancelledAt || null, cancelledBy: r.cancelledBy || null, cancelReason: str(r.cancelReason),
+    updatedAt: r.updatedAt || null, updatedBy: r.updatedBy || null,
     lines, lineCount: lines.length, totalRequested, totalIssued,
     issueCount: new Set(lines.flatMap((l) => l.issues.map((x) => x.issuanceId))).size,
     lastIssuedAt: lines.flatMap((l) => l.issues.map((x) => x.at)).filter(Boolean).sort((a, b) => new Date(b) - new Date(a))[0] || null,
@@ -146,12 +147,8 @@ async function listForOrder(moId, { companyId = null } = {}) {
 
 /* ── raise ──────────────────────────────────────────────────────────────── */
 
-async function create(companyId, moId, body, actor) {
-  const order = await orderForCompany(companyId, moId);
-  const reason = str(body?.reason);
-  if (reason.length < 5) throw refuse(400, "Say why the material is needed (at least 5 characters).");
-  const neededBy = body?.neededBy ? new Date(body.neededBy) : null;
-  if (neededBy && Number.isNaN(neededBy.getTime())) throw refuse(400, "The needed-by date is not valid.");
+/** The lines of a request, checked against the register. Shared by create and update. */
+async function buildLines(body) {
   const inLines = Array.isArray(body?.lines) ? body.lines : [];
   if (!inLines.length) throw refuse(400, "Add at least one raw item.");
   if (inLines.length > 60) throw refuse(400, "A request carries at most 60 lines.");
@@ -159,7 +156,7 @@ async function create(companyId, moId, body, actor) {
   if (itemIds.some((id) => !isId(id))) throw refuse(400, "A line names no raw item.");
   const items = await RawItem.find({ _id: { $in: itemIds } }).select("name sku unit variants._id variants.combination variants.sku variants.unit").lean();
   const byId = new Map(items.map((i) => [String(i._id), i]));
-  const lines = inLines.map((l, i) => {
+  return inLines.map((l, i) => {
     const item = byId.get(str(l.rawItemId));
     if (!item) throw refuse(400, `Line ${i + 1}: that raw item is not in the register.`);
     const qty = num(l.quantity);
@@ -170,12 +167,24 @@ async function create(companyId, moId, body, actor) {
       if (!variant) throw refuse(400, `Line ${i + 1} (${item.name}): that variant is not on the item.`);
     }
     return {
-      _id: new mongoose.Types.ObjectId(),
+      /* An edited line that keeps its id keeps it (nothing has been issued
+         against it, so nothing references it yet — but a stable id is still
+         the honest thing). A new line gets a new one. */
+      _id: isId(l.lineId) ? oid(l.lineId) : new mongoose.Types.ObjectId(),
       rawItemId: item._id, rawItemName: str(item.name), rawItemSku: str(item.sku),
       variantId: variant ? variant._id : null, variantCombination: variant ? (variant.combination || []).map(str) : [],
       quantity: qty, unit: str(l.unit) || str(variant?.unit) || str(item.unit) || "unit", note: str(l.note).slice(0, 500),
     };
   });
+}
+
+async function create(companyId, moId, body, actor) {
+  const order = await orderForCompany(companyId, moId);
+  const reason = str(body?.reason);
+  if (reason.length < 5) throw refuse(400, "Say why the material is needed (at least 5 characters).");
+  const neededBy = body?.neededBy ? new Date(body.neededBy) : null;
+  if (neededBy && Number.isNaN(neededBy.getTime())) throw refuse(400, "The needed-by date is not valid.");
+  const lines = await buildLines(body);
   const n = (order.materialRequests || []).length + 1;
   const doc = {
     _id: new mongoose.Types.ObjectId(),
@@ -206,10 +215,35 @@ async function cancel(companyId, moId, requestId, reason, actor) {
   return viewOf(fresh);
 }
 
+/* ── edit (16 Oct 2026, owner: "edit, withdraw and all he can do") ───────── */
+// Same rule as cancel: only while the request is open and the Store has
+// issued nothing against it. After the first issue the figures on both sides
+// are a contract; PPC raises a further request instead.
+async function update(companyId, moId, requestId, body, actor) {
+  const order = await orderForCompany(companyId, moId);
+  const r = (order.materialRequests || []).find((x) => String(x._id) === str(requestId));
+  if (!r) throw refuse(404, "That material request was not found on this order.");
+  if (r.status === "cancelled") throw refuse(400, "That request was cancelled; raise a new one.");
+  const issued = await StockIssuance.exists({ manufacturingOrder: order._id, materialRequestId: r._id });
+  if (issued) throw refuse(400, "The Store has already issued against this request — it cannot be edited. Raise a further request for anything more.");
+  const reason = str(body?.reason);
+  if (reason.length < 5) throw refuse(400, "Say why the material is needed (at least 5 characters).");
+  const neededBy = body?.neededBy ? new Date(body.neededBy) : null;
+  if (neededBy && Number.isNaN(neededBy.getTime())) throw refuse(400, "The needed-by date is not valid.");
+  const lines = await buildLines(body);
+  await CustomerRequest.updateOne(
+    { _id: order._id, "materialRequests._id": r._id },
+    { $set: { "materialRequests.$.reason": reason, "materialRequests.$.neededBy": neededBy, "materialRequests.$.lines": lines, "materialRequests.$.updatedAt": new Date(), "materialRequests.$.updatedBy": personOf(actor) } },
+  );
+  const fresh = await CustomerRequest.findById(order._id).select(ORDER_SELECT).lean();
+  const view = await viewOf(fresh);
+  return { ...view, updated: view.requests.find((x) => x.id === String(r._id)) || null };
+}
+
 /** The order's material story as a report: every request with its lines and issues, plus the free issues. */
 async function reportForOrder(moId, { companyId = null } = {}) {
   const view = await listForOrder(moId, { companyId });
   return { ...view, generatedAt: new Date() };
 }
 
-module.exports = { listForOrder, create, cancel, reportForOrder, isId };
+module.exports = { listForOrder, create, update, cancel, reportForOrder, isId };

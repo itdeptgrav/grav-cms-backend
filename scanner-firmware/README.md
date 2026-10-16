@@ -5,12 +5,21 @@ of truth for the firmware itself**; it is not the OTA store.
 
 | | |
 |---|---|
-| `GRAV_Scanner_v5_5_0/` | the Arduino sketch (`.ino` + `sketch.yaml`) |
+| `GRAV_Station_v1_0_0/` | **the current sketch** — the Remote Station firmware (16 Oct 2026): a scanner paired to the Ironing / Trimming dashboard as its input. `FIRMWARE-README.md` describes it. |
+| `GRAV_Scanner_v5_6_7/`, `GRAV_Scanner_v5_5_0/` | the RETIRED machine-scanner sketches, kept as the record of what the devices ran until 16 Oct 2026. Do not flash. |
 | `platformio.ini` | PlatformIO build config for the same sketch |
 | `GRAV_Scanner_v5_*.bin` | historical builds, kept for rollback |
-| `release/<version>/` | a tagged build: `bin/`, `source/`, `SHA256.txt`, `BUILD-INFO.txt` |
-| `FIRMWARE-README.md` | flashing instructions, partition scheme, what each version changed |
+| `release/<version>/` | a tagged build: `bin/`, `source/`, `SHA256.txt`, `BUILD-INFO.txt` (`release/station-1.0.0/` is the station firmware's) |
+| `FIRMWARE-README.md` | the station firmware: what the operator does, flashing, config barcodes |
 | `BARCODE-SERVER-README.md` | the standalone barcode server's own README, kept as the record of what it was before the merge |
+
+## Two device families on one OTA store (16 Oct 2026)
+
+A `Firmware` record carries `product`: `machine` (the retired scanner
+firmware; records written before the field count as machine) or `station`.
+`POST /api/barcode-devices/check-update` offers a build only to devices
+reporting the same product — the station firmware sends `product: "station"`,
+the old one sends nothing. The upload form has a device-type selector.
 
 ## This is NOT where the devices download from
 
