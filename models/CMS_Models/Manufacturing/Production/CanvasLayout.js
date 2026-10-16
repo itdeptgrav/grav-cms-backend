@@ -165,8 +165,28 @@ const LineSchema = new mongoose.Schema(
     y: { type: Number, default: 0 },
     rotation: { type: Number, default: 0 },
     slotsPerSide: { type: Number, default: 13 },
+    // Slots along the line on each side. A side with more slots than columns
+    // stacks them in rows outward from the middle (the finishing cell is
+    // 2 along × 2 deep a side). Defaults to slotsPerSide: one row.
+    cols: { type: Number, default: null },
+    qcDepth: { type: Number, default: 90 }, // cm along the line, the QC table
+    // cm a slot reaches out from the middle; 0 = the kind's own (130 a line,
+    // 160 a row). The fusing places are 220: a fusing press is 200 cm long.
+    slotDepth: { type: Number, default: 0 },
     pitch: { type: Number, default: 175 }, // cm along the line per slot
     tableWidth: { type: Number, default: 120 }, // cm across the table
+    // The register machine that is this line's QC table — a station with a
+    // scanner, fixed at the line's end past the last slot. Never in a slot.
+    qcMachineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine", default: null },
+    // "line" (a sewing line), "cell" (a short line with a head station before
+    // slot 1 — the finishing cell's embroidery machine) or "row" (one row of
+    // slots, no table, no QC — the iron tables).
+    kind: { type: String, enum: ["line", "cell", "row"], default: "line" },
+    headMachineId: { type: mongoose.Schema.Types.ObjectId, ref: "Machine", default: null },
+    // The chamberTemplates[].id of the zones that MARK this line and its QC
+    // table. The designer re-draws them around the line whenever it moves.
+    zoneId: { type: String, default: "" },
+    qcZoneId: { type: String, default: "" },
     slots: [LineSlotSchema],
   },
   { _id: false }

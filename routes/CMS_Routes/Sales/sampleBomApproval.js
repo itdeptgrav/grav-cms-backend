@@ -65,6 +65,7 @@ const SalesJourney = require("../../../models/CMS_Models/Sales/SalesJourney");
 const {
   notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL, escapeHtml,
 } = require("../../../services/departmentNotify.service");
+const styleFollowUps = require("../../../services/followUps/styleFollowUps");
 const { styleEmailContext, imageGalleryHtml, bomTableHtml } = require("../../../services/sampleStyleEmail.service");
 const { createServiceContext } = require("../../../services/companyContext/serviceScope.service");
 
@@ -315,6 +316,7 @@ router.post("/:styleId/:token", express.urlencoded({ extended: false }), async (
       note, by: { name: decidedByName }, at: new Date(),
     });
     await style.save();
+    styleFollowUps.onBomDecided(style, decision, note);
 
     // Tell Merchandising (who built the BOM) AND Sales (who asked for the
     // decision) — one shared, Sales-authored template per outcome (28 Aug

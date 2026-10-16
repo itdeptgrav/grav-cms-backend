@@ -40,6 +40,11 @@ const AccessDepartment = require("../../models/Access/AccessDepartment");
 const DeptUser = require("../../models/Access/DeptUser");
 const Employee = require("../../models/Employee");
 const { refuseIfNotEmployed } = require("../../services/employmentStatus");
+/* The departments whose people land on the home screen (/onboarding) after
+   signing in, because it opens on their follow-ups — see the login answer. */
+const FOLLOW_UP_HOME_SLUGS = require("../../services/followUps/followUpRules").DEPARTMENTS
+  .filter((d) => d.key !== "sales")
+  .flatMap((d) => d.slugs);
 const {
   matchesEmployeePassword,
   upgradeEmployeePassword,
@@ -548,7 +553,12 @@ router.post("/login", async (req, res) => {
       success: true,
       message: "Login successful",
       // More than one application and no tile chosen: the launcher, not a guess.
-      redirectTo: !slug && session.apps.length > 1 ? "/onboarding" : session.dept.resolveRedirect(),
+      // The production manager, Merchandising and Design land there too, even
+      // with one application (9 Oct 2026): the home screen opens on their
+      // follow-ups with each other (components/followups/HomeFollowUps.js).
+      redirectTo: !slug && (session.apps.length > 1 || session.apps.some((d) => FOLLOW_UP_HOME_SLUGS.includes(d.slug)))
+        ? "/onboarding"
+        : session.dept.resolveRedirect(),
       token,
       subject: identity.subject,
       identityId: String(rec._id),
