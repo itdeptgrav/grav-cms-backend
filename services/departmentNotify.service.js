@@ -44,7 +44,7 @@ const EVENT_REGISTRY = [
     key: "enquiry_created",
     label: "New enquiry created",
     description: "Merchandising and the Project Manager are notified when Sales opens a new Enquiry/RFQ.",
-    departments: ["merchandiser", "project-manager"],
+    departments: ["merchandiser", "project-manager", "ppc"],
   },
   // ── The three Style & Sample hand-offs (28 Aug 2026) ──────────────────────
   // Unlike every other event here, these three carry a template Sales can
@@ -68,7 +68,7 @@ const EVENT_REGISTRY = [
     // production supervisor"). See services/ensureAccessDepartments.js's
     // `project_manager` entry — slug "project-manager", dashboardPath
     // /project-manager/dashboard.
-    departments: ["project-manager"],
+    departments: ["project-manager", "ppc"],
     templateKey: "bomApproval",
   },
   // Split approve/reject into two keys — same reasoning as
@@ -137,7 +137,7 @@ const EVENT_REGISTRY = [
     key: "costing_sent_to_customer",
     label: "Cost & Invoicing sent to customer",
     description: "Merchandising and the Project Manager are notified when Sales sends pricing to the customer.",
-    departments: ["merchandiser", "project-manager"],
+    departments: ["merchandiser", "project-manager", "ppc"],
   },
   {
     // 31 Aug 2026, explicit request: "in the product manager side basically it
@@ -216,7 +216,7 @@ const EVENT_REGISTRY = [
     key: "customer_changes_to_materials",
     label: "Customer changes routed to Materials / BOM",
     description: "Merchandising is told the customer asked for a material, colour or trim change, and the BOM has reopened.",
-    departments: ["merchandiser", "project-manager"],
+    departments: ["merchandiser", "project-manager", "ppc"],
   },
   {
     key: "customer_changes_to_rnd",
@@ -234,7 +234,7 @@ const EVENT_REGISTRY = [
     key: "customer_decision_recorded",
     label: "Customer approved / rejected quote",
     description: "Merchandising and the Project Manager are notified when Sales records what the customer decided.",
-    departments: ["merchandiser", "project-manager"],
+    departments: ["merchandiser", "project-manager", "ppc"],
   },
   {
     key: "stock_item_requested",
@@ -862,4 +862,7 @@ module.exports = {
   resolveRoleRecipients,
   EVENT_REGISTRY, APP_URL, listEvents, listEventsWithTemplates, isEventEnabled, renderEventPreview,
   resolveDepartmentRecipients, notifyEvent, imageUrlFor, escapeHtml, interpolate,
+  // The bare sender and frame, for the follow-ups service (9 Oct 2026), which
+  // mails a named person rather than a department and is not a Sales event.
+  sendCmsEmail, wrapEmail,
 };
