@@ -31,6 +31,7 @@
 // zeros because of the silent route mount failure. This is a clean rewrite.
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const mongoose = require("mongoose");
 const router = express.Router();
 const {
@@ -100,7 +101,7 @@ async function applyLedgerBalances(voucher, direction = 1) {
     if (!lid) continue;
     const led = await Acc_Ledger.findById(lid);
     if (led) {
-      led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+      led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
       await led.save();
     }
   }
@@ -123,8 +124,17 @@ router.get("/expense-ledgers", companyScope, async (req, res) => {
       nature: "expense",
     })
       .sort({ groupName: 1, name: 1 })
-      .select("name groupName groupId currentBalance balanceType")
+      .select("name groupName groupId companyId openingBalance openingBalanceType")
       .lean();
+    /* the balance the picker prints is opening + posted vouchers, not the
+       cached figure (16 Oct 2026 audit) */
+    const { liveBalances } = require("../../services/accounting/ledgerBalance");
+    const live = await liveBalances(companyId, ledgers);
+    for (const l of ledgers) {
+      const b = live.get(String(l._id)) || { balance: 0, type: "Dr" };
+      l.currentBalance = b.balance;
+      l.currentBalanceType = b.type;
+    }
     res.json({ ledgers });
   } catch (e) {
     console.error("[expenses/expense-ledgers]", e);
@@ -209,8 +219,8 @@ router.get("/", companyScope, async (req, res) => {
 
     if (dateFrom || dateTo) {
       filter.voucherDate = {};
-      if (dateFrom) filter.voucherDate.$gte = new Date(dateFrom);
-      if (dateTo) filter.voucherDate.$lte = new Date(dateTo);
+      if (dateFrom) filter.voucherDate.$gte = istStart(dateFrom);
+      if (dateTo) filter.voucherDate.$lte = istEnd(dateTo);
     }
 
     if (search) {
@@ -271,7 +281,11 @@ router.get("/", companyScope, async (req, res) => {
       .select("grandTotal voucherType status")
       .lean();
     const summary = {
-      totalAmount: allForSummary.reduce((s, e) => s + (e.grandTotal || 0), 0),
+      /* what was actually spent: a cancelled, void or draft expense is not
+         (16 Oct 2026 audit) — unless the list is filtered to that status */
+      totalAmount: allForSummary
+        .filter((e) => (filter.status ? true : !["cancelled", "void", "draft"].includes(e.status)))
+        .reduce((s, e) => s + (e.grandTotal || 0), 0),
       totalPaid: allForSummary
         .filter((e) => e.voucherType === "payment" && e.status === "posted")
         .reduce((s, e) => s + (e.grandTotal || 0), 0),

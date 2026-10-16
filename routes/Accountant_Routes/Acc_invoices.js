@@ -16,6 +16,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const mongoose = require("mongoose");
 const router = express.Router();
 const {
@@ -182,7 +183,7 @@ async function _applyLedgerBalances(voucher, direction, session) {
       if (!lid) continue;
       const led = await Acc_Ledger.findById(lid).session(session || null);
       if (led) {
-        led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+        led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
         await led.save(session ? { session } : {});
       }
     }
@@ -430,8 +431,8 @@ router.get("/", companyScope, async (req, res) => {
     if (customerId) filter.partyLedgerId = customerId;
     if (dateFrom || dateTo) {
       filter.voucherDate = {};
-      if (dateFrom) filter.voucherDate.$gte = new Date(dateFrom);
-      if (dateTo) filter.voucherDate.$lte = new Date(dateTo);
+      if (dateFrom) filter.voucherDate.$gte = istStart(dateFrom);
+      if (dateTo) filter.voucherDate.$lte = istEnd(dateTo);
     }
     if (search) {
       const rx = new RegExp(search.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i");
@@ -1707,6 +1708,15 @@ router.put("/:id", companyScope, async (req, res) => {
     if (body.voucherDate) inv.financialYear = _computeFY(body.voucherDate);
     inv.updatedBy = req.user?.id;
 
+    /* a posted invoice stays balanced (16 Oct 2026 audit) — the edit never
+       checked, so an invoice could be re-saved out of balance and re-applied
+       that way. The transaction rolls the reversal back with the refusal. */
+    if (wasPosted) {
+      const bal = Acc_Voucher.balanceOf(inv.ledgerEntries);
+      if (!bal.isBalanced) {
+        throw new Error(`Debit ₹${bal.totalDebit.toFixed(2)} and credit ₹${bal.totalCredit.toFixed(2)} do not match — a posted invoice must balance. Nothing was changed.`);
+      }
+    }
     await inv.save({ session });
     if (wasPosted) await _applyLedgerBalances(inv, +1, session);
 

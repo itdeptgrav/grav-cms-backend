@@ -34,6 +34,7 @@
 // =============================================================================
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const router = express.Router();
 const mongoose = require("mongoose");
 
@@ -929,8 +930,8 @@ router.get("/eligible-vouchers", accountantAuth, companyScope, async (req, res) 
     };
     if (from || to) {
       filter.voucherDate = {};
-      if (from) filter.voucherDate.$gte = new Date(from);
-      if (to) filter.voucherDate.$lte = new Date(to);
+      if (from) filter.voucherDate.$gte = istStart(from);
+      if (to) filter.voucherDate.$lte = istEnd(to);
     } else {
       const now = new Date();
       const fyStart = new Date(

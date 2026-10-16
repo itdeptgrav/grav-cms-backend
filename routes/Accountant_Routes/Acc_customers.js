@@ -150,7 +150,7 @@ async function importedPartyRows(companyId, { groupRx, kind }) {
 
   const ledgerIds = ledgers.map((l) => l._id);
   const agg = await Acc_Voucher.aggregate([
-    { $match: { companyId: cId, status: "posted" } },
+    { $match: { companyId: cId, status: "posted", isOptional: { $ne: true }, "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     { $unwind: "$ledgerEntries" },
     { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     {
@@ -852,7 +852,9 @@ router.get("/all", verifyAccountantToken, companyScopeOptional, async (req, res)
         const linkedLedgerIds = linkedLedgers.map((l) => l._id);
 
         const vAgg = await Acc_Voucher.aggregate([
-          { $match: { status: "posted" } },
+          /* only vouchers that touch these ledgers, and not Tally's optional
+             (memorandum) vouchers — the outstanding report leaves them out */
+          { $match: { status: "posted", isOptional: { $ne: true }, "ledgerEntries.ledgerId": { $in: linkedLedgerIds } } },
           { $unwind: "$ledgerEntries" },
           { $match: { "ledgerEntries.ledgerId": { $in: linkedLedgerIds } } },
           {
@@ -1895,12 +1897,29 @@ router.get(
         //    ledger is found even if Mongoose strict mode previously dropped the
         //    field and a re-merge was required.
         try {
-          ledger = await Acc_Ledger.findOne({
-            linkedCustomerId: customer._id,
-            isActive: { $ne: false },
-          })
-            .select("name currentBalance balanceType groupName groupId")
-            .lean();
+          /* The selected company's ledger first (16 Oct 2026 audit): with the
+             customer linked in two companies, an unscoped findOne returned
+             either one, and the vouchers below — filtered to THIS company —
+             then left only that ledger's opening as "Outstanding". The
+             unscoped lookup stays as the fallback the note above explains. */
+          const cid = req.query.companyId;
+          if (cid && mongoose.Types.ObjectId.isValid(String(cid))) {
+            ledger = await Acc_Ledger.findOne({
+              linkedCustomerId: customer._id,
+              companyId: cid,
+              isActive: { $ne: false },
+            })
+              .select("name currentBalance balanceType groupName groupId")
+              .lean();
+          }
+          if (!ledger) {
+            ledger = await Acc_Ledger.findOne({
+              linkedCustomerId: customer._id,
+              isActive: { $ne: false },
+            })
+              .select("name currentBalance balanceType groupName groupId")
+              .lean();
+          }
         } catch (_) {}
 
         // 2. Name-match fallback — for ledgers not yet linked via ID.
@@ -1976,18 +1995,24 @@ router.get(
           .lean(),
       ]);
 
-      const totalInvoiced = invoices.reduce(
-        (s, v) => s + (v.grandTotal || 0),
-        0,
-      );
-      const totalReceived = receipts.reduce(
-        (s, v) => s + (v.grandTotal || 0),
-        0,
-      );
-      const totalCredited = creditNotes.reduce(
-        (s, v) => s + (v.grandTotal || 0),
-        0,
-      );
+      /* the totals cover EVERY document, not the 200 listed (16 Oct 2026
+         audit: a customer with more than 200 invoices was under-reported) */
+      const docTotals = await Acc_Voucher.aggregate([
+        /* aggregate does not cast: the ids are made ObjectIds here */
+        {
+          $match: {
+            companyId: new mongoose.Types.ObjectId(String(companyId)),
+            status: "posted",
+            partyLedgerId: new mongoose.Types.ObjectId(String(ledger._id)),
+            voucherType: { $in: ["sales", "receipt", "credit_note"] },
+          },
+        },
+        { $group: { _id: "$voucherType", total: { $sum: { $ifNull: ["$grandTotal", 0] } } } },
+      ]);
+      const docTotal = (t) => (docTotals.find((d) => d._id === t) || { total: 0 }).total;
+      const totalInvoiced = docTotal("sales");
+      const totalReceived = docTotal("receipt");
+      const totalCredited = docTotal("credit_note");
 
       const slimReceipts = receipts.map((r) => {
         const bills = [];
@@ -2013,6 +2038,7 @@ router.get(
       const stmtVouchers = await Acc_Voucher.find({
         companyId,
         status: "posted",
+        isOptional: { $ne: true },
         "ledgerEntries.ledgerId": ledger._id,
       })
         .select(
@@ -2026,9 +2052,9 @@ router.get(
       const openingLed = await Acc_Ledger.findById(ledger._id)
         .select("openingBalance openingBalanceType")
         .lean();
-      const openSigned =
-        (openingLed && openingLed.openingBalanceType === "Cr" ? -1 : 1) *
-        Math.abs((openingLed && openingLed.openingBalance) || 0);
+      /* one reading of the opening (services/accounting/ledgerBalance.js):
+         abs() + side turned a signed −500 marked "Dr" into +500 */
+      const openSigned = require("../../services/accounting/ledgerBalance").openingSigned(openingLed);
 
       let stmtRunning = openSigned;
       let ledgerDr = 0;

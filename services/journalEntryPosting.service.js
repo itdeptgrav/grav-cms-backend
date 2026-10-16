@@ -114,8 +114,11 @@ async function resolveLines(entry) {
       continue;
     }
 
-    const debit = Number(line.debit) || 0;
-    const credit = Number(line.credit) || 0;
+    /* to the paisa before anything is compared or posted (16 Oct 2026
+       audit): Dr 100.005 against Cr 100 used to pass the 0.01 check and post
+       a voucher whose sides differ */
+    const debit = Math.round((Number(line.debit) || 0) * 100) / 100;
+    const credit = Math.round((Number(line.credit) || 0) * 100) / 100;
     /* One side per line, as a voucher records them. A line carrying both, or
        neither, is not something the books can express. */
     if (debit > 0 && credit > 0) {
@@ -150,7 +153,7 @@ async function resolveLines(entry) {
 
   const totalDebit = entries.filter((e) => e.type === "Dr").reduce((s, e) => s + e.amount, 0);
   const totalCredit = entries.filter((e) => e.type === "Cr").reduce((s, e) => s + e.amount, 0);
-  if (Math.abs(totalDebit - totalCredit) > 0.01) {
+  if (Math.abs(totalDebit - totalCredit) >= 0.005) {
     return {
       ok: false,
       code: "UNBALANCED",

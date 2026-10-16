@@ -19,6 +19,7 @@
 // Acc_Voucher entries within ±3 days with the same amount.
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const router = express.Router();
 const crypto = require("crypto");
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
@@ -80,8 +81,8 @@ router.get("/", async (req, res) => {
     }
     if (startDate || endDate) {
       filter.transactionDate = {};
-      if (startDate) filter.transactionDate.$gte = new Date(startDate);
-      if (endDate) filter.transactionDate.$lte = new Date(endDate);
+      if (startDate) filter.transactionDate.$gte = istStart(startDate);
+      if (endDate) filter.transactionDate.$lte = istEnd(endDate);
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);

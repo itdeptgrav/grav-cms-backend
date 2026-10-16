@@ -363,8 +363,8 @@ function effectiveAsOf(asOf, now = new Date()) {
  * reading that is correct under both conventions.
  */
 function openingSignedOf(ledger) {
-  const sign = ledger && ledger.openingBalanceType === "Cr" ? -1 : 1;
-  return sign * Math.abs((ledger && ledger.openingBalance) || 0);
+  /* one reading for every screen (services/accounting/ledgerBalance.js) */
+  return require("./accounting/ledgerBalance").openingSigned(ledger);
 }
 
 /** opening + debits − credits. The whole accounting definition, in one line. */

@@ -965,8 +965,26 @@ async function applyAllocations(voucher, requested = [], { partyLedgerId = null 
      keeps the voucher's own arithmetic honest without opening a phantom bill.
      Rebuilt each time so it can never drift from the settlements beside it. */
   const remainder = money(total - money(fresh.reduce((s, a) => s + a.amount, 0)));
-  const kept = preserved.filter((a) => a.billType !== "on_account");
-  if (remainder > EPSILON) {
+  /* ── A MATCHED ADVANCE IS USED UP, NOT KEPT BESIDE ITS SETTLEMENT ───────
+     (16 Oct 2026 audit) A receipt or payment entered as an advance carries a
+     named "advance" row for its whole amount. Matching it to an invoice used
+     to KEEP that row and add the settlement beside it, so a ₹1 lakh advance
+     matched to a ₹1 lakh invoice showed as a ₹1 lakh open credit on the
+     parties list and the ageing report while the ledger said nil; unmatching
+     added the whole amount back as "on account" beside the untouched advance
+     — counted twice either way. The advance now keeps its name and holds
+     only what is still unmatched (a fully matched advance is a closed, zero
+     row, which every open-items read ignores), and unmatching restores it. */
+  const advanceRows = preserved.filter((a) => a.billType === "advance");
+  const kept = preserved.filter((a) => a.billType !== "on_account" && a.billType !== "advance");
+  if (advanceRows.length) {
+    advanceRows.forEach((a, i) => {
+      const row = { billName: a.billName, billType: "advance", amount: i === 0 ? Math.max(remainder, 0) : 0 };
+      if (a.dueDate) row.dueDate = a.dueDate;
+      if (a.creditDays != null) row.creditDays = a.creditDays;
+      kept.push(row);
+    });
+  } else if (remainder > EPSILON) {
     kept.push({ billType: "on_account", amount: remainder });
   }
 

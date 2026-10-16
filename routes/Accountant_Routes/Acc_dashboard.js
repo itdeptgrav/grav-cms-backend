@@ -2,6 +2,7 @@
 // Complete Dashboard & Overview Routes
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const router = express.Router();
 const mongoose = require("mongoose");
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
@@ -399,7 +400,7 @@ router.get("/profit-loss", async (req, res) => {
 
     let dateFilter = {};
     if (startDate && endDate) {
-      dateFilter = { $gte: new Date(startDate), $lte: new Date(endDate) };
+      dateFilter = { $gte: istStart(startDate), $lte: istEnd(endDate) };
     } else {
       const today = new Date();
       const fyStart = new Date(today.getFullYear(), 3, 1);

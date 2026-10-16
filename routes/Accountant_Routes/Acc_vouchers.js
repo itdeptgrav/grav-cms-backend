@@ -8,6 +8,8 @@
  */
 
 const express = require("express");
+const { liveBalances, liveBalanceOf, openingSigned } = require("../../services/accounting/ledgerBalance");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const mongoose = require("mongoose");
 const { assertYearsOpen, assertVoucherOpen } = require("../../services/accounting/fyLock");
 const router = express.Router();
@@ -92,6 +94,34 @@ const companyScope = (req, res, next) =>
   accOrgAuth.requireCompanyScope(req, res, next);
 const companyScopeOptional = (req, res, next) =>
   accOrgAuth.scopeCompanyIfPresent(req, res, next);
+
+/* ── A ROUTE ON ONE VOUCHER IS SCOPED BY THAT VOUCHER'S COMPANY ────────────
+   (16 Oct 2026 audit) Bill matching ran on `auth` alone and found the voucher
+   by id, so anyone signed in could match or unmatch another company's
+   receipt. The voucher's own company is checked against the person's scope
+   with the one canonical guard; naming a different company is refused. */
+const voucherCompanyScope = async (req, res, next) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.id))) {
+      return res.status(404).json({ error: "Voucher not found" });
+    }
+    const v = await Acc_Voucher.findById(req.params.id).select("companyId").lean();
+    if (!v) return res.status(404).json({ error: "Voucher not found" });
+    const named = (req.query && req.query.companyId) || (req.body && req.body.companyId);
+    if (named && String(named) !== String(v.companyId)) {
+      return res.status(403).json({ error: "This voucher belongs to another company." });
+    }
+    Object.defineProperty(req, "query", {
+      value: { ...(req.query || {}), companyId: String(v.companyId) },
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+    return companyScope(req, res, next);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+};
 
 /**
  * Run work inside a transaction, retrying the ones Mongo says to retry.
@@ -340,7 +370,9 @@ async function applyLedgerBalances(voucher, direction = 1, session = null) {
     if (!lid) continue;
     const led = await Acc_Ledger.findById(lid).session(session);
     if (led) {
-      led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+      /* `currentBalanceType` is the schema's field; `balanceType` is not on
+         the schema and was silently dropped, so the side never updated. */
+      led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
       await led.save({ session });
     }
   }
@@ -478,6 +510,8 @@ const {
   matchesQuery,
   norm,
 } = require("../../services/accounting/voucherItemCatalogue");
+const { rawItemRow, istDay } = require("../../services/accounting/stockSummary");
+const { loadRawInputs } = require("../../services/accounting/stockSummaryData");
 
 function loadCMSStockItem() {
   try {
@@ -806,6 +840,14 @@ router.get("/cash-bank-ledgers", auth, companyScope, async (req, res) => {
     })
       .sort({ groupName: 1, name: 1 })
       .lean();
+    /* the balance the picker shows is the real one, not the drifting cache */
+    const live = await liveBalances(companyId, ledgers);
+    for (const l of ledgers) {
+      const b = live.get(String(l._id));
+      l.currentBalance = b ? b.balance : 0;
+      l.currentBalanceType = b ? b.type : "Dr";
+      l.balanceType = l.currentBalanceType;
+    }
 
     res.json({
       success: true,
@@ -854,8 +896,8 @@ router.get("/", auth, companyScope, async (req, res) => {
     if (party) filter.partyLedgerId = party;
     if (dateFrom || dateTo) {
       filter.voucherDate = {};
-      if (dateFrom) filter.voucherDate.$gte = new Date(dateFrom);
-      if (dateTo) filter.voucherDate.$lte = new Date(dateTo);
+      if (dateFrom) filter.voucherDate.$gte = istStart(dateFrom);
+      if (dateTo) filter.voucherDate.$lte = istEnd(dateTo);
     }
     if (q) {
       filter.$or = [
@@ -955,7 +997,9 @@ router.get("/", auth, companyScope, async (req, res) => {
           $match: {
             companyId: new mongoose.Types.ObjectId(String(companyId)),
             voucherType: "debit_note",
-            status: { $in: ["posted", "pending_approval"] },
+            /* posted only: the books ignore a note until it posts, so the
+               register must not call a bill closed by one (16 Oct 2026) */
+            status: "posted",
             "originalBill.voucherId": { $in: items.map((v) => v._id) },
           },
         },
@@ -1028,12 +1072,34 @@ router.get("/", auth, companyScope, async (req, res) => {
         byStatus[s] = { count: row.count, grandTotal: row.grandTotal, subtotal: row.subtotal, totalTax: row.totalTax };
         all = add(all, byStatus[s]);
       }
+      /* posted value by payment mode and by credit-note reason, over the
+         whole filter: the Receipts and Credit notes strips summed one page of
+         50 beside a whole-filter total (16 Oct 2026 audit) */
+      const split = await Acc_Voucher.aggregate([
+        { $match: { $and: [castFilter, { status: "posted" }] } },
+        {
+          $group: {
+            _id: { mode: { $ifNull: ["$paymentMode", "unspecified"] }, reason: { $ifNull: ["$creditNoteReason", "unspecified"] } },
+            grandTotal: { $sum: { $ifNull: ["$grandTotal", 0] } },
+          },
+        },
+      ]);
+      const postedByMode = {};
+      const postedByReason = {};
+      for (const row of split) {
+        const m = row._id.mode || "unspecified";
+        const r = row._id.reason || "unspecified";
+        postedByMode[m] = (postedByMode[m] || 0) + row.grandTotal;
+        postedByReason[r] = (postedByReason[r] || 0) + row.grandTotal;
+      }
       summary = {
         all,
         byStatus,
         posted: byStatus.posted || { ...zero },
         draft: byStatus.draft || { ...zero },
         pendingApproval: byStatus.pending_approval || { ...zero },
+        postedByMode,
+        postedByReason,
       };
     } catch (aggErr) {
       console.warn("[vouchers] summary aggregate skipped:", aggErr.message);
@@ -1112,9 +1178,9 @@ router.get("/invoice-lookup", auth, companyScope, async (req, res) => {
     }
 
     const from = dateFrom
-      ? new Date(dateFrom)
+      ? istStart(dateFrom)
       : new Date(Date.now() - 365 * 86400000);
-    const to = dateTo ? new Date(dateTo) : new Date();
+    const to = dateTo ? istEnd(dateTo) : new Date();
 
     const invoices = await Acc_Voucher.find({
       companyId,
@@ -1741,10 +1807,16 @@ router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
         .json({ error: "companyId and partyLedgerId required" });
     }
 
-    const from = dateFrom
-      ? new Date(dateFrom)
-      : new Date(Date.now() - 365 * 86400000);
-    const to = dateTo ? new Date(dateTo) : new Date();
+    /* ── THE SAME UNPAID INVOICES THE AGEING REPORT SEES (16 Oct 2026 audit)
+       Only the last 365 days and the first 200 invoices were listed, credit
+       notes still awaiting approval reduced what was owed (the books ignore
+       them until posted), and a receipt counted only when this customer was
+       its HEADER party — a receipt paying two customers settled the second
+       one's invoice in the Ageing report but not here. Now: from the books'
+       beginning unless a From is given, posted credit notes only, and every
+       receipt whose lines touch this customer's ledger. */
+    const from = dateFrom ? istStart(dateFrom) : new Date(0);
+    const to = dateTo ? istEnd(dateTo) : new Date();
 
     const invoices = await Acc_Voucher.find({
       companyId,
@@ -1757,7 +1829,7 @@ router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
       .select(
         "voucherNumber voucherDate grandTotal placeOfSupplyCode placeOfSupply",
       )
-      .limit(200)
+      .limit(1000)
       .lean();
 
     if (invoices.length === 0) {
@@ -1770,7 +1842,7 @@ router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
         $match: {
           companyId: new mongoose.Types.ObjectId(companyId),
           voucherType: "credit_note",
-          status: { $in: ["posted", "pending_approval"] },
+          status: "posted",
           "originalInvoice.voucherId": { $in: invoiceIds },
         },
       },
@@ -1790,7 +1862,7 @@ router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
       companyId,
       voucherType: "receipt",
       status: "posted",
-      partyLedgerId,
+      "ledgerEntries.ledgerId": new mongoose.Types.ObjectId(String(partyLedgerId)),
       "ledgerEntries.billAllocations.billName": { $in: invoiceNumbers },
     })
       .select("ledgerEntries")
@@ -1799,6 +1871,8 @@ router.get("/unpaid-invoices", auth, companyScope, async (req, res) => {
     const receivedMap = new Map();
     for (const rcpt of priorReceipts) {
       for (const entry of rcpt.ledgerEntries || []) {
+        /* only this customer's line of a multi-party receipt */
+        if (String(entry.ledgerId || "") !== String(partyLedgerId)) continue;
         for (const alloc of entry.billAllocations || []) {
           if (alloc.billType === "agst_ref" && alloc.billName) {
             const inv = invoices.find(
@@ -1860,9 +1934,9 @@ router.get("/unpaid-bills", auth, companyScope, async (req, res) => {
     }
 
     const from = dateFrom
-      ? new Date(dateFrom)
+      ? istStart(dateFrom)
       : new Date(Date.now() - 365 * 86400000);
-    const to = dateTo ? new Date(dateTo) : new Date();
+    const to = dateTo ? istEnd(dateTo) : new Date();
 
     const bills = await Acc_Voucher.find({
       companyId,
@@ -2850,29 +2924,45 @@ router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
   try {
     const { companyId, q, limit = 3000 } = req.query;
     const lim = parseInt(limit) || 3000;
-    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
-    const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
-
-    const [rawItems, orders, lines] = await Promise.all([
-      RawItem.find({})
-        .sort({ name: 1 })
-        .select(
-          "name sku unit customUnit category customCategory vendorNicknames primaryVendor variants._id variants.combination variants.vendorNicknames",
-        )
-        .lean(),
-      /* The latest purchase rate per material is what it costs now. Live
-         orders only — a cancelled or draft order's rate was never paid. */
-      PurchaseOrder.find({ status: { $nin: ["CANCELLED", "Cancelled", "DRAFT", "Draft"] } })
-        .sort({ orderDate: -1, createdAt: -1 })
-        .select("items.rawItem items.variantId items.unitPrice items.gstRate")
-        .limit(1000)
-        .lean(),
+    /* the SAME inputs the Stock Summary reads (services/accounting/
+       stockSummaryData.js), so a line's price and the stock rate beside it
+       come from one load */
+    const [inputs, lines] = await Promise.all([
+      loadRawInputs({ extraRawFields: "vendorNicknames" }),
       companyId ? voucherLinesFor(companyId, ["purchase", "debit_note"]) : [],
     ]);
+    const rawItems = inputs.raws;
     const poLines = [];
-    for (const o of orders) for (const l of o.items || []) poLines.push(l);
+    for (const o of inputs.orders) for (const l of o.items || []) poLines.push(l);
 
-    const items = purchaseCatalogue(rawItems, billHistory(lines), poLines)
+    /* what the Stock Summary values each material / variant at today */
+    const today = new Date(Date.now() + 330 * 60000).toISOString().slice(0, 10);
+    const now = new Date();
+    const stockRates = new Map();
+    for (const r of rawItems) {
+      const row = rawItemRow(r, {
+        from: istDay(today, false), to: istDay(today, true), now,
+        factorByMovement: inputs.factorByMovement,
+        poPrice: (variantId) => inputs.poPriceOf(r._id, variantId),
+      });
+      stockRates.set(`${r._id}:`, { rate: row.rate, source: row.rateSource });
+      for (const v of row.variants) stockRates.set(`${r._id}:${v._id}`, { rate: v.rate, source: v.rateSource });
+      /* variants with no stock are not on the summary's row; price them the same way */
+      for (const v of r.variants || [])
+        if (!stockRates.has(`${r._id}:${v._id}`)) {
+          const only = rawItemRow({ ...r, quantity: 1, variants: [{ ...v, quantity: 1 }] }, {
+            from: istDay(today, false), to: istDay(today, true), now,
+            factorByMovement: inputs.factorByMovement,
+            poPrice: (variantId) => inputs.poPriceOf(r._id, variantId),
+          }).variants[0];
+          if (only) stockRates.set(`${r._id}:${v._id}`, { rate: only.rate, source: only.rateSource });
+        }
+    }
+
+    const items = purchaseCatalogue(rawItems, billHistory(lines), poLines, {
+      units: inputs.units,
+      stockRate: (rawId, variantId) => stockRates.get(`${rawId}:${variantId || ""}`) || null,
+    })
       .filter((r) => matchesQuery(r, q))
       .slice(0, lim);
     res.json({ items, count: items.length });
@@ -3100,7 +3190,7 @@ router.post("/:id/match-payment", auth, companyScopeOptional, async (req, res) =
  */
 
 /* GET /unmatched — the worklist: money that settles nothing yet.        */
-router.get("/unmatched", auth, async (req, res) => {
+router.get("/unmatched", auth, companyScope, async (req, res) => {
   try {
     const { companyId, voucherType = "receipt", partyLedgerId, q, limit = 100 } = req.query;
     if (!companyId) return res.status(400).json({ error: "companyId required" });
@@ -3186,7 +3276,7 @@ router.get("/unmatched", auth, async (req, res) => {
 });
 
 /* GET /:id/match — this voucher's match state, and the bills it can settle. */
-router.get("/:id/match", auth, async (req, res) => {
+router.get("/:id/match", auth, voucherCompanyScope, async (req, res) => {
   try {
     const voucher = await Acc_Voucher.findById(req.params.id).lean();
     billMatching.assertMatchable(voucher);
@@ -3232,7 +3322,7 @@ router.get("/:id/match", auth, async (req, res) => {
 
 /* POST /:id/match — set this voucher's allocations.                     */
 /* Body: { allocations: [{ billName, amount }] }   — [] unmatches it.    */
-router.post("/:id/match", auth, async (req, res) => {
+router.post("/:id/match", auth, voucherCompanyScope, async (req, res) => {
   try {
     const perms = req.user?.permissions || {};
     const role = req.user?.role;
@@ -3274,7 +3364,7 @@ router.post("/:id/match", auth, async (req, res) => {
 });
 
 /* DELETE /:id/match — unmatch everything on this voucher.               */
-router.delete("/:id/match", auth, async (req, res) => {
+router.delete("/:id/match", auth, voucherCompanyScope, async (req, res) => {
   try {
     const perms = req.user?.permissions || {};
     const role = req.user?.role;
@@ -3693,8 +3783,22 @@ router.post("/", auth, companyScope, async (req, res) => {
     // that has never been saved it still reads false — gating on it here
     // meant the check silently never ran. Acc_Voucher.balanceOf is the same
     // rule, callable before the first save.
-    const willPost =
-      body.autoPost && Acc_Voucher.balanceOf(voucher.ledgerEntries).isBalanced;
+    /* ── ASKED TO POST, NOT BALANCED → SAY SO (16 Oct 2026 audit) ─────────
+       An unbalanced voucher sent with autoPost used to be saved as a DRAFT
+       and answered 201, so the accountant saw "saved" and the bill never
+       reached the books. A form whose rounded lines were a paisa apart did
+       exactly that, silently. It is refused now, with the two totals. */
+    const balance = Acc_Voucher.balanceOf(voucher.ledgerEntries);
+    if (body.autoPost && !balance.isBalanced) {
+      return res.status(400).json({
+        success: false,
+        code: "VOUCHER_NOT_BALANCED",
+        message: `Debit ₹${(balance.totalDebit || 0).toFixed(2)} and credit ₹${(balance.totalCredit || 0).toFixed(2)} do not match, so it cannot be posted. Correct the amounts (or turn round-off on) and save again.`,
+        totalDebit: balance.totalDebit,
+        totalCredit: balance.totalCredit,
+      });
+    }
+    const willPost = body.autoPost && balance.isBalanced;
     let escalated = false;
     if (willPost) {
       const clearance = await budgetControl.clearanceFor({
@@ -4019,17 +4123,40 @@ router.put("/:id", auth, companyScope, async (req, res) => {
        the body invites someone to think it persists. */
     delete body.budgetOverrideReason;
 
-    // For a posted voucher, reverse the OLD balances before mutating entries.
+    /* ── A POSTED VOUCHER STAYS BALANCED (16 Oct 2026 audit) ──────────────
+       The edit never checked Dr = Cr, so a posted bill could be re-saved a
+       paisa (or a rupee) out and re-applied to the ledgers that way. */
     if (wasPosted) {
-      await applyLedgerBalances(existing, -1);
+      const after = Acc_Voucher.balanceOf(Array.isArray(body.ledgerEntries) ? body.ledgerEntries : existing.ledgerEntries);
+      if (!after.isBalanced) {
+        return res.status(400).json({
+          success: false,
+          code: "VOUCHER_NOT_BALANCED",
+          error: `Debit ₹${after.totalDebit.toFixed(2)} and credit ₹${after.totalCredit.toFixed(2)} do not match — a posted voucher must balance. Nothing was changed.`,
+          totalDebit: after.totalDebit,
+          totalCredit: after.totalCredit,
+        });
+      }
     }
+
+    /* ── THE OLD EFFECT IS REVERSED ONLY ONCE THE NEW ONE IS SAVED ──────────
+       Balances used to be reversed FIRST and the voucher saved after; a save
+       that threw (a locked period, an unresolvable ledger, a validation
+       error) left the ledgers reversed while the voucher stayed posted, and
+       every retry reversed them again. The old entries are kept aside, the
+       new version saved, and only then is the old effect taken off and the
+       new one put on. */
+    const before = wasPosted
+      ? { voucherDate: existing.voucherDate, companyId: existing.companyId, voucherType: existing.voucherType, sourceSystem: existing.sourceSystem, ledgerEntries: existing.toObject().ledgerEntries }
+      : null;
 
     // Apply the incoming changes and recompute totals via the pre-save hook.
     Object.assign(existing, body);
     await existing.save();
 
-    // Re-apply balances if it remains posted.
+    // Swap the old effect for the new one if it remains posted.
     if (wasPosted) {
+      await applyLedgerBalances(before, -1);
       await applyLedgerBalances(existing, +1);
       await writePaymentToPO(existing).catch((e) =>
         console.error("[PO payment writeback]", e.message),
@@ -4426,8 +4553,8 @@ router.get("/summary/by-type", auth, companyScope, async (req, res) => {
     };
     if (dateFrom || dateTo) {
       match.voucherDate = {};
-      if (dateFrom) match.voucherDate.$gte = new Date(dateFrom);
-      if (dateTo) match.voucherDate.$lte = new Date(dateTo);
+      if (dateFrom) match.voucherDate.$gte = istStart(dateFrom);
+      if (dateTo) match.voucherDate.$lte = istEnd(dateTo);
     }
 
     const summary = await Acc_Voucher.aggregate([

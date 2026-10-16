@@ -32,9 +32,14 @@
  *   HSN   — the product's; else any PI line for it; else the latest sales
  *           bill for it.
  * Purchase (a raw material):
- *   price — the latest purchase-order rate for that variant; else the
- *           material's latest PO rate; else the primary supplier's price on
- *           the variant; else the latest purchase bill's rate.
+ *   price — the SHARED rule the Stock Summary uses too
+ *           (materialPrices.variantPrice, 16 Oct 2026): the latest
+ *           purchase-order rate for that variant, in the stock unit; else the
+ *           variant's own supplier price (primary supplier first); else the
+ *           material's latest PO rate; else the latest purchase bill's rate.
+ *           Beside it, `stockRate` is the rate the Stock Summary values that
+ *           variant at today (what was paid for it), so the two can be read
+ *           side by side on the line.
  *   GST   — the latest PO line that recorded one; else the latest purchase
  *           bill for it; else UNKNOWN (null) — the line keeps its own rate.
  *   HSN   — the latest purchase bill for it (the CMS records none on a raw
@@ -44,6 +49,8 @@
  * Every row says where its figures came from (`priceSource`, `taxRateSource`,
  * `hsnSource`).
  */
+
+const { variantPrice, latestPoPrices } = require("./materialPrices");
 
 const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 const num = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
@@ -223,22 +230,19 @@ function salesCatalogue(products, bills, piLines = []) {
  * @param rawItems  RawItem documents
  * @param bills     billHistory over PURCHASE voucher lines
  * @param poLines   purchase-order lines, latest first:
- *                  { rawItem, variantId, unitPrice, gstRate }
+ *                  { rawItem, variantId, unit, unitPrice, gstRate }
+ * @param opts      { units: the unit master (for PO lines in another unit),
+ *                    stockRate(rawItem, variantId | null) → { rate, source } | null }
  */
-function purchaseCatalogue(rawItems, bills, poLines = []) {
-  const lastPrice = new Map();
+function purchaseCatalogue(rawItems, bills, poLines = [], opts = {}) {
   const lastGst = new Map();
   for (const l of poLines) {
     const raw = String(l.rawItem || "");
-    if (!raw) continue;
-    const price = num(l.unitPrice);
-    if (price) {
-      const kv = `${raw}|${l.variantId || ""}`;
-      if (!lastPrice.has(kv)) lastPrice.set(kv, price);
-      if (!lastPrice.has(`${raw}|`)) lastPrice.set(`${raw}|`, price);
-    }
-    if (num(l.gstRate) && !lastGst.has(raw)) lastGst.set(raw, Number(l.gstRate));
+    if (raw && num(l.gstRate) && !lastGst.has(raw)) lastGst.set(raw, Number(l.gstRate));
   }
+  const stockUnit = new Map((rawItems || []).map((r) => [String(r._id), r.customUnit || r.unit || ""]));
+  const poPrice = latestPoPrices([{ items: poLines }], (id) => stockUnit.get(id) || "", opts.units || []);
+  const stockRateOf = typeof opts.stockRate === "function" ? opts.stockRate : () => null;
 
   const out = [];
   for (const r of rawItems) {
@@ -264,23 +268,13 @@ function purchaseCatalogue(rawItems, bills, poLines = []) {
       source: "cms_raw",
       ...gst,
     };
-    const supplierPrice = (v) => {
-      const list = Array.isArray(v?.vendorNicknames) ? v.vendorNicknames : [];
-      const primary = r.primaryVendor
-        ? list.find((n) => String(n.vendor) === String(r.primaryVendor) && num(n.price))
-        : null;
-      return num((primary || list.find((n) => num(n.price)))?.price);
-    };
     const priceOf = (v) => {
-      const vid = v?._id ? String(v._id) : "";
-      if (vid && lastPrice.has(`${raw}|${vid}`))
-        return { standardCost: lastPrice.get(`${raw}|${vid}`), priceSource: "purchase_order" };
-      if (lastPrice.has(`${raw}|`))
-        return { standardCost: lastPrice.get(`${raw}|`), priceSource: "purchase_order" };
-      const sp = v ? supplierPrice(v) : null;
-      if (sp) return { standardCost: sp, priceSource: "supplier" };
-      if (num(hist.rate)) return { standardCost: hist.rate, priceSource: "bill" };
-      return { standardCost: null, priceSource: null };
+      const shared = variantPrice(r, v || {}, poPrice);
+      const stock = stockRateOf(raw, v && v._id ? String(v._id) : null);
+      const withStock = stock && stock.rate != null ? { stockRate: stock.rate, stockRateSource: stock.source } : { stockRate: null, stockRateSource: null };
+      if (shared.price != null) return { standardCost: shared.price, priceSource: shared.source, ...withStock };
+      if (num(hist.rate)) return { standardCost: hist.rate, priceSource: "bill", ...withStock };
+      return { standardCost: null, priceSource: null, ...withStock };
     };
 
     const variants = (r.variants || []).filter(Boolean);
@@ -297,11 +291,19 @@ function purchaseCatalogue(rawItems, bills, poLines = []) {
           variantLabel: label,
           standardCost: p.standardCost,
           priceSource: p.priceSource,
+          stockRate: p.stockRate,
+          stockRateSource: p.stockRateSource,
         });
       }
       continue;
     }
     const one = priced.find((p) => p.standardCost) || priceOf(variants[0]);
+    /* one row for the material: its stock rate is the material's, unless it
+       has exactly one variant */
+    const stock = variants.length === 1 ? one : (() => {
+      const s = stockRateOf(raw, null);
+      return s && s.rate != null ? { stockRate: s.rate, stockRateSource: s.source } : { stockRate: null, stockRateSource: null };
+    })();
     out.push({
       ...base,
       name: r.name,
@@ -309,6 +311,8 @@ function purchaseCatalogue(rawItems, bills, poLines = []) {
       ...(variants.length === 1 ? { variantId: variants[0]._id, variantLabel: variantLabelOf(variants[0]) } : {}),
       standardCost: one.standardCost ?? null,
       priceSource: one.priceSource ?? null,
+      stockRate: stock.stockRate ?? null,
+      stockRateSource: stock.stockRateSource ?? null,
     });
   }
   return out;

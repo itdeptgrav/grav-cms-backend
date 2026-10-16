@@ -68,12 +68,15 @@ async function buildFinancials() {
   const c = await company();
   const cid = c._id;
 
-  // Current financial year window from the company's configured FY start.
-  const from = new Date(c.financialYearStart || c.booksFromDate || `${new Date().getUTCFullYear()}-04-01`);
-  const to = new Date(from);
-  to.setUTCFullYear(to.getUTCFullYear() + 1);
-  to.setUTCDate(to.getUTCDate() - 1);
-  to.setUTCHours(23, 59, 59, 999);
+  /* The CURRENT Indian financial year, on India's calendar — what the P&L
+     page opens on (16 Oct 2026 audit). It used the company's
+     `financialYearStart`, which is when the books began, so after the first
+     year the assistant answered with a year-old P&L; and its UTC bounds
+     dropped vouchers stored at India's midnight on 1 April. */
+  const { istFyStartYear } = require("./accounting/istDates");
+  const fyYear = istFyStartYear(new Date());
+  const from = new Date(`${fyYear}-04-01T00:00:00.000+05:30`);
+  const to = new Date(`${fyYear + 1}-03-31T23:59:59.999+05:30`);
 
   const [groups, ledgers, movements] = await Promise.all([
     col("acc_groups").find({ companyId: cid, isActive: true }).toArray().catch(() => []),
@@ -82,7 +85,17 @@ async function buildFinancials() {
       .aggregate([
         { $match: { companyId: cid, status: "posted", voucherDate: { $gte: from, $lte: to } } },
         { $unwind: "$ledgerEntries" },
-        { $group: { _id: "$ledgerEntries.ledgerId", net: { $sum: "$ledgerEntries.signedAmount" } } },
+        /* type × amount: an entry saved without signedAmount still counts */
+        {
+          $group: {
+            _id: "$ledgerEntries.ledgerId",
+            net: {
+              $sum: {
+                $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", { $multiply: ["$ledgerEntries.amount", -1] }],
+              },
+            },
+          },
+        },
       ])
       .toArray()
       .catch(() => []),
@@ -116,6 +129,11 @@ async function buildFinancials() {
   let directRevenue = 0;
   let directExpenses = 0;
   const bs = { asset: 0, liability: 0, equity: 0 };
+  /* the balance sheet from opening + posted vouchers, never the cached
+     `currentBalance`, which is wrong on 186 of this company's 489 ledgers
+     (16 Oct 2026 audit) */
+  const { liveBalances } = require("./accounting/ledgerBalance");
+  const live = await liveBalances(cid, ledgers).catch(() => new Map());
   for (const led of ledgers) {
     const grp = led.groupId && groupMap[led.groupId.toString()];
     if (!grp) continue;
@@ -131,9 +149,10 @@ async function buildFinancials() {
       if (["purchase accounts", "direct expenses", "opening stock"].includes(root)) directExpenses += amount;
     }
     // Balance sheet uses closing (current) balances by nature.
-    if (grp.nature === "asset") bs.asset += led.currentBalance || 0;
-    else if (grp.nature === "liability") bs.liability += led.currentBalance || 0;
-    else if (grp.nature === "equity") bs.equity += led.currentBalance || 0;
+    const closing = (live.get(String(led._id)) || { balance: 0 }).balance;
+    if (grp.nature === "asset") bs.asset += closing;
+    else if (grp.nature === "liability") bs.liability += closing;
+    else if (grp.nature === "equity") bs.equity += closing;
   }
 
   revenue = money(revenue);
@@ -149,12 +168,12 @@ async function buildFinancials() {
   const assets = money(Math.abs(bs.asset));
   const liabilities = money(Math.abs(bs.liability));
   const equity = money(Math.abs(bs.equity));
-  const fy = c.currentFinancialYear || `${from.getUTCFullYear()}-${String((from.getUTCFullYear() + 1) % 100).padStart(2, "0")}`;
+  const fy = `${fyYear}-${String((fyYear + 1) % 100).padStart(2, "0")}`;
 
   return {
     baseCurrency: c.baseCurrency || "INR",
     financialYear: fy,
-    period: `${from.toISOString().slice(0, 10)} to ${to.toISOString().slice(0, 10)}`,
+    period: `${fyYear}-04-01 to ${fyYear + 1}-03-31`,
     profitAndLoss: {
       totalRevenue: revenue,
       totalExpenses: expenses,
@@ -593,8 +612,10 @@ async function buildVouchers({ voucherType, partyName, from, to } = {}) {
   }
   if (from || to) {
     match.voucherDate = {};
-    if (from) match.voucherDate.$gte = new Date(from);
-    if (to) match.voucherDate.$lte = new Date(`${to}T23:59:59.999Z`);
+    /* India's days, like every accounting screen */
+    const { istStart, istEnd } = require("./accounting/istDates");
+    if (from) match.voucherDate.$gte = istStart(from);
+    if (to) match.voucherDate.$lte = istEnd(to);
   }
 
   const project = { voucherTypeName: 1, voucherNumber: 1, voucherDate: 1, grandTotal: 1, ledgerEntries: 1 };
@@ -613,7 +634,7 @@ async function buildVouchers({ voucherType, partyName, from, to } = {}) {
   const row = (v) => ({
     type: v.voucherTypeName || "unknown",
     number: v.voucherNumber,
-    date: v.voucherDate ? new Date(v.voucherDate).toISOString().slice(0, 10) : null,
+    date: v.voucherDate ? require("./accounting/istDates").istYmd(v.voucherDate) : null,
     amount: inr(v.grandTotal),
     party: (v.ledgerEntries && v.ledgerEntries[0] && v.ledgerEntries[0].ledgerName) || null,
   });
@@ -645,7 +666,7 @@ async function buildPartyReport({ report, asOf = null, search = null } = {}) {
   const result = await service[fnName]({
     companyId: cid,
     scope: "all",
-    asOf: asOf ? new Date(`${asOf}T23:59:59.999Z`) : null,
+    asOf: asOf ? require("./accounting/istDates").istEnd(asOf) : null,
     search: search || "",
     balanceSide: "both",
     minOutstanding: 0,

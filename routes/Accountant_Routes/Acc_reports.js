@@ -2,6 +2,7 @@
 // Complete Financial Reports Routes
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const router = express.Router();
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
 const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
@@ -41,382 +42,281 @@ function classifyGstLedger(name) {
   return { comp, dir };
 }
 
-async function voucherDerivedGst(startDate, endDate) {
-  // The GST page doesn't pass companyId, so resolve the primary/only
-  // accounting company the same way the other bridges do.
-  let company = await Acc_Company.findOne({ isPrimary: true })
-    .select("_id")
-    .lean();
+/* ── THE GST SUMMARY, FROM THE BOOKS (16 Oct 2026 audit) ─────────────────
+   What was wrong, measured on this company's vouchers:
+   • every GST line was ADDED whatever its side, so a credit note's reversal
+     (Dr Output CGST — ₹4.77 lakh of it) raised output tax instead of
+     lowering it, and a debit note raised ITC;
+   • the monthly set-off and payment journals (Dr Output CGST 2.5% ₹3.18
+     lakh against Cr Input …, Dr CGST Payable / Cr Receivable) were read as
+     tax on supplies, so output tax and ITC were both inflated by the very
+     entries that clear them;
+   • the HSN summary took purchase lines too, added pieces to metres and
+     grouped by HSN alone;
+   • it always reported the PRIMARY company.
+
+   Now:
+   • only supplies count — sales and credit notes (outward), purchases and
+     debit notes (inward), and expenses booked through the expense module.
+     Journals, payments and contras are settlements, not supplies;
+   • a line is signed by its side: an output ledger counts Cr +, Dr −; an
+     input ledger Dr +, Cr −. A credit note therefore REDUCES output tax and
+     taxable value, a debit note reduces ITC, and reverse-charge tax on a
+     purchase (Cr Output … RCM) is counted as the liability it is;
+   • the rate, HSN and invoice tables carry the same sign (a note is a
+     negative row);
+   • HSN is sales-side only, one row per HSN + rate + unit, its taxable value
+     scaled onto the ledger base like the rate table;
+   • the company is the one asked for (`companyId`), else the primary one. */
+const GST_SLABS = [0, 0.1, 0.25, 1.5, 3, 5, 12, 18, 28, 40];
+const OUTWARD_TYPES = new Set(["sales", "credit_note"]);
+const INWARD_TYPES = new Set(["purchase", "debit_note"]);
+
+async function voucherDerivedGst(startDate, endDate, companyId) {
+  let company = null;
+  if (companyId && mongoose.Types.ObjectId.isValid(String(companyId))) {
+    company = await Acc_Company.findById(companyId).select("_id").lean();
+  }
+  if (!company) company = await Acc_Company.findOne({ isPrimary: true }).select("_id").lean();
   if (!company) {
     const all = await Acc_Company.find({}).select("_id").limit(2).lean();
     if (all.length === 1) company = all[0];
   }
   if (!company) return null;
 
-  const match = { companyId: company._id, status: "posted" };
+  const match = { companyId: company._id, status: "posted", isOptional: { $ne: true } };
   if (startDate && endDate) {
-    match.voucherDate = {
-      $gte: new Date(startDate),
-      $lte: new Date(endDate),
-    };
+    match.voucherDate = { $gte: istStart(startDate), $lte: istEnd(endDate) };
   }
 
   const vouchers = await Acc_Voucher.find(match)
-    .select(
-      "voucherType ledgerEntries inventoryEntries voucherDate voucherNumber partyLedgerName",
-    )
+    .select("voucherType sourceSystem ledgerEntries inventoryEntries voucherDate voucherNumber partyLedgerName")
     .lean();
-
   if (!vouchers.length) return null;
 
   const out = { cgst: 0, sgst: 0, igst: 0, cess: 0, taxable: 0 };
   const inp = { cgst: 0, sgst: 0, igst: 0, cess: 0, taxable: 0 };
   let outCount = 0;
   let inCount = 0;
-
-  // GSTR-3B helpers ---------------------------------------------------
-  // rate-wise: { "5": {taxable, cgst, sgst, igst, cess}, "12": {...} }
   const outByRate = {};
   const inByRate = {};
-  // B2B vs B2C (a sale is B2B when the party has a GSTIN; we look it up
-  // on the party ledger). Without a reliable per-voucher GSTIN we treat
-  // a party ledger that has gstin set as B2B.
   const b2b = { taxable: 0, tax: 0, count: 0 };
   const b2c = { taxable: 0, tax: 0, count: 0 };
-  // HSN summary: { "6109": { hsn, qty, taxable, cgst, sgst, igst, cess } }
   const hsnMap = {};
   const outInvoices = [];
   const inInvoices = [];
 
   const addRate = (bucket, rate, vals) => {
     const key = String(rate || 0);
-    if (!bucket[key])
-      bucket[key] = { taxable: 0, cgst: 0, sgst: 0, igst: 0, cess: 0 };
-    bucket[key].taxable += vals.taxable || 0;
-    bucket[key].cgst += vals.cgst || 0;
-    bucket[key].sgst += vals.sgst || 0;
-    bucket[key].igst += vals.igst || 0;
-    bucket[key].cess += vals.cess || 0;
+    if (!bucket[key]) bucket[key] = { taxable: 0, cgst: 0, sgst: 0, igst: 0, cess: 0 };
+    for (const k of ["taxable", "cgst", "sgst", "igst", "cess"]) bucket[key][k] += vals[k] || 0;
   };
 
   for (const v of vouchers) {
-    const isSalesSide = ["sales", "credit_note"].includes(v.voucherType);
-    const isPurchSide = ["purchase", "debit_note"].includes(v.voucherType);
+    const isSalesSide = OUTWARD_TYPES.has(v.voucherType);
+    const isPurchSide = INWARD_TYPES.has(v.voucherType) || v.sourceSystem === "expense_module";
+    if (!isSalesSide && !isPurchSide) continue; // a settlement, not a supply
+
     let touchedOut = false;
     let touchedIn = false;
-    let vCgst = 0;
-    let vSgst = 0;
-    let vIgst = 0;
-    let vCess = 0;
+    /* this voucher's own tax and base, signed for the side it reports on */
+    const vt = { cgst: 0, sgst: 0, igst: 0, cess: 0 };
     let vTaxable = 0;
     for (const e of v.ledgerEntries || []) {
-      const c = classifyGstLedger(e.ledgerName);
       const amt = e.amount || 0;
+      const c = classifyGstLedger(e.ledgerName);
+      if (c) {
+        const dir = c.dir || (isSalesSide ? "outward" : "inward");
+        if (dir === "outward") {
+          const signed = e.type === "Cr" ? amt : -amt;
+          out[c.comp] += signed;
+          touchedOut = true;
+          if (isSalesSide) vt[c.comp] += signed;
+        } else {
+          const signed = e.type === "Dr" ? amt : -amt;
+          inp[c.comp] += signed;
+          touchedIn = true;
+          if (isPurchSide) vt[c.comp] += signed;
+        }
+        continue;
+      }
+      // Taxable base = the sales / purchase ledger line only — never the
+      // party total (base + tax) or round-off.
       const lname = String(e.ledgerName || "").toLowerCase();
       const grp = String(e.groupName || "").toLowerCase();
-      if (c) {
-        const dir =
-          c.dir || (isSalesSide ? "outward" : isPurchSide ? "inward" : null);
-        if (dir === "outward") {
-          out[c.comp] += amt;
-          touchedOut = true;
-          if (c.comp === "cgst") vCgst += amt;
-          else if (c.comp === "sgst") vSgst += amt;
-          else if (c.comp === "igst") vIgst += amt;
-          else if (c.comp === "cess") vCess += amt;
-        } else if (dir === "inward") {
-          inp[c.comp] += amt;
-          touchedIn = true;
-          if (c.comp === "cgst") vCgst += amt;
-          else if (c.comp === "sgst") vSgst += amt;
-          else if (c.comp === "igst") vIgst += amt;
-          else if (c.comp === "cess") vCess += amt;
-        }
-      } else {
-        // Taxable base = the SALES / PURCHASE revenue/expense ledger
-        // line only — NOT the party (debtor/creditor) total and NOT
-        // round-off. The party line equals base+tax and would double
-        // count. Identify the base ledger by name or its account group.
-        const isSalesLedger =
-          /\bsales?\b/.test(lname) ||
-          grp.includes("sales account") ||
-          grp.includes("direct inco");
-        const isPurchLedger =
-          /\bpurchase?\b/.test(lname) ||
-          grp.includes("purchase account") ||
-          grp.includes("direct expens");
-        if (isSalesSide && isSalesLedger) {
-          out.taxable += amt;
-          vTaxable += amt;
-        } else if (isPurchSide && isPurchLedger) {
-          inp.taxable += amt;
-          vTaxable += amt;
-        }
+      const isSalesLedger = /\bsales?\b/.test(lname) || grp.includes("sales account") || grp.includes("direct inco");
+      const isPurchLedger = /\bpurchase?\b/.test(lname) || grp.includes("purchase account") || grp.includes("direct expens");
+      if (isSalesSide && isSalesLedger) {
+        const signed = e.type === "Cr" ? amt : -amt;
+        out.taxable += signed;
+        vTaxable += signed;
+      } else if (isPurchSide && !isSalesSide && isPurchLedger) {
+        const signed = e.type === "Dr" ? amt : -amt;
+        inp.taxable += signed;
+        vTaxable += signed;
       }
     }
-    if (touchedOut) outCount++;
-    if (touchedIn) inCount++;
+    if (touchedOut && isSalesSide) outCount++;
+    if (touchedIn && isPurchSide) inCount++;
 
-    // ── Rate-wise + HSN ────────────────────────────────────────────
-    // The OLD imports stored inventoryEntries WITHOUT gstRate/hsnCode,
-    // so we must NOT depend on it. Instead derive the effective GST
-    // rate for this voucher from the actual tax it carries vs its
-    // taxable base (data already in the DB): rate ≈ tax / taxable.
-    // Snap to the nearest standard Indian slab so 4.99 → 5, etc.
-    const vTaxAbs = Math.abs(vCgst) + Math.abs(vSgst) + Math.abs(vIgst);
+    const vTax = vt.cgst + vt.sgst + vt.igst + vt.cess;
+    const sgn = (vTaxable || vTax) < 0 ? -1 : 1;
     const vBaseAbs = Math.abs(vTaxable);
+    const vTaxAbs = Math.abs(vt.cgst) + Math.abs(vt.sgst) + Math.abs(vt.igst);
+
+    // Effective rate of the voucher, snapped to the nearest slab.
     let effRate = 0;
     if (vBaseAbs > 0 && vTaxAbs > 0) {
       const raw = (vTaxAbs / vBaseAbs) * 100;
-      const slabs = [0, 0.25, 3, 5, 12, 18, 28];
-      effRate = slabs.reduce((best, s) =>
-        Math.abs(s - raw) < Math.abs(best - raw) ? s : best,
-      );
+      effRate = GST_SLABS.reduce((best, s) => (Math.abs(s - raw) < Math.abs(best - raw) ? s : best));
     }
-    const rateVals = {
-      taxable: vBaseAbs,
-      cgst: Math.abs(vCgst),
-      sgst: Math.abs(vSgst),
-      igst: Math.abs(vIgst),
-      cess: Math.abs(vCess),
-    };
-    /* ONE RATE PER VOUCHER IS WRONG FOR A MIXED INVOICE.
-       ------------------------------------------------------------------
-       An invoice selling taxed goods AND nil-rated goods has no single
-       rate. Folding it under one diluted effective rate files the
-       nil-rated turnover as though it were taxed — the same mistake the
-       invoice's own HSN summary was making.
 
-       So the lines are used when they can be trusted, and only then.
-       Trust is not assumed: 123 vouchers here carry real tax while every
-       one of their lines says taxRate 0 (old Tally imports that never
-       stored a per-line rate). Splitting those by line rate would file
-       ~₹49 lakh of taxed turnover at 0% — far worse than the problem being
-       fixed. The test is arithmetic, not faith: the lines are used only if
-       the tax they imply reconciles with the tax the voucher actually
-       carries. Otherwise the voucher-level effective rate stands, exactly
-       as before.
-
-       The ledger base stays authoritative — line amounts are scaled onto
-       it — so this changes how the base is DISTRIBUTED across rate rows,
-       never the total. */
-    const invLines = v.inventoryEntries || [];
+    /* Lines are used for the rate split only when the tax they imply
+       reconciles with the tax the voucher carries (old Tally imports store
+       no per-line rate); otherwise the voucher's effective rate stands. The
+       ledger base stays authoritative — line amounts are scaled onto it. */
+    const invLines = (v.inventoryEntries || []).filter((i) => !i.isCharge);
     const lineBase = invLines.reduce((s, i) => s + Math.abs(i.amount || 0), 0);
-    const lineTaxTotal = invLines.reduce(
-      (s, i) => s + (Math.abs(i.amount || 0) * Number(i.taxRate || 0)) / 100,
-      0,
-    );
+    const lineTaxTotal = invLines.reduce((s, i) => s + (Math.abs(i.amount || 0) * Number(i.taxRate || 0)) / 100, 0);
     const linesReconcile =
-      invLines.length > 0 &&
-      lineBase > 0 &&
-      vBaseAbs > 0 &&
+      invLines.length > 0 && lineBase > 0 && vBaseAbs > 0 &&
       Math.abs(lineTaxTotal - vTaxAbs) <= Math.max(2, vTaxAbs * 0.02);
+    const scale = lineBase > 0 && vBaseAbs > 0 ? vBaseAbs / lineBase : 1;
 
-    const rateBucket = isSalesSide ? outByRate : isPurchSide ? inByRate : null;
-    if (rateBucket && (vBaseAbs > 0 || vTaxAbs > 0)) {
+    const rateBucket = isSalesSide ? outByRate : inByRate;
+    if (vBaseAbs > 0 || vTaxAbs > 0) {
       if (linesReconcile) {
-        const scale = vBaseAbs / lineBase;
         const baseByRate = new Map();
         for (const it of invLines) {
           const r = Number(it.taxRate || 0);
-          baseByRate.set(
-            r,
-            (baseByRate.get(r) || 0) + Math.abs(it.amount || 0) * scale,
-          );
+          baseByRate.set(r, (baseByRate.get(r) || 0) + Math.abs(it.amount || 0) * scale);
         }
         for (const [r, base] of baseByRate) {
-          /* Apportion the voucher's real tax by how much of it this rate
-             band accounts for, so the components still add up to what was
-             actually posted rather than to a recomputation. */
           const share = vTaxAbs > 0 ? (base * r) / 100 / vTaxAbs : 0;
           addRate(rateBucket, r, {
-            taxable: base,
-            cgst: Math.abs(vCgst) * share,
-            sgst: Math.abs(vSgst) * share,
-            igst: Math.abs(vIgst) * share,
-            cess: Math.abs(vCess) * share,
+            taxable: sgn * base,
+            cgst: sgn * Math.abs(vt.cgst) * share,
+            sgst: sgn * Math.abs(vt.sgst) * share,
+            igst: sgn * Math.abs(vt.igst) * share,
+            cess: sgn * Math.abs(vt.cess) * share,
           });
         }
       } else {
-        addRate(rateBucket, effRate, rateVals);
+        addRate(rateBucket, effRate, {
+          taxable: sgn * vBaseAbs,
+          cgst: sgn * Math.abs(vt.cgst),
+          sgst: sgn * Math.abs(vt.sgst),
+          igst: sgn * Math.abs(vt.igst),
+          cess: sgn * Math.abs(vt.cess),
+        });
       }
     }
 
-    // HSN summary — use inventoryEntries when the (newer) import stored
-    // hsnCode; otherwise skip silently (the rate-wise table above is
-    // the authoritative GSTR-3B 3.1 view and is now DB-independent).
-    const invs = v.inventoryEntries || [];
-    for (const it of invs) {
-      const h = it.hsnCode ? String(it.hsnCode).trim() : "";
-      if (!h) continue;
-      const base = Math.abs(it.amount || 0);
-      /* Apportion this line's tax by its OWN rate where the lines
-         reconcile with the posted tax (see the note above), and by the
-         voucher's effective rate otherwise. A nil-rated line then shows
-         under 0% instead of borrowing the invoice's average. */
-      const lineTax = (base * (linesReconcile ? Number(it.taxRate || 0) : effRate)) / 100;
-      const isIgst = Math.abs(vIgst) > Math.abs(vCgst);
-      if (!hsnMap[h])
-        hsnMap[h] = {
-          hsn: h,
-          quantity: 0,
-          taxable: 0,
-          cgst: 0,
-          sgst: 0,
-          igst: 0,
-          cess: 0,
-        };
-      hsnMap[h].quantity += it.quantity || 0;
-      hsnMap[h].taxable += base;
-      if (isIgst) {
-        hsnMap[h].igst += lineTax;
-      } else {
-        hsnMap[h].cgst += lineTax / 2;
-        hsnMap[h].sgst += lineTax / 2;
+    // HSN summary — outward supplies only, one row per HSN + rate + unit.
+    if (isSalesSide) {
+      const isIgst = Math.abs(vt.igst) > Math.abs(vt.cgst);
+      for (const it of invLines) {
+        const h = it.hsnCode ? String(it.hsnCode).trim() : "";
+        if (!h) continue;
+        const rate = linesReconcile ? Number(it.taxRate || 0) : effRate;
+        const unit = String(it.unit || "").trim().toUpperCase() || "NOS";
+        const key = `${h}|${rate}|${unit}`;
+        const base = sgn * Math.abs(it.amount || 0) * scale;
+        const tax = (base * rate) / 100;
+        if (!hsnMap[key]) hsnMap[key] = { hsn: h, rate, unit, quantity: 0, taxable: 0, cgst: 0, sgst: 0, igst: 0, cess: 0 };
+        hsnMap[key].quantity += sgn * Math.abs(it.quantity || 0);
+        hsnMap[key].taxable += base;
+        if (isIgst) hsnMap[key].igst += tax;
+        else {
+          hsnMap[key].cgst += tax / 2;
+          hsnMap[key].sgst += tax / 2;
+        }
       }
     }
 
-    // B2B / B2C split + invoice register (sales side only).
-    if (isSalesSide && (touchedOut || vTaxable)) {
-      const taxTotal =
-        Math.abs(vCgst) + Math.abs(vSgst) + Math.abs(vIgst) + Math.abs(vCess);
-      const rec = {
-        voucherNumber: v.voucherNumber,
-        date: v.voucherDate,
-        party: v.partyLedgerName || "",
-        taxableValue: Math.abs(vTaxable),
-        cgst: Math.abs(vCgst),
-        sgst: Math.abs(vSgst),
-        igst: Math.abs(vIgst),
-        cess: Math.abs(vCess),
-        totalTax: taxTotal,
-      };
-      outInvoices.push(rec);
-    } else if (isPurchSide && (touchedIn || vTaxable)) {
-      const taxTotal =
-        Math.abs(vCgst) + Math.abs(vSgst) + Math.abs(vIgst) + Math.abs(vCess);
-      inInvoices.push({
-        voucherNumber: v.voucherNumber,
-        date: v.voucherDate,
-        party: v.partyLedgerName || "",
-        taxableValue: Math.abs(vTaxable),
-        cgst: Math.abs(vCgst),
-        sgst: Math.abs(vSgst),
-        igst: Math.abs(vIgst),
-        cess: Math.abs(vCess),
-        totalTax: taxTotal,
-      });
-    }
+    // Invoice registers (a note is a negative row).
+    const rec = {
+      voucherNumber: v.voucherNumber,
+      voucherType: v.voucherType,
+      date: v.voucherDate,
+      party: v.partyLedgerName || "",
+      taxableValue: vTaxable,
+      cgst: vt.cgst,
+      sgst: vt.sgst,
+      igst: vt.igst,
+      cess: vt.cess,
+      totalTax: vTax,
+    };
+    if (isSalesSide && (touchedOut || vTaxable)) outInvoices.push(rec);
+    else if (isPurchSide && (touchedIn || vTaxable)) inInvoices.push(rec);
   }
 
-  // B2B vs B2C: look up which party ledgers have a GSTIN.
-  const partyNames = [
-    ...new Set(outInvoices.map((r) => r.party).filter(Boolean)),
-  ];
-  let gstinByParty = {};
+  // B2B vs B2C: a party ledger with a GSTIN is B2B.
+  const partyNames = [...new Set(outInvoices.map((r) => r.party).filter(Boolean))];
+  const gstinByParty = {};
   if (partyNames.length) {
-    const {
-      Acc_Ledger,
-    } = require("../../models/Accountant_model/Acc_MasterModels");
-    const leds = await Acc_Ledger.find({
-      companyId: company._id,
-      name: { $in: partyNames },
-    })
-      .select("name gstin")
-      .lean();
+    const { Acc_Ledger } = require("../../models/Accountant_model/Acc_MasterModels");
+    const leds = await Acc_Ledger.find({ companyId: company._id, name: { $in: partyNames } }).select("name gstin").lean();
     for (const l of leds) gstinByParty[l.name] = (l.gstin || "").trim();
   }
   for (const r of outInvoices) {
     const hasGstin = !!gstinByParty[r.party];
     r.type = hasGstin ? "B2B" : "B2C";
     r.partyGstin = gstinByParty[r.party] || "";
-    if (hasGstin) {
-      b2b.taxable += r.taxableValue;
-      b2b.tax += r.totalTax;
-      b2b.count += 1;
-    } else {
-      b2c.taxable += r.taxableValue;
-      b2c.tax += r.totalTax;
-      b2c.count += 1;
-    }
+    const bucket = hasGstin ? b2b : b2c;
+    bucket.taxable += r.taxableValue;
+    bucket.tax += r.totalTax;
+    bucket.count += 1;
   }
 
+  const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
   const roundObj = (o) => {
     const r = {};
-    for (const k of Object.keys(o))
-      r[k] =
-        typeof o[k] === "number"
-          ? Math.round(Math.abs(o[k]) * 100) / 100
-          : o[k];
+    for (const k of Object.keys(o)) r[k] = typeof o[k] === "number" ? r2(o[k]) : o[k];
     return r;
   };
+  const taxOf = (o) => r2((o.cgst || 0) + (o.sgst || 0) + (o.igst || 0) + (o.cess || 0));
   const rateRows = (bucket) =>
     Object.keys(bucket)
       .sort((a, b) => parseFloat(a) - parseFloat(b))
-      .map((rate) => ({
-        rate: parseFloat(rate),
-        ...roundObj(bucket[rate]),
-        totalTax:
-          Math.round(
-            (Math.abs(bucket[rate].cgst) +
-              Math.abs(bucket[rate].sgst) +
-              Math.abs(bucket[rate].igst) +
-              Math.abs(bucket[rate].cess)) *
-              100,
-          ) / 100,
-      }));
+      .map((rate) => ({ rate: parseFloat(rate), ...roundObj(bucket[rate]), totalTax: taxOf(bucket[rate]) }));
 
   const outputTax = out.cgst + out.sgst + out.igst + out.cess;
   const inputTax = inp.cgst + inp.sgst + inp.igst + inp.cess;
 
   return {
     outputGST: {
-      totalTaxableValue: Math.abs(out.taxable),
-      totalCGST: Math.abs(out.cgst),
-      totalSGST: Math.abs(out.sgst),
-      totalIGST: Math.abs(out.igst),
-      totalCess: Math.abs(out.cess),
-      totalTax: Math.abs(outputTax),
+      totalTaxableValue: r2(out.taxable),
+      totalCGST: r2(out.cgst),
+      totalSGST: r2(out.sgst),
+      totalIGST: r2(out.igst),
+      totalCess: r2(out.cess),
+      totalTax: r2(outputTax),
       invoiceCount: outCount,
     },
     inputGST: {
-      totalTaxableValue: Math.abs(inp.taxable),
-      totalCGST: Math.abs(inp.cgst),
-      totalSGST: Math.abs(inp.sgst),
-      totalIGST: Math.abs(inp.igst),
-      totalCess: Math.abs(inp.cess),
-      totalTax: Math.abs(inputTax),
+      totalTaxableValue: r2(inp.taxable),
+      totalCGST: r2(inp.cgst),
+      totalSGST: r2(inp.sgst),
+      totalIGST: r2(inp.igst),
+      totalCess: r2(inp.cess),
+      totalTax: r2(inputTax),
       expenseCount: inCount,
     },
-    netGSTPayable: Math.abs(outputTax) - Math.abs(inputTax),
-    inputTaxCredit: Math.abs(inputTax),
-    // ── GSTR-3B style sections ──────────────────────────────────────
+    netGSTPayable: r2(outputTax - inputTax),
+    inputTaxCredit: r2(inputTax),
     gstr3b: {
-      // 3.1(a) Outward taxable supplies, 4 Eligible ITC
       outwardByRate: rateRows(outByRate),
       inwardByRate: rateRows(inByRate),
       b2b: roundObj(b2b),
       b2c: roundObj(b2c),
       hsnSummary: Object.values(hsnMap)
-        .map((h) => ({
-          ...roundObj(h),
-          totalTax:
-            Math.round(
-              (Math.abs(h.cgst) +
-                Math.abs(h.sgst) +
-                Math.abs(h.igst) +
-                Math.abs(h.cess)) *
-                100,
-            ) / 100,
-        }))
+        .map((h) => ({ ...roundObj(h), totalTax: taxOf(h) }))
         .sort((a, b) => b.taxable - a.taxable),
     },
-    outwardInvoices: outInvoices
-      .map((r) => roundObj(r))
-      .sort((a, b) => new Date(a.date) - new Date(b.date)),
-    inwardInvoices: inInvoices
-      .map((r) => roundObj(r))
-      .sort((a, b) => new Date(a.date) - new Date(b.date)),
+    outwardInvoices: outInvoices.map(roundObj).sort((a, b) => new Date(a.date) - new Date(b.date)),
+    inwardInvoices: inInvoices.map(roundObj).sort((a, b) => new Date(a.date) - new Date(b.date)),
+    companyId: String(company._id),
     source: "vouchers",
   };
 }
@@ -573,17 +473,23 @@ router.get("/payables-aging", async (req, res) => {
 });
 
 // ── GST Report ──
-router.get("/gst", async (req, res) => {
+router.get("/gst", (req, res, next) => (req.query.companyId ? AccountantAuthMiddleware.requireCompanyScope(req, res, next) : next()), async (req, res) => {
   try {
-    const { startDate, endDate, type = "summary" } = req.query;
+    const { startDate, endDate, type = "summary", companyId } = req.query;
     let dateFilter = {};
     if (startDate && endDate) {
-      dateFilter = { $gte: new Date(startDate), $lte: new Date(endDate) };
+      dateFilter = { $gte: istStart(startDate), $lte: istEnd(endDate) };
     }
+
+    /* The books are the vouchers: read them first. The two collections
+       below are an older bookkeeping path (empty on this company); they
+       are read only when the books have nothing for the period. */
+    const fromBooks = await voucherDerivedGst(startDate, endDate, companyId);
+    if (fromBooks) return res.json({ success: true, gstReport: fromBooks });
 
     // Output GST (Sales)
     const invoices = await Acc_Invoice.find(
-      dateFilter.invoiceDate ? { invoiceDate: dateFilter } : {},
+      dateFilter.$gte ? { invoiceDate: dateFilter } : {},
     )
       .select(
         "invoiceNumber invoiceDate customerName taxBreakdown grandTotal items",
@@ -626,22 +532,6 @@ router.get("/gst", async (req, res) => {
     };
 
     const netGSTPayable = outputGST.totalTax - inputGST.totalTax;
-
-    // If the operational collections have nothing (this company's data
-    // came from a Tally import, which lands in Acc_Voucher, not
-    // Acc_Invoice/Acc_Expense), derive GST from the voucher tax lines so
-    // the report isn't empty. Keeps the invoice/expense path as primary
-    // for any company that genuinely uses those collections.
-    if (invoices.length === 0 && expenses.length === 0) {
-      try {
-        const vd = await voucherDerivedGst(startDate, endDate);
-        if (vd) {
-          return res.json({ success: true, gstReport: vd });
-        }
-      } catch (e) {
-        console.error("[gst] voucher fallback:", e.message);
-      }
-    }
 
     res.json({
       success: true,
@@ -804,7 +694,7 @@ router.get("/expense-summary", async (req, res) => {
     let filter = { status: { $ne: "void" } };
     if (financialYear) filter.financialYear = financialYear;
     if (startDate && endDate) {
-      filter.createdAt = { $gte: new Date(startDate), $lte: new Date(endDate) };
+      filter.createdAt = { $gte: istStart(startDate), $lte: istEnd(endDate) };
     }
 
     const expenses = await Acc_Expense.find(filter)
