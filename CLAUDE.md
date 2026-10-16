@@ -2183,87 +2183,67 @@ Checked 13 Oct 2026 on the owner's STAR CRATE label (GRN/2026-27/0001,
 PO/2026-27/0013): accepted as "SL CR-1 · 5 Nos", the record carried no
 order and the GRN number, then it was deleted.
 
-## Sewing completion scans: the preview was broken, the route rule is a note (13 Oct 2026, owner)
+## Split one requested MRF line into several (13 Oct 2026, owner)
 
-`routes/CMS_Routes/Manufacturing/Production/productionCompletionRoutes.js`:
+"Button (18L & 14L), 2 Pcs" is one line to the requester and two products to
+the Store. `services/mrfItemSplit.service.js` is every rule; two routes on
+`mrfRoutes.js` (MRF_FULFIL, idempotent, `may(req, "MATCH")`, store-actionable
+requests only):
 
-- **`POST /preview` threw on every call** — its loop pushed to `invalidOrder`,
-  `invalidOrderDetails` and `orderPassed`, none declared, so Save Record on
-  the supervisor's page answered "Server error" every time; and it read
-  `wo.orderQuantity`, a field the model does not have (it is `quantity`), so
-  "past the quantity ordered" never fired. Both fixed. The preview now also
-  answers `details[]` (one verdict per barcode: `state` new /
-  already-recorded / no-order / beyond-quantity / unrouted / invalid-format,
-  `reason`, `product`, `workOrderNumber`, `unitNumber`, `quantity`,
-  `noRoute`) and `byWorkOrder[]` (the new pieces grouped: product, order,
-  quantity, `units`, `count`) for the page's rows and its confirmation.
-- **`parseBarcode` FINDS `WO-<8|24 hex>-<unit>` in the text** (a camera hands
-  over a URL; a label may be printed upper-case — the hex is lowered, `WO`
-  stays upper as every other parser has it) and every stored spelling is the
-  canonical `WO-<hex>-<unit as printed>` (`canonicalOf`).
-- **A piece of an order with no operation route is RECORDED, with a note.**
-  Since 9 Oct 2026 orders reach the floor without a route, so the refusal
-  turned every genuine scan of such an order into "wrong scan". The scan
-  saves; `details[].noRoute` says so. `PRODUCTION_SCAN_REQUIRE_ROUTE=1`
-  restores the refusal (then unrouted pieces are skipped, never the whole
-  batch).
-- **`POST /mark-done` skips and names, never refuses the batch**: pieces on no
-  work order (`notInOrderBarcodes`), past the quantity
-  (`beyondQuantityBarcodes`), unrouted under the switch (`unroutedBarcodes`),
-  not piece barcodes (`invalidBarcodes`) and already recorded
-  (`alreadyScannedBarcodes`) are listed beside `savedBarcodes`; the good
-  pieces in the same batch are written. "Nothing could be recorded" is a 200
-  with zero saved, not a 400.
-Checked 13 Oct 2026 on the owner's own codes: WO-d9f4eb87-001/002 are
-"already recorded on 2026-07-27" (which is why they were refused),
-WO-5c10f3bb-002 is new, WO-5c10f3bb-999 is past the 15 ordered, "hello" is
-not a piece barcode.
+- `POST /:id/items/:itemId/split` `{ parts: [{ quantity, rawItemId?, variantId? }] }`
+  → the line keeps its `_id`, history and approval and becomes part 1; parts
+  2..N are new lines spliced in right after it. Quantities must add up to the
+  line's `requestedQty` (2–20 parts). A part naming a product is matched on
+  the way with `applyCatalogueMatch` — the SAME assignment the match route now
+  calls (matched unit wins, APPROVED, free-text category/attributes dropped);
+  a product with variants needs one of ITS variants. Matched parts get an
+  auto-reservation attempt (`LINE_MATCHED`). Event `ITEM_SPLIT`, one
+  `SpActionHistory` entry, a notification to the requester.
+- `POST /:id/items/:itemId/unsplit` (any part names the group) → the original
+  line back exactly (`split.original` snapshot), the other parts removed.
+  Event `ITEM_SPLIT_UNDONE`.
+- **Refused** (`splitRefusal` / `undoRefusal`, each with what to do): not
+  UNMATCHED/APPROVED, not approved, anything issued/returned/consumed,
+  customer-supplied, a purchase form / `buyQty`, a live PO line
+  (`sourceMrfLineId`), an ACTIVE `StockReservation` (release it first).
+  Undo also needs every part untouched.
+- **`MRF.items[].split`** `{ groupId, originalQty, originalUnit, originalName,
+  at, by, byName, original? }` — `groupId` is the original line's `_id` on every
+  part; `original` only on that line. A part split again joins the same group.
+- **Approval stays true across parts**: approved quantities add up to what was
+  approved; what was asked and what was cut stay on the original line (part 1's
+  `approval.requestedQty` = asked − the other parts). Lines with no recorded
+  approval keep deriving it from the request.
+- Every part restarts its availability report and auto-reservation record.
+- `/stock-check` adds `splitCheck` per line (`canSplit`, `reason`, and on the
+  original `canUndo`, `undoReason`) — the server alone knows the
+  reservations and PO lines (`lineBlockers`).
 
-## IE plans a work order: operations and the line (16 Oct 2026, owner)
+Tests: `test/store-purchase/mrf-item-split.route.test.js` (10). The four
+failures in `mrf-chat-legacy-numbering` and `mrf-tenancy` are identical at HEAD.
 
-"The IE will assign the operation against the WO — the main thing — with
-shortcuts to select multiple WOs; the line planning happens on the basis of
-WO, on the 2D/3D interface the supervisor has; copy / reference another WO;
-stored for that WO so PPC can see it." Everything is on the IE router
-(`/api/cms/ie/work-orders/*`, viewer reads / editor writes, declared before
-`/orders/:id`) and in `services/industrialEngineering/ieWorkOrderPlanning.service.js`
-(tested: `ieWorkOrderPlanning.test.js`, plus the FerretDB harness, 19 checks).
+## Scan a barcode to match an MRF line (14 Oct 2026, owner)
 
-- **No new collection** (the cap). Two additive sub-documents on `WorkOrder`,
-  both `default: undefined` so older rows carry nothing: `operationsPlan`
-  (who last set `operations[]`, from where — `ie-typed | ie-registered |
-  ie-style | ie-copy | ie-mixed` — `copiedFromWorkOrderId/Number`,
-  `version`) and `linePlan` (`lineId` / `lineName` of a `CanvasLayout.lines[]`
-  line, its shape, `stations[]` = `{ side, index, item, machineId/Name/Type
-  as the floor had it, operationId → operations[]._id, operationCode,
-  operationType, plannedTimeSeconds, operatorId/Name, notes }`, `summary`,
-  `copiedFrom…`, `version`, `plannedAt/By`). `operations[]` itself is
-  unchanged — the scanner, QC and PPC read it as before.
-- **Every write names the work orders** (`workOrderIds[]`, ≤200) and answers
-  per work order (`results[]`: `saved` / `skipped` with the reason; a
-  completed / cancelled / forwarded work order is skipped, never changed).
-  Each gets its OWN copy — nothing is shared by reference.
-  - `POST /work-orders/operations { workOrderIds, operations[], mode:
-    replace|append, source }` — `normaliseOperations` (name required, time
-    ≥ 0, ≤400 rows).
-  - `POST /work-orders/operations/copy { fromWorkOrderId, workOrderIds }`.
-  - `POST /work-orders/line-plan { workOrderIds, plan }` — `planFor`
-    resolves every station's operation against THAT work order's own rows,
-    by `operationId`, then code (case-insensitive), then name; an operation
-    the work order lacks is kept by name with `operationId: null` and named
-    in `results[].notOnWorkOrder`. Stations off the line or listed twice are
-    refused before anything is written.
-  - `POST /work-orders/line-plan/copy { fromWorkOrderId, workOrderIds }`,
-    `POST /work-orders/line-plan/clear { workOrderId }` (a POST: nothing on
-    this router is a DELETE).
-- **Reads**: `GET /work-orders?ids=` and `/work-orders/:id` (route + plan +
-  photo via `workOrderPhoto`), `/work-orders/floor` (the lines with the
-  machine standing in each slot — read-only; the floor is written only by
-  `/api/cms/production/canvas-layout`), `/work-orders/plan-sources?what=
-  operations|line-plan&q=` (the "copy from" picker), `/work-orders/
-  registered-operations?q=`, `/work-orders/operators?q=`.
-  `GET /manufacturing-orders/:moId` rows now carry `photo`, `variant`,
-  `workOrderOperations.rows` (with `operationId`) and `.plan`, and a
-  `linePlan` summary.
-- Every work order is proved through the SAME `ieOrders.orderOwnershipBound`
-  the IE order pages use; a foreign one is "not found".
+`GET /api/cms/inventory/mrf/data/raw-items/scan?code=` (mrfRoutes, behind
+`requireTenant`; reads only) turns what the Store's scanner read into the
+product for the Match to Inventory popup, in the same shape as
+`/data/raw-items` (`pickerItem`, now shared by both). Every rule is
+`services/mrfScanMatch.service.js`:
+
+- **our raw-item label** — `itemid=`, `RawItem=`, the label URL, the bare id —
+  parsed with QC's `rawMaterialIdOf`; answers the label's material AND
+  variant (`via: "label"`, `label: {quantity, unit}`; `variantGone` when the
+  item lost that variant). A **VOIDED** label is refused with
+  `identityRefusal`'s message.
+- a **raw item's own id** (`via: "item-id"`).
+- an **exact SKU**, item or variant, case and surrounding spaces ignored, the
+  code regex-escaped (`via: "item-sku" | "variant-sku"`). Variant SKUs are
+  NOT unique (20 repeats on 14 Oct 2026): several matches answer
+  `reason: "AMBIGUOUS"` with `candidates`, never a guess.
+- a shelf `loc=LOC-` label → `LOCATION_LABEL`; anything else → `NOT_FOUND`
+  with the code in the message. Empty → 400.
+
+Scoped with `tenantFilter` folded into `$and` (the read-through filter is an
+`$or`, so it must not be spread beside another `$or`) — another company's
+label or SKU is not found. Tests:
+`test/store-purchase/mrf-scan-match.route.test.js` (8).

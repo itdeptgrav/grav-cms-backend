@@ -12,6 +12,14 @@
  *
  * Each test sends the payload and asserts the refusal AND that no part of a
  * mixed payload was applied.
+ *
+ * (14 Oct 2026, owner: no role tiers in the employee section) Every HR user —
+ * viewer to owner — now writes pay, bank details and employment state on these
+ * routes, and nothing is held for the owner. What is still refused, at every
+ * HR role, is a field that is not HR's to write at all (an access grant, an
+ * admin flag, a credential, an audit stamp); those tests are unchanged in
+ * substance, and the "mixed payload" tests now pin the whole-request refusal
+ * on such a field instead of on pay.
  */
 
 const express = require("express");
@@ -105,10 +113,11 @@ describe("access grants are never writable through an HR employee route", () => 
       });
 
       expect(r.status).toBe(403);
-      /* A viewer is refused for lacking people.write; everybody else is
-         refused because the FIELD is not writable here at all. Both are a
-         refusal, and neither writes. */
-      expect(["HR_FIELD_NOT_WRITABLE", "HR_MISSING_CAPABILITY"]).toContain(r.body.code);
+      /* (14 Oct 2026, owner: no role tiers in the employee section) A viewer
+         used to be refused for lacking people.write. Every HR role holds it
+         here now, so every one of them — the viewer included — is refused
+         because the FIELD is not writable here at all. */
+      expect(r.body.code).toBe("HR_FIELD_NOT_WRITABLE");
 
       const after = await reload();
       expect(String(after.accessDepartmentId)).toBe(String(sales._id));
@@ -153,39 +162,38 @@ describe("access grants are never writable through an HR employee route", () => 
   });
 });
 
-describe("salary needs compensation.write, and only an owner has it", () => {
-  test("an editor's NEW employee with a salary goes to the owner, and writes nothing", async () => {
-    /* Owner's rule, 5 Oct 2026: not refused — held for the owner. The
-       security property is unchanged: an editor still cannot SET pay. */
+describe("salary is written by every HR user — no owner hold", () => {
+  /* (14 Oct 2026, owner: no role tiers in the employee section) Until today
+     only an owner held compensation.write: an editor's pay went to the owner
+     (held, 202) and a bulk pay change was refused. Every HR user now holds it
+     on the employee routes, and the write is applied directly. */
+  test("an editor's NEW employee with a salary is applied, not held", async () => {
     const token = await hrUser("editor");
     const r = await send("POST", "/api/employees", token, { firstName: "New", salary: { gross: 100000 } });
-    expect({ status: r.status, held: r.body.held, requiredRole: r.body.requiredRole }).toEqual({
-      status: 202, held: true, requiredRole: "owner",
+    expect({ status: r.status, applied: r.body.applied, held: r.body.held }).toEqual({
+      status: 200, applied: true, held: undefined,
     });
-    expect((await reload()).salary.gross).not.toBe(100000);
   });
 
-  test("an editor's pay change is HELD for the owner; a bulk pay change is still refused", async () => {
-    /* 12 Oct 2026 (owner): pay from an editor or approver goes to the owner to
-       accept instead of being refused. Nothing is written until the owner
-       approves. A BULK pay change has no owner path and is refused as before. */
-    const token = await hrUser("editor");
+  test.each(["viewer", "editor", "approver"])(
+    "an %s's pay and bank change is applied; so is a bulk pay change",
+    async (role) => {
+      const token = await hrUser(role);
 
-    for (const body of [{ salary: { gross: 100000 } }, { bankDetails: { accountNumber: "1" } }]) {
-      const r = await send("PUT", `/api/employees/${target._id}`, token, body);
-      expect({ status: r.status, held: r.body.held, requiredRole: r.body.requiredRole }).toEqual({
-        status: 202, held: true, requiredRole: "owner",
+      for (const body of [{ salary: { gross: 100000 } }, { bankDetails: { accountNumber: "1" } }]) {
+        const r = await send("PUT", `/api/employees/${target._id}`, token, body);
+        expect({ body, status: r.status, applied: r.body.applied }).toEqual({ body, status: 200, applied: true });
+      }
+      expect((await reload()).salary.gross).toBe(100000);
+
+      const bulk = await send("PATCH", "/api/employees/bulk-update", token, {
+        employeeIds: [String(target._id)],
+        updates: { "salary.gross": 120000 },
       });
-    }
-    const bulk = await send("PATCH", "/api/employees/bulk-update", token, {
-      employeeIds: [String(target._id)],
-      updates: { "salary.gross": 100000 },
-    });
-    expect({ status: bulk.status, code: bulk.body.code }).toEqual({ status: 403, code: "HR_MISSING_CAPABILITY" });
-    expect(bulk.body.requiredCapability).toBe("compensation.write");
-
-    expect((await reload()).salary.gross).not.toBe(100000);
-  });
+      expect({ status: bulk.status, applied: bulk.body.applied }).toEqual({ status: 200, applied: true });
+      expect((await reload()).salary.gross).toBe(120000);
+    },
+  );
 
   test("an owner with compensation.write performs the same operation", async () => {
     const token = await hrUser("owner");
@@ -207,7 +215,9 @@ describe("salary needs compensation.write, and only an owner has it", () => {
 });
 
 describe("employment state needs employment.change", () => {
-  test("a viewer cannot transfer, promote or terminate", async () => {
+  test("a viewer may transfer, promote or terminate", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) A viewer
+       was refused each of these until today. */
     const token = await hrUser("viewer");
     for (const updates of [
       { department: "HR" },
@@ -216,9 +226,9 @@ describe("employment state needs employment.change", () => {
       { primaryManager: { managerId: String(target._id) } },
     ]) {
       const r = await send("PUT", `/api/employees/${target._id}`, token, updates);
-      expect({ updates, status: r.status }).toEqual({ updates, status: 403 });
+      expect({ updates, status: r.status }).toEqual({ updates, status: 200 });
     }
-    expect((await reload()).designation).toBe("Operator");
+    expect((await reload()).designation).toBe("Head");
   });
 
   test("an editor holds employment.change and may transfer", async () => {
@@ -239,30 +249,42 @@ describe("employment state needs employment.change", () => {
 });
 
 describe("a mixed payload writes nothing at all", () => {
-  test("one owner-only field holds the WHOLE request for the owner — nothing is written", async () => {
-    const token = await hrUser("editor");
-    const before = await reload();
+  /* (14 Oct 2026, owner: no role tiers in the employee section) These used a
+     salary as the field that held the whole request for the owner. Pay is no
+     longer held, so the property — a payload mixing an allowed change with a
+     disallowed one is decided WHOLE, and no part of it is written — is pinned
+     on a field no HR role may write: the access-department grant. */
+  test.each(["viewer", "editor", "owner"])(
+    "one field that is not HR's refuses the WHOLE request from an %s — nothing is written",
+    async (role) => {
+      const token = await hrUser(role);
+      const before = await reload();
 
-    const r = await send("PUT", `/api/employees/${target._id}`, token, {
-      middleName: "Kumar",          // allowed
-      nickName: "T",                // allowed
-      salary: { gross: 999999 },    // needs compensation.write
-    });
+      const r = await send("PUT", `/api/employees/${target._id}`, token, {
+        middleName: "Kumar",                 // allowed
+        nickName: "T",                       // allowed
+        salary: { gross: 999999 },           // allowed now, to every HR user
+        accessDepartmentId: String(hr._id),  // Access Control's, never HR's
+      });
 
-    expect({ status: r.status, requiredRole: r.body.requiredRole }).toEqual({ status: 202, requiredRole: "owner" });
-    const after = await reload();
-    expect(after.middleName).toBe(before.middleName);
-    expect(after.nickName).toBe(before.nickName);
-    expect(after.salary.gross).toEqual(before.salary.gross);
-  });
+      expect({ status: r.status, code: r.body.code }).toEqual({ status: 403, code: "HR_FIELD_NOT_WRITABLE" });
+      const after = await reload();
+      expect(after.middleName).toBe(before.middleName);
+      expect(after.nickName).toBe(before.nickName);
+      expect(after.salary.gross).toEqual(before.salary.gross);
+      expect(String(after.accessDepartmentId)).toBe(String(sales._id));
+    },
+  );
 
-  test("the hold names the fields that caused it, and nothing else", async () => {
+  test("the refusal names the fields that caused it, and nothing else", async () => {
     const token = await hrUser("editor");
     const r = await send("PUT", `/api/employees/${target._id}`, token, {
       middleName: "Kumar",
       salary: { gross: 1 },
+      accessDepartmentId: String(hr._id),
     });
-    expect(r.body.fields).toEqual(["salary"]);
+    expect(r.status).toBe(403);
+    expect(r.body.fields).toEqual(["accessDepartmentId"]);
     /* The caller's own request echoed back — it says nothing about the record. */
     expect(JSON.stringify(r.body)).not.toMatch(/target@grav\.in|GRTGT|30000/);
   });

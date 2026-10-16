@@ -161,6 +161,8 @@ async function _nextInvoiceNum(companyId, voucherDate) {
 
 // Apply / reverse ledger balances. direction = +1 post, -1 reverse.
 async function _applyLedgerBalances(voucher, direction, session) {
+  /* no balance moves for an invoice in a locked period (15 Oct 2026) */
+  await require("../../services/accounting/fyLock").assertVoucherOpen(voucher, [voucher.voucherDate], "An invoice in it");
   const ops = [];
   for (const entry of voucher.ledgerEntries || []) {
     const lid = entry.ledgerId || entry.ledger;

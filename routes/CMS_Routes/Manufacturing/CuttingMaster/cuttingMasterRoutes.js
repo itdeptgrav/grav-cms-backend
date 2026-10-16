@@ -547,7 +547,9 @@ router.get("/manufacturing-orders/:moId", cutting.cuttingCompany, async (req, re
     })
       .select(
         "workOrderNumber stockItemName stockItemId quantity variantAttributes " +
-          "cuttingStatus cuttingProgress status createdAt _id salesLineLink",
+          "cuttingStatus cuttingProgress status createdAt _id salesLineLink " +
+          /* the page hides "Send to cutting" once every work order has gone */
+          "sentToCutting sentToCuttingAt",
       )
       .sort({ createdAt: -1 })
       .lean();

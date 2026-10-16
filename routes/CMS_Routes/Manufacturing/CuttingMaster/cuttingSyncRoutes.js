@@ -78,6 +78,28 @@ router.post("/work-orders/:woId/send-to-cutting", async (req, res) => {
   }
 });
 
+/* Every work order of an order in one press (14 Oct 2026, owner: "the send
+   to cutting must be on the WO at top so that we can directly send all the
+   products"). Takes the ids the page shows; one already sent is left as it
+   was, so pressing twice changes nothing. */
+router.post("/work-orders/send-to-cutting", async (req, res) => {
+  try {
+    const ids = (Array.isArray(req.body?.workOrderIds) ? req.body.workOrderIds : [])
+      .map(String).filter((id) => /^[0-9a-f]{24}$/i.test(id)).slice(0, 500);
+    if (!ids.length) return res.status(400).json({ success: false, message: "No work orders to send." });
+    const at = new Date();
+    const pending = await WorkOrder.find({ _id: { $in: ids }, sentToCutting: { $ne: true } }).select("_id").lean();
+    if (pending.length) {
+      await WorkOrder.updateMany({ _id: { $in: pending.map((w) => w._id) } }, { $set: { sentToCutting: true, sentToCuttingAt: at } });
+    }
+    const sent = pending.map((w) => String(w._id));
+    res.json({ success: true, sentToCuttingAt: at, sent, already: ids.length - sent.length });
+    warmManyLater(sent, req);
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
 router.post("/work-orders/:woId/recall-from-cutting", async (req, res) => {
   try {
     const wo = await WorkOrder.findById(req.params.woId);
@@ -291,6 +313,23 @@ function warmLater(woId, req) {
         .lean();
       if (wo?.sentToCutting !== false) await bundleFor(wo, origin, headers);
     } catch (e) { console.warn("cutting-sync warm:", e.message); }
+  }, 50);
+}
+
+/** The bulk send's warm-up: one bundle after another, never all of them at once. */
+function warmManyLater(woIds, req) {
+  if (!woIds.length) return;
+  const origin = selfOrigin(req);
+  const headers = forwardedAuth(req);
+  setTimeout(async () => {
+    for (const woId of woIds) {
+      try {
+        const wo = await WorkOrder.findById(woId)
+          .select("workOrderNumber stockItemName stockItemReference stockItemId quantity customerRequestId variantAttributes cuttingStatus cuttingProgress sentToCuttingAt updatedAt")
+          .lean();
+        if (wo) await bundleFor(wo, origin, headers);
+      } catch (e) { console.warn("cutting-sync warm:", e.message); }
+    }
   }, 50);
 }
 

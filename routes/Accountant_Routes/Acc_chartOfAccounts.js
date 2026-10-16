@@ -2119,6 +2119,9 @@ router.delete("/ledgers/:id", async (req, res) => {
           message: "Alternative ledger not found",
         });
 
+      /* refused before any re-pointing when a voucher of this ledger is locked */
+      await require("../../services/accounting/fyLock").assertLedgersOpen([ledger._id], "A voucher of the ledger being removed in it");
+
       // Reassign voucher ledger entries
       if (txnCount > 0) {
         await Acc_Voucher.updateMany(
@@ -5165,6 +5168,10 @@ router.post("/payroll/cleanup", companyScope, async (req, res) => {
       sourceSystem: "auto_from_payroll",
     });
 
+    /* every voucher this would reverse and delete must be outside a locked
+       period — checked before the first balance moves (15 Oct 2026) */
+    await require("../../services/accounting/fyLock").assertVouchersOpen({ _id: { $in: vouchers.map((v) => v._id) } }, "A payroll voucher in it");
+
     let reversedCount = 0;
     for (const v of vouchers) {
       if (v.status !== "cancelled") {
@@ -5239,6 +5246,10 @@ router.post("/payroll/runs/:runId/unpost", companyScope, async (req, res) => {
         .status(404)
         .json({ success: false, message: "No vouchers found for this run." });
     }
+
+    /* refused before the first balance moves when a voucher of the run sits
+       in a locked period (15 Oct 2026) */
+    await require("../../services/accounting/fyLock").assertVouchersOpen({ _id: { $in: vouchers.map((v) => v._id) } }, "A payroll voucher in it");
 
     const reversed = [];
     const deleted = [];
@@ -6654,6 +6665,11 @@ router.post("/ledgers/:id/merge", companyScope, async (req, res) => {
         message: `Cannot merge a ${source.nature} ledger into a ${dest.nature} ledger — that would move the transactions to the wrong financial statement.`,
       });
     }
+
+    /* refused up front when a voucher of the source ledger is locked, or its
+       opening balance would move while the books' first day is locked */
+    await require("../../services/accounting/fyLock").assertLedgersOpen([source._id], "A voucher of the ledger being merged in it");
+    if (Number(source.openingBalance || 0) !== 0) await require("../../services/accounting/fyLock").assertOpeningOpen(source.companyId);
 
     const counts = { ledgerEntries: 0, partyVouchers: 0, bankVouchers: 0 };
 

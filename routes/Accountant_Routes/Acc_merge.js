@@ -358,6 +358,12 @@ router.post("/ledgers", auth, companyScope, async (req, res) => {
     const ghostObjIds = ghosts.map((g) => g._id);
     const sId = survivor._id;
 
+    /* Refused up front when a voucher of a merged ledger is in a locked
+       period, or an opening balance would move while the books' first day is
+       locked — a refusal half-way through would leave the merge half done. */
+    await require("../../services/accounting/fyLock").assertLedgersOpen(ghostObjIds, "A voucher of a ledger being merged in it");
+    if (ghosts.some((g) => Number(g.openingBalance || 0) !== 0)) await require("../../services/accounting/fyLock").assertOpeningOpen(cId);
+
     // 1. Re-point every voucher ledger line.
     const r1 = await Acc_Voucher.updateMany(
       { companyId: cId, "ledgerEntries.ledgerId": { $in: ghostObjIds } },
@@ -451,6 +457,9 @@ router.post("/stock-items", auth, companyScope, async (req, res) => {
 
     const ghostObjIds = ghosts.map((g) => g._id);
     const sId = survivor._id;
+
+    /* refused up front when a voucher carrying a merged item is locked */
+    await require("../../services/accounting/fyLock").assertVouchersOpen({ companyId: cId, "inventoryEntries.stockItemId": { $in: ghostObjIds } }, "A voucher of a stock item being merged in it");
 
     const r1 = await Acc_Voucher.updateMany(
       {

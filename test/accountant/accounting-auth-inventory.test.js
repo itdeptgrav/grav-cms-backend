@@ -511,7 +511,10 @@ describe("the compatibility façade", () => {
     // number moves, either a file was migrated off it (good — update this and
     // say so) or a NEW file was written against it (which is fine, since it now
     // resolves through orgAuth, but should be a conscious choice).
-    expect(importers.length).toBe(39);
+    // 41 since 13 Oct 2026: Acc_fyLocks.js (freeze / unfreeze financial years)
+    // and Acc_stockSummary.js (the inventory's stock for accounts) were written
+    // against it deliberately — both go through orgAuth like the rest.
+    expect(importers.length).toBe(41);
     for (const f of importers) {
       expect(f.startsWith("routes/")).toBe(true);
     }

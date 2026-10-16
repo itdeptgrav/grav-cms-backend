@@ -19,7 +19,7 @@ const express = require("express");
 const router = express.Router();
 
 const ChangeRequest = require("../../models/Access/ChangeRequest");
-const { getRole, listRoles, roleAtLeast } = require("../../services/departmentRoles");
+const { getEffectiveRole, listRoles, roleAtLeast } = require("../../services/departmentRoles");
 const { decideChangeRequest, actorFrom } = require("../../services/changeRequests");
 const { recordChange } = require("../../services/changeLog");
 
@@ -32,10 +32,17 @@ const { recordChange } = require("../../services/changeLog");
    themselves rather than sitting behind a department's guard. */
 const { authenticateCmsSession: authenticate } = require("../../services/cmsSession");
 
-/** The caller's role in `slug`, with admins treated as owner. */
+/** The caller's role in `slug`, with admins treated as owner.
+ *
+ * The SAME lookup the write guard uses (getEffectiveRole: the token's email
+ * AND the caller's own employee record's email). This read only the token's
+ * email, so a person whose grant sits on their employee address but who signs
+ * in with another one was HELD as an editor by the write guard and then shown
+ * an empty queue with no Approve button here — a request nobody could see,
+ * owner included (14 Oct 2026). */
 async function roleFor(req, slug) {
   if (req.user?.isAdmin) return "owner";
-  return getRole(slug, req.user.email);
+  return getEffectiveRole(slug, req);
 }
 
 /**
@@ -49,7 +56,7 @@ async function canRead(req, slug) {
   if (req.user?.isAdmin) return true;
   const assigned = await listRoles(slug);
   if (assigned.length === 0) return Boolean(req.user?.deptSlug === slug);
-  return Boolean(await getRole(slug, req.user.email));
+  return Boolean(await getEffectiveRole(slug, req));
 }
 
 router.use(authenticate);
@@ -200,7 +207,8 @@ router.get("/:slug", async (req, res) => {
     // total for an approver, and the caller's own for an editor.
     const pendingCount = await ChangeRequest.countDocuments({
       departmentSlug: slug,
-      status: "pending",
+      /* The same statuses the Waiting list shows, so the badge and the list agree. */
+      status: { $in: ["pending", "applying"] },
       ...(roleAtLeast(role, "approver") ? {} : { "requestedBy.email": req.user.email }),
     });
 

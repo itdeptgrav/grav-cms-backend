@@ -51,6 +51,7 @@ beforeAll(async () => {
       scope: req.hrAuth?.declaration?.scope,
       exclude: req.hrAuth?.exclude || "",
       holdForApprover: req.holdForApprover || null,
+      employeeSection: Boolean(req.hrEmployeeSection),
     }),
   );
 
@@ -161,23 +162,55 @@ describe("3 — HR viewer", () => {
     }
   });
 
-  test("may NOT write, and may not read compensation or private identity", async () => {
+  test("may NOT write, and may not read compensation or private identity — outside the employee section", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) The employee
+       entries — POST /api/employees, PUT and GET /api/employees/:id — left this
+       list; they are permitted to a viewer now (next test). Everything that is
+       NOT the employee section keeps the viewer's old limits. */
     const token = await hrUser("viewer");
     for (const [method, path] of [
-      ["POST", "/api/employees"],
-      ["PUT", "/api/employees/60c0000000000000000000aa"],
       ["PUT", "/hr/attendance/day-override"],
       ["PATCH", "/api/hr/leaves/60c0000000000000000000aa/approve"],
       ["POST", "/api/hr/documents"],
       ["GET", "/api/hr/payslip/GR0001"],
       ["GET", "/api/hr/payroll/items"],
-      ["GET", "/api/employees/60c0000000000000000000aa"],
     ]) {
       const r = await call(method, path, { token, body: {} });
       expect({ path, status: r.status, code: r.body.code }).toEqual({
         path, status: 403, code: "HR_MISSING_CAPABILITY",
       });
     }
+  });
+
+  test("in the employee section a viewer reads and writes everything, pay included", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) These three
+       were refused to a viewer above until today. The viewer acts with the
+       whole employee capability set on them, so pay, bank details and
+       identifiers are read and written alike, and the request is marked so the
+       department write guard does not queue it. */
+    const token = await hrUser("viewer");
+    for (const [method, path, body] of [
+      ["POST", "/api/employees", { firstName: "New", salary: { gross: 20000 }, bankDetails: { bankName: "SBI" } }],
+      ["PUT", "/api/employees/60c0000000000000000000aa", { salary: { gross: 99999 } }],
+      ["GET", "/api/employees/60c0000000000000000000aa"],
+    ]) {
+      const r = await call(method, path, { token, body });
+      expect({ path, status: r.status, employeeSection: r.body.employeeSection }).toEqual({
+        path, status: 200, employeeSection: true,
+      });
+      expect(r.body.template).toBe("hr_viewer");
+      for (const cap of ["compensation.read", "compensation.write", "people.read.private", "people.read.identifiers", "people.read.medical", "employment.change"]) {
+        expect(r.body.capabilities).toContain(cap);
+      }
+      /* Nothing is excluded at the query on these routes any more. */
+      expect(r.body.exclude).not.toContain("-salary");
+      expect(r.body.exclude).not.toContain("-bankDetails");
+    }
+
+    /* The extra capabilities are for THIS request only: the same viewer's very
+       next request outside the section is a viewer's again. */
+    const outside = await call("GET", "/api/hr/payroll/items", { token });
+    expect(outside.status).toBe(403);
   });
 });
 
@@ -311,7 +344,11 @@ describe("9 — employee self-service is record-scoped", () => {
 
 describe("12-16 — the capability separations, end to end", () => {
   test("compensation endpoints require the compensation capability", async () => {
-    const editor = await hrUser("editor");     // has people.read.private, not compensation
+    /* Since 13 Oct 2026 an editor holds compensation.read; a viewer does not.
+       (14 Oct 2026, owner: no role tiers in the employee section) The
+       employee export left this list — it is in the employee section — and is
+       pinned in the next test. Payslips and payroll keep the old rule. */
+    const editor = await hrUser("viewer");     // no compensation
     const approver = await hrUser("approver"); // has compensation.read
 
     for (const path of [
@@ -320,7 +357,6 @@ describe("12-16 — the capability separations, end to end", () => {
       "/api/hr/payslip/GR0001/pdf",
       "/api/hr/payroll/items",
       "/api/hr/payroll/preview",
-      "/api/employees/import-export/export",
     ]) {
       const denied = await call("GET", path, { token: editor });
       expect({ path, status: denied.status }).toEqual({ path, status: 403 });
@@ -329,6 +365,22 @@ describe("12-16 — the capability separations, end to end", () => {
       const allowed = await call("GET", path, { token: approver });
       expect({ path, status: allowed.status }).toEqual({ path, status: 200 });
     }
+  });
+
+  test("the employee export carries pay for every HR user", async () => {
+    /* (14 Oct 2026, owner: no role tiers in the employee section) The export
+       needs compensation.read; a viewer was refused it until today. */
+    for (const role of ["viewer", "editor", "approver", "owner"]) {
+      const token = await hrUser(role);
+      const r = await call("GET", "/api/employees/import-export/export", { token });
+      expect({ role, status: r.status, employeeSection: r.body.employeeSection }).toEqual({
+        role, status: 200, employeeSection: true,
+      });
+    }
+    /* The CEO projection is not an HR user and is still refused it. */
+    const emp = await makeEmployee({ biometricId: "GRCX", email: "cyrax@grav.in", accessDepartmentId: ceo._id });
+    const ceoToken = cmsToken({ id: String(emp._id), email: "cyrax@grav.in", employeeId: "GRCX", role: "ceo" });
+    expect((await call("GET", "/api/employees/import-export/export", { token: ceoToken })).status).toBe(403);
   });
 
   test("attendance correction and attendance close need different people", async () => {

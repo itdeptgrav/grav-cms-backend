@@ -211,6 +211,15 @@ proformaInvoiceSchema.index(
 proformaInvoiceSchema.index({ companyId: 1, voucherDate: -1 });
 proformaInvoiceSchema.index({ companyId: 1, partyLedgerId: 1 });
 
+/* A proforma invoice dated in a locked period is not changed (16 Oct 2026).
+   Linking it to its order is bookkeeping, not a figure, and stays open. */
+proformaInvoiceSchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
+  dateField: "voucherDate",
+  label: "A proforma invoice",
+  section: "proforma",
+  harmless: ["customerRequestId", "requestRef"],
+});
+
 const Acc_ProformaInvoice = mongoose.model(
   "Acc_ProformaInvoice",
   proformaInvoiceSchema,

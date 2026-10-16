@@ -215,6 +215,16 @@ acc_GSTR2B_schema.index(
 // Fast supplier-wise lookup on a single 2B document
 acc_GSTR2B_schema.index({ "records.supplierGSTIN": 1 });
 
+/* A GSTR-2B / 2A of a locked month is not uploaded, replaced or deleted
+   (16 Oct 2026). Its reconciliation cache is a result, not a figure. */
+acc_GSTR2B_schema.plugin(require("../../services/accounting/fyLock").rangeLockPlugin, {
+  label: "A GST return",
+  section: "gst",
+  rangeOf: require("../../services/accounting/fyLock").returnPeriodRange,
+  locksFor: (doc) => require("../../services/accounting/fyLock").lockedPeriods(doc && doc.companyId),
+  harmless: ["lastReconAt", "lastReconBy", "lastReconSummary"],
+});
+
 const Acc_GSTR2B = mongoose.model("Acc_GSTR2B", acc_GSTR2B_schema);
 
 module.exports = { Acc_GSTR2B };

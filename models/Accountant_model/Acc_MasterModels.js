@@ -155,6 +155,144 @@ const tallyCompanySchema = new mongoose.Schema(
     financialYearStart: { type: Date }, // current FY start (e.g. 2025-04-01)
     currentFinancialYear: { type: String }, // "2025-26"
 
+    /* Frozen financial years (13 Oct 2026, owner). While a year's `locked`
+       is true no voucher, journal entry or opening balance in it may be
+       written — services/accounting/fyLock.js, attached to the models.
+       Kept ON the company, not in a collection of its own: the cluster is at
+       its collection limit. A reason is required to freeze and to unfreeze,
+       and every change stays in `history`. */
+    financialYearLocks: {
+      type: [
+        new mongoose.Schema(
+          {
+            fyStartYear: { type: Number, required: true }, // 2025 = FY 2025-26
+            from: { type: Date, required: true },
+            to: { type: Date, required: true },
+            locked: { type: Boolean, default: false },
+            lockedAt: { type: Date, default: null },
+            lockedByName: { type: String, default: "" },
+            lockReason: { type: String, default: "" },
+            /* The sections this lock closes (16 Oct 2026, owner: "lock or
+               unlock specific sections"). Empty = every section; the keys
+               are services/accounting/fyLock.js SECTIONS. */
+            sections: { type: [String], default: [] },
+            history: {
+              type: [
+                new mongoose.Schema(
+                  {
+                    action: { type: String, enum: ["lock", "unlock"], required: true },
+                    reason: { type: String, required: true, trim: true },
+                    /* the sections this event closed or opened; absent = all */
+                    sections: { type: [String], default: undefined },
+                    by: { type: mongoose.Schema.Types.ObjectId, default: null },
+                    byName: { type: String, default: "" },
+                    at: { type: Date, default: Date.now },
+                  },
+                  { _id: false },
+                ),
+              ],
+              default: [],
+            },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
+    /* Locked MONTHS (15 Oct 2026, owner: "lock monthly wise, like the
+       financial year"). The same guard as a frozen year
+       (services/accounting/fyLock.js): while a month's `locked` is true no
+       voucher or journal entry dated in it may be created, changed or
+       deleted. `month` is "YYYY-MM" on the Indian calendar. A reason is
+       required both ways and every change stays in `history`. */
+    monthLocks: {
+      type: [
+        new mongoose.Schema(
+          {
+            month: { type: String, required: true, match: /^\d{4}-(0[1-9]|1[0-2])$/ },
+            from: { type: Date, required: true },
+            to: { type: Date, required: true },
+            locked: { type: Boolean, default: false },
+            lockedAt: { type: Date, default: null },
+            lockedByName: { type: String, default: "" },
+            lockReason: { type: String, default: "" },
+            /* The sections this lock closes (16 Oct 2026, owner: "lock or
+               unlock specific sections"). Empty = every section; the keys
+               are services/accounting/fyLock.js SECTIONS. */
+            sections: { type: [String], default: [] },
+            history: {
+              type: [
+                new mongoose.Schema(
+                  {
+                    action: { type: String, enum: ["lock", "unlock"], required: true },
+                    reason: { type: String, required: true, trim: true },
+                    /* the sections this event closed or opened; absent = all */
+                    sections: { type: [String], default: undefined },
+                    by: { type: mongoose.Schema.Types.ObjectId, default: null },
+                    byName: { type: String, default: "" },
+                    at: { type: Date, default: Date.now },
+                  },
+                  { _id: false },
+                ),
+              ],
+              default: [],
+            },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
+    /* Locked DAYS, WEEKS and RANGES (15 Oct 2026, owner: "lock according
+       to the week, month or year or even day"). Each is a run of whole
+       Indian days, `fromDay`..`toDay` ("YYYY-MM-DD", both included), kept
+       under `key` = "fromDay..toDay" so locking the same run again carries
+       its history on. `kind` only words it (day / week / range / upto =
+       "everything up to a date"); the guard reads `from` / `to`. */
+    periodLocks: {
+      type: [
+        new mongoose.Schema(
+          {
+            key: { type: String, required: true },
+            kind: { type: String, enum: ["day", "week", "range", "upto"], default: "range" },
+            fromDay: { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
+            toDay: { type: String, required: true, match: /^\d{4}-\d{2}-\d{2}$/ },
+            from: { type: Date, required: true },
+            to: { type: Date, required: true },
+            locked: { type: Boolean, default: false },
+            lockedAt: { type: Date, default: null },
+            lockedByName: { type: String, default: "" },
+            lockReason: { type: String, default: "" },
+            /* The sections this lock closes (16 Oct 2026, owner: "lock or
+               unlock specific sections"). Empty = every section; the keys
+               are services/accounting/fyLock.js SECTIONS. */
+            sections: { type: [String], default: [] },
+            history: {
+              type: [
+                new mongoose.Schema(
+                  {
+                    action: { type: String, enum: ["lock", "unlock"], required: true },
+                    reason: { type: String, required: true, trim: true },
+                    /* the sections this event closed or opened; absent = all */
+                    sections: { type: [String], default: undefined },
+                    by: { type: mongoose.Schema.Types.ObjectId, default: null },
+                    byName: { type: String, default: "" },
+                    at: { type: Date, default: Date.now },
+                  },
+                  { _id: false },
+                ),
+              ],
+              default: [],
+            },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     baseCurrency: { type: String, default: "INR" },
     currencySymbol: { type: String, default: "₹" },
 
@@ -977,6 +1115,9 @@ tallyStockItemSchema.index({ aliases: 1 });
 // ─────────────────────────────────────────────────────────────────────────────
 const Acc_Company = mongoose.model("Acc_Company", tallyCompanySchema);
 const Acc_Group = mongoose.model("Acc_Group", tallyGroupSchema);
+/* A ledger is a master and is always open; its OPENING BALANCE is a figure
+   of the year the books begin in, frozen with that year (13 Oct 2026). */
+tallyLedgerSchema.plugin(require("../../services/accounting/fyLock").openingBalanceGuard);
 const Acc_Ledger = mongoose.model("Acc_Ledger", tallyLedgerSchema);
 const Acc_CostCentre = mongoose.model("Acc_CostCentre", tallyCostCentreSchema);
 const Acc_Unit = mongoose.model("Acc_Unit", tallyUnitSchema);

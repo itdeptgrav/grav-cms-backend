@@ -22,6 +22,8 @@ const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const XLSX = require("xlsx");
+/* The statement reader (Indian Bank, HDFC, SBI, ICICI…) — services/accounting/bankStatementParser.js. */
+const { parseBankStatement } = require("../../services/accounting/bankStatementParser");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
 
 /* Lane A Chunk 3A — canonical company isolation. Every route below that
@@ -161,6 +163,10 @@ const sessionSchema = new mongoose.Schema(
   { timestamps: true, collection: "acc_bank_recon_sessions" },
 );
 
+/* A reconciliation touching a locked period is refused (16 Oct 2026, owner:
+   "lock bank reconciliation too") — services/accounting/fyLock.js. */
+sessionSchema.plugin(require("../../services/accounting/fyLock").bankReconGuard);
+
 const Acc_BankReconSession =
   mongoose.models.Acc_BankReconSession ||
   mongoose.model("Acc_BankReconSession", sessionSchema);
@@ -194,56 +200,6 @@ const MONTH_NAMES = [
   "Dec",
 ];
 
-function parseDate(str) {
-  if (!str) return null;
-  const s = String(str).trim();
-  // DD-MM-YYYY or DD/MM/YYYY (Indian bank format — dashes OR slashes).
-  // Indian Bank exports use dashes (e.g. 23-07-2025); the old code only
-  // accepted slashes, so every date came back null and the whole month
-  // got filtered out.
-  let m = s.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})\b/);
-  if (m) {
-    return new Date(
-      `${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}T00:00:00.000+05:30`,
-    );
-  }
-  // YYYY-MM-DD or YYYY/MM/DD (ISO)
-  m = s.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})\b/);
-  if (m) {
-    return new Date(
-      `${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}T00:00:00.000+05:30`,
-    );
-  }
-  // Excel serial date number
-  if (/^\d+(\.\d+)?$/.test(s)) {
-    const d = XLSX.SSF.parse_date_code(parseFloat(s));
-    if (d)
-      return new Date(
-        `${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}T00:00:00.000+05:30`,
-      );
-  }
-  return null;
-}
-
-function parseAmt(v) {
-  return (
-    parseFloat(
-      String(v || "")
-        .replace(/,/g, "")
-        .trim(),
-    ) || 0
-  );
-}
-
-function parseBalStr(s) {
-  const m = String(s || "").match(/([\d,]+\.?\d*)\s*(CR|DR)?/i);
-  if (!m) return { amount: 0, suffix: "CR" };
-  return {
-    amount: parseFloat(m[1].replace(/,/g, "")) || 0,
-    suffix: (m[2] || "CR").toUpperCase(),
-  };
-}
-
 // Stable identity for a single statement line — used to carry over manual
 // matches / reconciled flags when the SAME month is re-uploaded, so prior
 // reconciliation work is never wiped.
@@ -261,174 +217,6 @@ function txnKey(t) {
       .replace(/\s+/g, " ")
       .trim(),
   ].join("|");
-}
-
-// ─── Statement parser ─────────────────────────────────────────────────────────
-function parseBankStatement(buffer, filename) {
-  const ext = (filename || "").split(".").pop().toLowerCase();
-  const wb = XLSX.read(buffer, {
-    type: "buffer",
-    cellDates: false,
-    cellText: true,
-    raw: true,
-  });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, {
-    header: 1,
-    defval: "",
-    raw: false,
-  });
-
-  const meta = {
-    bankName: "",
-    accountNumber: "",
-    ifscCode: "",
-    branch: "",
-    periodFrom: null,
-    periodTo: null,
-    closingBalance: null,
-    openingBalance: null,
-  };
-  let headerRowIdx = -1;
-
-  for (let i = 0; i < Math.min(rows.length, 40); i++) {
-    const cells = rows[i].map((c) => String(c || "").trim());
-    const line = cells.join(" ").trim();
-    if (!line) continue;
-
-    // A header row has BOTH a date-like column AND a debit/credit/amount
-    // column. This catches "Transaction Date" + "Credit Amount" / "Debit
-    // Amount" (Indian Bank), "Value Date" + "Withdrawal"/"Deposit" (HDFC/
-    // ICICI), "Date" + "Debit"/"Credit" (SBI), etc. The old check only
-    // recognised "value date" or an exact "date" cell, so Indian Bank's
-    // "Transaction Date" header was never found.
-    const hasDateCol = cells.some(
-      (c) =>
-        /(value|txn|transaction|post(ing)?)\s*date/i.test(c) ||
-        /^date$/i.test(c),
-    );
-    const hasAmountCol = cells.some(
-      (c) =>
-        /(debit|credit|withdrawal|deposit)/i.test(c) || /\bamount\b/i.test(c),
-    );
-    if (hasDateCol && hasAmountCol) {
-      headerRowIdx = i;
-      break;
-    }
-    if (
-      !meta.bankName &&
-      /BANK|FINANCIAL|COOPERATIVE/i.test(line) &&
-      line.length < 60
-    )
-      meta.bankName = line;
-    const acctM = line.match(/account\s*(?:number|no)?\s*[:.]\s*(\d{6,20})/i);
-    if (acctM) meta.accountNumber = acctM[1];
-    const ifscM = line.match(
-      /IFSC\s*(?:CODE)?\s*[:.]\s*([A-Z]{4}0[A-Z0-9]{6})/i,
-    );
-    if (ifscM) meta.ifscCode = ifscM[1];
-    const branchM = line.match(/Branch\s*[:.]\s*(.+)/i);
-    if (branchM && !meta.branch)
-      meta.branch = branchM[1].trim().substring(0, 60);
-    const clearM = line.match(/cleared\s+balance\s*[:.]\s*([\d,]+\.?\d*)/i);
-    if (clearM) meta.closingBalance = parseFloat(clearM[1].replace(/,/g, ""));
-  }
-
-  if (headerRowIdx === -1)
-    throw new Error(
-      "Could not find the transaction header row. Expected a row with a " +
-        "date column (Transaction/Value/Posting Date) and a Debit/Credit " +
-        "(or Withdrawal/Deposit/Amount) column.",
-    );
-
-  const headers = rows[headerRowIdx].map((c) =>
-    String(c || "")
-      .trim()
-      .toLowerCase(),
-  );
-  const col = (ps) => {
-    for (const p of ps) {
-      const i = headers.findIndex((h) => p.test(h));
-      if (i !== -1) return i;
-    }
-    return -1;
-  };
-
-  const colValueDate = col([/value\s*date/, /txn\s*date/, /^date$/]);
-  const colPostDate = col([/post\s*date/, /transaction\s*date/]);
-  const colDesc = col([/description/, /narration/, /particulars/, /remarks/]);
-  const colCheque = col([/cheque/, /chq/, /ref\s*no/]);
-  const colDebit = col([/debit\s*amount/, /withdrawal/, /\bdebit\b/, /^dr$/]);
-  const colCredit = col([/credit\s*amount/, /deposit/, /\bcredit\b/, /^cr$/]);
-  // "Closing Balance" / "Balance" — but NOT the credit/debit amount columns.
-  const colBalance = col([
-    /closing\s*balance/,
-    /running\s*balance/,
-    /^balance$/,
-    /balance/,
-  ]);
-  const colBranch = col([/remitter\s*branch/, /branch/, /remitter/]);
-  const colAcct = col([/account\s*(number|no)/, /^a\/c/, /account/]);
-
-  if (colDesc === -1) throw new Error("Could not identify Description column.");
-  if (colDebit === -1 && colCredit === -1)
-    throw new Error(
-      "Could not identify the Debit/Credit (or Withdrawal/Deposit) columns.",
-    );
-
-  const transactions = [];
-  for (let i = headerRowIdx + 1; i < rows.length; i++) {
-    const row = rows[i];
-    if (!row || row.every((c) => !String(c).trim())) continue;
-    const desc = colDesc !== -1 ? String(row[colDesc] || "").trim() : "";
-    if (!desc) continue;
-    if (
-      /^(total|end\s*of|statement\s*downloaded|unless|immediately|\*|#)/i.test(
-        desc,
-      )
-    )
-      continue;
-    if (/balance\s*b\/?f/i.test(desc)) {
-      const bal = parseBalStr(
-        colBalance !== -1 ? String(row[colBalance] || "") : "",
-      );
-      meta.openingBalance = bal.amount;
-      continue;
-    }
-    const debit = colDebit !== -1 ? parseAmt(row[colDebit]) : 0;
-    const credit = colCredit !== -1 ? parseAmt(row[colCredit]) : 0;
-    if (debit === 0 && credit === 0) continue;
-    const bal = parseBalStr(
-      colBalance !== -1 ? String(row[colBalance] || "").trim() : "",
-    );
-    const vDate = colValueDate !== -1 ? parseDate(row[colValueDate]) : null;
-    const pDate = colPostDate !== -1 ? parseDate(row[colPostDate]) : null;
-    // Grab the account number from the first data row if the header block
-    // didn't carry one (Indian Bank puts it in a per-row column).
-    if (!meta.accountNumber && colAcct !== -1) {
-      const acct = String(row[colAcct] || "").trim();
-      if (/^\d{6,20}$/.test(acct)) meta.accountNumber = acct;
-    }
-    transactions.push({
-      valueDate: vDate || pDate,
-      postDate: pDate || vDate,
-      description: desc.substring(0, 500),
-      chequeNo: colCheque !== -1 ? String(row[colCheque] || "").trim() : "",
-      debit,
-      credit,
-      balance: bal.amount,
-      balanceSuffix: bal.suffix,
-      branch:
-        colBranch !== -1
-          ? String(row[colBranch] || "")
-              .trim()
-              .substring(0, 100)
-          : "",
-    });
-  }
-  if (!transactions.length)
-    throw new Error("No transactions found in the file.");
-  return { ...meta, transactions };
 }
 
 // ─── Auto-match ───────────────────────────────────────────────────────────────
@@ -638,11 +426,65 @@ router.post(
           message: "periodMonth (1-12) and periodYear are required",
         });
 
+      /* Each bank keeps its own months (13 Oct 2026): Indian Bank's October
+         and HDFC's October are two sessions. Without a bank account an
+         upload used to merge into ANY session of that month — an HDFC
+         statement could land on top of Indian Bank's reconciliation. */
+      if (!bankLedgerId)
+        return res.status(400).json({
+          success: false,
+          code: "BANK_LEDGER_REQUIRED",
+          message: "Choose the bank account this statement belongs to.",
+        });
+      const bankLedger = await Acc_Ledger.findOne({ _id: bankLedgerId, companyId })
+        .select("name bankDetails")
+        .lean();
+      if (!bankLedger)
+        return res.status(400).json({ success: false, message: "That bank account is not in this company." });
+
       let parsed;
       try {
         parsed = parseBankStatement(req.file.buffer, req.file.originalname);
       } catch (e) {
         return res.status(400).json({ success: false, message: e.message });
+      }
+
+      /* The statement says which account it is; refuse it under another one. */
+      const digits = (a) => String(a || "").replace(/\D/g, "");
+      const stmtAcct = digits(parsed.accountNumber);
+      if (stmtAcct) {
+        const tail = (a) => digits(a).slice(-4);
+        const ledgerAcct = digits(bankLedger.bankDetails?.accountNumber);
+        const label = `${parsed.bankName ? parsed.bankName + " " : ""}account …${tail(stmtAcct)}`;
+        if (ledgerAcct && ledgerAcct !== stmtAcct)
+          return res.status(400).json({
+            success: false,
+            code: "WRONG_BANK_ACCOUNT",
+            message: `This statement is for ${label}, but ${bankLedger.name} is account …${tail(ledgerAcct)}. Choose the right bank account.`,
+          });
+        /* No number recorded on the ledger, but its NAME often carries the
+           last four digits — "INDIAN BANK (CA-3512)", "HDFC BANK A/C
+           (CA-6085)". Read that too. */
+        const named = !ledgerAcct && String(bankLedger.name || "").match(/(?:-|…|x{2,}|\*{2,})\s*(\d{4})\b/i);
+        if (named && !stmtAcct.endsWith(named[1]))
+          return res.status(400).json({
+            success: false,
+            code: "WRONG_BANK_ACCOUNT",
+            message: `This statement is for ${label}, but ${bankLedger.name} ends in ${named[1]}. Choose the right bank account.`,
+          });
+        const elsewhere = await Acc_BankReconSession.findOne({
+          companyId,
+          accountNumber: stmtAcct,
+          bankLedgerId: { $ne: bankLedgerId },
+        })
+          .select("bankLedgerName periodLabel")
+          .lean();
+        if (elsewhere)
+          return res.status(400).json({
+            success: false,
+            code: "WRONG_BANK_ACCOUNT",
+            message: `Statements of ${label} are reconciled under ${elsewhere.bankLedgerName || "another bank account"} (e.g. ${elsewhere.periodLabel}). Choose that bank account.`,
+          });
       }
 
       // Filter transactions to the selected IST period
@@ -659,10 +501,7 @@ router.post(
           message: `No transactions found for ${MONTH_NAMES[month - 1]} ${year} in the uploaded file. The file has ${parsed.transactions.length} total transactions — check that the correct month is selected.`,
         });
 
-      const ledgerName = bankLedgerId
-        ? (await Acc_Ledger.findById(bankLedgerId).select("name").lean())
-            ?.name || ""
-        : "";
+      const ledgerName = bankLedger.name || "";
       let matchedTxns = await autoMatch(companyId, bankLedgerId, periodTxns);
 
       // ── Preserve prior reconciliation work ────────────────────────────────
@@ -675,7 +514,7 @@ router.post(
         companyId,
         periodMonth: month,
         periodYear: year,
-        ...(bankLedgerId ? { bankLedgerId } : {}),
+        bankLedgerId,
       });
       if (existing && existing.transactions && existing.transactions.length) {
         const prior = new Map();
@@ -794,14 +633,18 @@ router.get("/sessions", companyScope, async (req, res) => {
         .json({ success: false, message: "companyId required" });
     const skip = Math.max(0, parseInt(req.query.skip || "0", 10));
     const limit = 20;
+    /* ?bankLedgerId= lists one bank's statements only (13 Oct 2026). */
+    const filter = { companyId };
+    if (req.query.bankLedgerId && mongoose.Types.ObjectId.isValid(String(req.query.bankLedgerId)))
+      filter.bankLedgerId = req.query.bankLedgerId;
     const [sessions, total] = await Promise.all([
-      Acc_BankReconSession.find({ companyId })
+      Acc_BankReconSession.find(filter)
         .select("-transactions")
         .sort({ periodYear: -1, periodMonth: -1 })
         .skip(skip)
         .limit(limit)
         .lean(),
-      Acc_BankReconSession.countDocuments({ companyId }),
+      Acc_BankReconSession.countDocuments(filter),
     ]);
     res.json({
       success: true,
@@ -1130,7 +973,8 @@ router.put("/sessions/:id/unmatch", blockViewerWrite, async (req, res) => {
 // Mark a ledger voucher reconciled WITHOUT a bank line (a timing or bundled
 // item), or undo that. Body: { voucherId, cleared: true|false, note? }
 // ═════════════════════════════════════════════════════════════════════════════
-router.put("/sessions/:id/clear-ledger", async (req, res) => {
+/* blockViewerWrite was missing here — a viewer could clear ledger lines (16 Oct 2026) */
+router.put("/sessions/:id/clear-ledger", blockViewerWrite, async (req, res) => {
   try {
     const { voucherId, cleared, note } = req.body;
     if (!voucherId)
@@ -1280,7 +1124,7 @@ router.get("/bank-ledgers", companyScope, async (req, res) => {
       isActive: true,
       groupId: { $in: bankGroups.map((g) => g._id) },
     })
-      .select("_id name groupName currentBalance balanceType")
+      .select("_id name groupName currentBalance balanceType bankDetails.accountNumber bankDetails.bankName")
       .sort({ name: 1 })
       .lean();
     res.json({ success: true, ledgers });

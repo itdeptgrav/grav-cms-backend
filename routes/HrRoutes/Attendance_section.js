@@ -30,6 +30,8 @@ const mongoose = require("mongoose");
 const { recordChange } = require("../../services/changeLog");
 const { previewRekey, rekeyAttendanceRows, liftHolds } = require("../../services/attendanceRekey");
 const AttendanceExclusion = require("../../models/HR_Models/AttendanceExclusion");
+// The override is retired on a date; after it only a worked rest day can be credited.
+const overrideWindow = require("../../services/attendanceOverrideWindow");
 const {
   loadExclusionMap,
   excludedBidsForMonth,
@@ -4068,6 +4070,12 @@ router.get("/leave-balance-check", EmployeeAuthMiddlewear, async (req, res) => {
   }
 });
 
+/* What the attendance screens may still offer: the full override until the
+   sunset, then only a worked rest day's credit. A read. */
+router.get("/override-window", EmployeeAuthMiddlewear, (_req, res) => {
+  res.json({ success: true, window: overrideWindow.windowView() });
+});
+
 router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
   try {
     const {
@@ -4133,6 +4141,20 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
         success: false,
         message: `Cannot override attendance before date of joining (${dojViolation})`,
       });
+    }
+
+    /* After the sunset (services/attendanceOverrideWindow.js) the only thing
+       left is crediting a worked week-off or holiday: no new rows, no times,
+       no other status. */
+    const creditOnly = !overrideWindow.overridesOpen();
+    if (creditOnly) {
+      const hit = await DailyAttendance.findOne(
+        { dateStr, "employees.biometricId": bid },
+        { "employees.$": 1 },
+      ).lean();
+      const refusal = overrideWindow.restDayCreditRefusal(hit?.employees?.[0] || null, hrFinalStatus);
+      if (refusal)
+        return res.status(403).json({ success: false, code: "OVERRIDE_RETIRED", message: refusal });
     }
 
     let dayDoc = await DailyAttendance.findOne({
@@ -4230,7 +4252,7 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
        a punch edit; removing a punch is punch-correction's job. So for these
        statuses the time fields are ignored, whoever sent them. */
     const NO_TIME_STATUSES = new Set(["AB", "WO", "PH", "FH", "NH", "OH", "RH", "L-CL", "L-SL", "L-EL", "LWP", "CO"]);
-    const keepPunches = hrFinalStatus !== undefined && NO_TIME_STATUSES.has(hrFinalStatus);
+    const keepPunches = creditOnly || (hrFinalStatus !== undefined && NO_TIME_STATUSES.has(hrFinalStatus));
     const punchChanges = [];
     let anyTimeUpdated = false;
     for (const [field, value] of Object.entries(punchFields)) {
@@ -4523,6 +4545,12 @@ router.put("/day-override", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    if (!overrideWindow.overridesOpen())
+      return res.status(403).json({
+        success: false,
+        code: "OVERRIDE_RETIRED",
+        message: `Punch corrections ended on ${overrideWindow.sunset()}. Punches come from the device; a missed punch is regularized from the app.`,
+      });
     const { dateStr, biometricId, punchType, action, punchTime, hrRemarks } =
       req.body;
 
@@ -4764,6 +4792,12 @@ router.post("/punch-correction", EmployeeAuthMiddlewear, async (req, res) => {
 
 router.put("/bulk-day-override", EmployeeAuthMiddlewear, async (req, res) => {
   try {
+    if (!overrideWindow.overridesOpen())
+      return res.status(403).json({
+        success: false,
+        code: "OVERRIDE_RETIRED",
+        message: `Attendance overrides ended on ${overrideWindow.sunset()}.`,
+      });
     const { dateStr, updates } = req.body;
     if (!dateStr || !Array.isArray(updates) || !updates.length)
       return res
@@ -8198,6 +8232,7 @@ router.get("/regularizations", EmployeeAuthMiddlewear, async (req, res) => {
       pending: all.filter((a) => a.status === "pending").length,
       manager_approved: all.filter((a) => a.status === "manager_approved")
         .length,
+      awaiting_hr: all.filter((a) => a.status === "awaiting_hr").length,
       manager_rejected: all.filter((a) => a.status === "manager_rejected")
         .length,
       hr_approved: all.filter((a) => a.status === "hr_approved").length,
@@ -8383,7 +8418,10 @@ router.patch(
 
       // Only an undecided request can be finalised. Without this gate HR could
       // approve a request no manager has ever seen, or resurrect a rejected one.
-      if (!["pending", "manager_approved"].includes(r.status))
+      /* "awaiting_hr" (13 Oct 2026) is the normal case now: every manager
+         approved, and HR's approval is the one that applies it. HR may still
+         decide one the managers have not finished. */
+      if (!["pending", "manager_approved", "awaiting_hr"].includes(r.status))
         return res.status(400).json({
           success: false,
           code: "INVALID_TRANSITION",

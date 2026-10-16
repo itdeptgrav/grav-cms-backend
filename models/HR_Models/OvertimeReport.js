@@ -48,12 +48,19 @@ const overtimeReportSchema = new mongoose.Schema(
     documentFileName: { type: String, default: null },
     documentUploadedAt: { type: Date, default: null },
 
+    // CCTV proof the manager attached when approving (13 Oct 2026, owner):
+    // required from the manager whose approval hands the report to HR.
+    cctvProof: { type: require("../../services/approvalProof").cctvProofSchema, default: undefined },
+
     // Approval workflow
     status: {
       type: String,
       enum: [
         "pending",
         "manager_approved",
+        /* The manager approved; HR decides and HR's approval applies the
+           grace (13 Oct 2026, owner: "HR should always ask for approval"). */
+        "awaiting_hr",
         "manager_rejected",
         "hr_approved",
         "hr_rejected",
@@ -79,6 +86,13 @@ const overtimeReportSchema = new mongoose.Schema(
     rejectedBy: { type: mongoose.Schema.Types.ObjectId },
     rejectedAt: { type: Date },
     rejectionReason: { type: String },
+
+    /* HR's decision (13 Oct 2026). `approvedBy*` above stays the MANAGER's. */
+    hrApprovedBy: { type: mongoose.Schema.Types.ObjectId },
+    hrApprovedByName: { type: String },
+    hrApprovedAt: { type: Date },
+    hrRemarks: { type: String },
+    rejectedByName: { type: String },
 
     // Whether grace was applied to next day's attendance
     graceApplied: { type: Boolean, default: false },

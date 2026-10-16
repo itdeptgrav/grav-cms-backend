@@ -225,6 +225,32 @@ const mrfItemSchema = new mongoose.Schema(
      */
     warehouseId: { type: mongoose.Schema.Types.ObjectId, default: null },
 
+    /* ── ONE REQUESTED LINE, SPLIT INTO SEVERAL BY THE STORE (13 Oct 2026) ──
+     * "Button (18L & 14L), 2 Pcs" is one line to the requester and two
+     * products to the Store. The Store splits it (services/mrfItemSplit.service.js):
+     * the line keeps its own _id and history and becomes part 1, the other
+     * parts are new lines inserted right after it, and every part is an
+     * ordinary line from then on — matched, reserved and issued on its own.
+     *
+     * `groupId` is the ORIGINAL line's _id on every part (that line included),
+     * so the parts can be found and shown together. The quantities of a group
+     * always add up to `originalQty`. `original` is set on the original line
+     * only: what it was before the split, so "Undo split" can put it back
+     * exactly. Absent on every line that was never split. */
+    split: {
+      type: new mongoose.Schema({
+        groupId: { type: mongoose.Schema.Types.ObjectId, required: true },
+        originalQty: { type: Number, min: 0 },
+        originalUnit: { type: String, trim: true, default: "" },
+        originalName: { type: String, trim: true, default: "" },
+        at: { type: Date, default: null },
+        by: { type: mongoose.Schema.Types.ObjectId, default: null },
+        byName: { type: String, trim: true, default: "" },
+        original: { type: mongoose.Schema.Types.Mixed, default: undefined },
+      }, { _id: false }),
+      default: undefined,
+    },
+
     /* ── WHAT AUTOMATIC RESERVATION DID, AND WHY ──────────────────────────────
      * Approving a request now attempts to hold the stock for it, so the store
      * no longer chooses locations by hand for the ordinary case. This records

@@ -1041,6 +1041,19 @@ router.put("/:id", async (req, res) => {
     const updates = { ...req.body };
     delete updates._id;
     delete updates.createdAt;
+    /* The locks are changed ONLY through /fy-locks — by the right person,
+       with a reason, kept in their history. A company save must not carry
+       them (it used to replace them wholesale, silently unlocking). */
+    delete updates.financialYearLocks;
+    delete updates.monthLocks;
+    delete updates.periodLocks;
+    /* Moving the books' first day moves where the opening balances sit: not
+       into or out of a locked period (15 Oct 2026). */
+    if (updates.booksFromDate) {
+      const cur = await Acc_Company.findById(req.params.id).select("booksFromDate").lean();
+      if (cur && cur.booksFromDate && new Date(cur.booksFromDate).getTime() !== new Date(updates.booksFromDate).getTime())
+        await require("../../services/accounting/fyLock").assertYearsOpen(req.params.id, [cur.booksFromDate, updates.booksFromDate], "The books' first day (and its opening balances)", "opening_balances");
+    }
 
     /* DOCUMENTS ARE NOT EDITABLE THROUGH THIS ROUTE.
        --------------------------------------------------------------------

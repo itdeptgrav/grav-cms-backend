@@ -79,6 +79,8 @@ const customerSuppliedRouting = require("../../../../services/storePurchase/cust
 // live here; the CONTROLLED ISSUE reuses this file's own adjustStock engine.
 const reservationSvc = require("../../../../services/storePurchase/reservation.service");
 const StockReservation = require("../../../../models/CMS_Models/Inventory/Operations/StockReservation");
+const itemSplit = require("../../../../services/mrfItemSplit.service");
+const scanMatch = require("../../../../services/mrfScanMatch.service");
 const { resolveConversion } = require("../../../../services/storePurchase/goodsReceipt.service");
 
 const MRF_ENTITY = "MRF";
@@ -477,20 +479,46 @@ router.get("/data/raw-items", async (req, res) => {
       .select("name sku unit customUnit quantity variants")
       .sort({ name: 1 }).limit(50).lean();
     const unitMap = await buildUnitConversions();
-    const formatted = items.map(item => {
-      const baseUnit = item.customUnit || item.unit || "unit";
-      return {
-        _id: item._id, name: item.name, sku: item.sku, baseUnit,
-        quantity: item.quantity || 0,
-        conversions: unitMap[baseUnit] || [],
-        variants: (item.variants || []).map(v => ({
-          _id: v._id, combination: v.combination || [],
-          quantity: v.quantity || 0, sku: v.sku || "", status: v.status || "Out of Stock",
-        })),
-      };
-    });
+    const formatted = items.map(item => pickerItem(item, unitMap));
     res.json({ success: true, rawItems: formatted });
   } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+/* One product as the Match to Inventory popup reads it — the search above and
+   the scan below answer in the same shape. */
+function pickerItem(item, unitMap) {
+  const baseUnit = item.customUnit || item.unit || "unit";
+  return {
+    _id: item._id, name: item.name, sku: item.sku, baseUnit,
+    quantity: item.quantity || 0,
+    conversions: unitMap[baseUnit] || [],
+    variants: (item.variants || []).map(v => ({
+      _id: v._id, combination: v.combination || [],
+      quantity: v.quantity || 0, sku: v.sku || "", status: v.status || "Out of Stock",
+    })),
+  };
+}
+
+// ── GET /data/raw-items/scan?code= ────────────────────────────────────────────
+/* A scanned barcode → the product (and variant) for the Match to Inventory
+   popup (14 Oct 2026, owner). A raw-item label, a raw item's id, or an exact
+   item / variant SKU; several products on one SKU come back as candidates.
+   Reads only, scoped to the caller's company. services/mrfScanMatch.service.js
+   holds every rule. */
+router.get("/data/raw-items/scan", async (req, res) => {
+  try {
+    const code = String(req.query.code || "").trim();
+    if (!code) return res.status(400).json({ success: false, message: "Scan a barcode first." });
+    if (code.length > 300) return res.status(400).json({ success: false, message: "That code is too long to be a barcode." });
+    const unitMap = await buildUnitConversions();
+    const answer = await scanMatch.matchScannedCode({
+      code,
+      tenantFilter: tenantContext.tenantFilter(req.tenant),
+      RawItem, Barcode,
+      format: (item) => pickerItem(item, unitMap),
+    });
+    res.json({ success: true, ...answer });
+  } catch (e) { sendError(res, e); }
 });
 
 // ── GET /data/employees ───────────────────────────────────────────────────────
@@ -955,17 +983,9 @@ router.patch(
     // unit is a property of the item too, not a free-standing fact the
     // requester gets to fix in advance of knowing what it would be matched
     // to.)
-    const matchedUnit = rawItem.customUnit || rawItem.unit || "unit";
-    item.rawItem = rawItem._id;
-    item.rawItemName = rawItem.name;
-    item.rawItemSku = rawItem.sku || "";
-    item.variantId = variantId || null;
-    item.variantCombination = variantCombination || [];
-    item.unit = matchedUnit;
-    item.baseUnit = matchedUnit;
-    item.itemStatus = "APPROVED";
-    item.category = "";
-    item.attributes = [];
+    /* The one assignment — services/mrfItemSplit.service.js applyCatalogueMatch,
+       shared with a part matched while splitting (13 Oct 2026). */
+    itemSplit.applyCatalogueMatch(item, rawItem, { variantId, variantCombination });
 
     mrf.logEvent({
       action: wasRematch ? "ITEM_REMATCHED" : "ITEM_MATCHED", actorName: actorName(req), actorRole: "store",
@@ -1013,6 +1033,175 @@ router.patch(
        generic 500 the browser cannot reason about. */
     if (e?.name === "StorePurchaseError") return sendError(res, e);
     console.error("[Match MRF item]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+},
+);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SPLITTING ONE REQUESTED LINE INTO SEVERAL  (13 Oct 2026, owner)
+   "Button (18L & 14L), 2 Pcs" is one line to the requester and two products
+   to the Store. POST /:id/items/:itemId/split turns it into N lines whose
+   quantities add up to the original; each may be matched on the way, and
+   each is an ordinary line afterwards. POST /:id/items/:itemId/unsplit puts
+   it back while nothing has happened to any part. The rules are
+   services/mrfItemSplit.service.js; this reads what they need from the
+   database and commits.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Line ids of this request that hold an active reservation or a live PO line. */
+async function lineBlockers(req, mrf) {
+  const ids = (mrf.items || []).map((l) => l._id);
+  const PurchaseOrder = require("../../../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+  const [reserved, ordered] = await Promise.all([
+    StockReservation.find({ companyId: req.tenant?.companyId, mrfLineId: { $in: ids }, active: true }).select("mrfLineId").lean(),
+    PurchaseOrder.find({ "items.sourceMrfLineId": { $in: ids }, status: { $ne: "CANCELLED" } }).select("items.sourceMrfLineId").lean(),
+  ]);
+  const orderedLineIds = new Set();
+  for (const po of ordered) for (const it of po.items || []) if (it.sourceMrfLineId) orderedLineIds.add(String(it.sourceMrfLineId));
+  return { reservedLineIds: new Set(reserved.map((r) => String(r.mrfLineId))), orderedLineIds };
+}
+
+const splitWords = (parts, unit) => parts.map((p) => `${p.quantity} ${unit}`).join(" · ");
+
+router.post(
+  "/:id/items/:itemId/split",
+  requireCapability(CAPABILITIES.MRF_FULFIL),
+  refuseLegacyWrite,
+  withIdempotency("MRF_SPLIT"),
+  async (req, res) => {
+  try {
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) });
+    if (!mrf) return res.status(404).json({ success: false, message: "Request not found" });
+    await may(req, "MATCH", mrf);
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    }
+    const line = mrf.items.id(req.params.itemId);
+    const blockers = await lineBlockers(req, mrf);
+    const refusal = itemSplit.splitRefusal(mrf, line, blockers);
+    if (refusal) return res.status(refusal.reason === "NOT_FOUND" ? 404 : 409).json({ success: false, reason: refusal.reason, message: refusal.message });
+
+    const read = itemSplit.readParts(line, req.body?.parts);
+    if (read.error) return res.status(400).json({ success: false, ...read.error });
+    const rawIds = [...new Set(read.parts.map((p) => p.rawItemId).filter((v) => mongoose.Types.ObjectId.isValid(v)))];
+    if (read.parts.some((p) => p.rawItemId && !mongoose.Types.ObjectId.isValid(p.rawItemId))) {
+      return res.status(400).json({ success: false, reason: "PRODUCT", message: "One of the products named is not a valid inventory item." });
+    }
+    const rawItems = rawIds.length ? await RawItem.find({ _id: { $in: rawIds } }).select("name sku unit customUnit variants").lean() : [];
+    const matched = itemSplit.readMatches(read.parts, new Map(rawItems.map((r) => [String(r._id), r])));
+    if (matched.error) return res.status(400).json({ success: false, ...matched.error });
+
+    const originalName = line.rawItemName;
+    const originalUnit = line.unit;
+    let result = null;
+    const saved = await commitMrf(req, mrf, (doc) => ({
+      action: "ITEM_SPLIT",
+      previousState: doc.status, resultingState: doc.status,
+      metadata: { itemId: String(req.params.itemId), parts: read.parts.length, lineIds: (result?.lineIds || []).join(",") },
+    }), {
+      /* Applied to a FRESH copy inside the transaction, re-checked there, so a
+         retry lands once and a line changed meanwhile is refused, not split. */
+      applyTargets: async (doc) => {
+        const fresh = doc.items.id(req.params.itemId);
+        const again = itemSplit.splitRefusal(doc, fresh, blockers)
+          || (itemSplit.readParts(fresh, req.body?.parts).error || null);
+        if (again) throw fail("CONFLICT", again.message, { reason: again.reason });
+        result = itemSplit.applySplit(doc, fresh._id, read.parts, matched.matches, { actorId: req.user?.id || null, actorName: actorName(req) });
+        doc.logEvent({
+          action: "ITEM_SPLIT", actorName: actorName(req), actorRole: "store",
+          itemId: fresh._id, itemName: originalName,
+          detail: `"${originalName}" (${read.parts.reduce((t, p) => t + p.quantity, 0)} ${originalUnit}) split into ${read.parts.length} lines: ${splitWords(read.parts, originalUnit)}.`,
+        });
+      },
+    });
+    const doc = saved?.result || mrf;
+
+    NotificationService.sendToUser(doc.requestedFor, {
+      title: "Item split by the Store",
+      body: `"${originalName}" on your request ${doc.mrfNumber} is being supplied as ${read.parts.length} separate items.`,
+      type: "request",
+      url: "/coworking/mrf",
+      tag: `mrf-item-split-${doc._id}-${req.params.itemId}`,
+    }).catch(() => { });
+    /* A part matched while splitting is eligible for a hold now, like a line
+       matched by Search to Match — one attempt per matched part. */
+    for (const [i] of matched.matches) {
+      const lineId = result?.lineIds?.[i];
+      if (!lineId) continue;
+      autoReservation.attemptInBackground({
+        tenant: req.tenant, mrfId: doc._id, lineId,
+        trigger: autoReservation.TRIGGERS.LINE_MATCHED,
+        actorName: actorName(req), actorId: req.user?.id || null,
+      });
+    }
+
+    const payload = {
+      success: true,
+      message: `Split into ${read.parts.length} lines.`,
+      groupId: result ? String(result.groupId) : String(req.params.itemId),
+      lineIds: result?.lineIds || [],
+      mrf: doc,
+    };
+    return req.idempotent
+      ? await req.idempotent.succeed(200, payload, { entityType: MRF_ENTITY, entityId: doc._id })
+      : res.json(payload);
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    console.error("[Split MRF item]", e);
+    res.status(500).json({ success: false, message: e.message });
+  }
+},
+);
+
+router.post(
+  "/:id/items/:itemId/unsplit",
+  requireCapability(CAPABILITIES.MRF_FULFIL),
+  refuseLegacyWrite,
+  withIdempotency("MRF_UNSPLIT"),
+  async (req, res) => {
+  try {
+    const mrf = await MRF.findOne({ _id: req.params.id, ...tenantContext.tenantFilter(req.tenant) });
+    if (!mrf) return res.status(404).json({ success: false, message: "Request not found" });
+    await may(req, "MATCH", mrf);
+    if (!isStoreActionable(mrf)) {
+      return res.status(403).json({ success: false, message: "This request has not been approved yet." });
+    }
+    /* Any part of the group names it; the group is the original line's. */
+    const named = mrf.items.id(req.params.itemId);
+    const groupId = named?.split?.groupId || req.params.itemId;
+    const blockers = await lineBlockers(req, mrf);
+    const refusal = itemSplit.undoRefusal(mrf, groupId, blockers);
+    if (refusal) return res.status(409).json({ success: false, reason: refusal.reason, message: refusal.message });
+
+    let result = null;
+    const saved = await commitMrf(req, mrf, (doc) => ({
+      action: "ITEM_SPLIT_UNDONE",
+      previousState: doc.status, resultingState: doc.status,
+      metadata: { itemId: String(groupId), removed: (result?.removed || []).join(",") },
+    }), {
+      applyTargets: async (doc) => {
+        const again = itemSplit.undoRefusal(doc, groupId, blockers);
+        if (again) throw fail("CONFLICT", again.message, { reason: again.reason });
+        const root = itemSplit.rootOf(doc, groupId);
+        const parts = doc.items.filter((l) => String(l.split?.groupId || "") === String(groupId)).length;
+        const name = root.split?.originalName || root.rawItemName;
+        result = itemSplit.applyUndo(doc, groupId);
+        doc.logEvent({
+          action: "ITEM_SPLIT_UNDONE", actorName: actorName(req), actorRole: "store",
+          itemId: root._id, itemName: name,
+          detail: `The split of "${name}" into ${parts} lines was undone — it is one line of ${root.requestedQty} ${root.unit} again.`,
+        });
+      },
+    });
+    const doc = saved?.result || mrf;
+    const payload = { success: true, message: "Split undone — it is one line again.", lineId: result?.lineId || String(groupId), mrf: doc };
+    return req.idempotent
+      ? await req.idempotent.succeed(200, payload, { entityType: MRF_ENTITY, entityId: doc._id })
+      : res.json(payload);
+  } catch (e) {
+    if (e?.name === "StorePurchaseError") return sendError(res, e);
+    console.error("[Undo MRF item split]", e);
     res.status(500).json({ success: false, message: e.message });
   }
 },
@@ -3116,8 +3305,12 @@ router.get("/:id/stock-check", async (req, res) => {
     const storeContext = buildContext(mrf, "store");
     storeView(mrf);
     const visible = storeLineIds(mrf);
+    /* Split / Undo split, per line (13 Oct 2026): the server alone knows the
+       reservations and purchase orders that hold a line, so it says. */
+    const standing = itemSplit.splitStanding(mrf, await lineBlockers(req, mrf));
     const itemsWithStock = (await mrfUnits.enrichItemsWithStock(mrf.items || []))
-      .filter((l) => visible.has(String(l._id)));
+      .filter((l) => visible.has(String(l._id)))
+      .map((l) => ({ ...l, splitCheck: standing.get(String(l._id)) || { canSplit: false, reason: "" } }));
 
     // If this MRF was spawned from a product-request match/approve, find
     // that source so the page can link back to it — that's where "Edit

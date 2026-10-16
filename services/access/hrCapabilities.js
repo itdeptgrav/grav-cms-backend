@@ -155,6 +155,11 @@ const EDITOR = [
   C.SKILLS_ASSESS,
   C.TRAINING_MANAGE,
   C.PAYROLL_READ,
+  /* 13 Oct 2026, owner: "the salary of an employee is not visible to the HR
+     editor". An editor READS pay and bank details; CHANGING pay is still
+     COMPENSATION_WRITE, which only the owner holds, so an editor's pay edit
+     is held for the owner exactly as before. */
+  C.COMPENSATION_READ,
 ];
 
 /* An approver signs things off. The separations that matter are here and are

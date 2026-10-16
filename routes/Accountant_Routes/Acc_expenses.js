@@ -77,6 +77,9 @@ function computeFY(dateInput) {
  * +1 to post, -1 to reverse. Mirrors the helper in tallyVouchers.js.
  */
 async function applyLedgerBalances(voucher, direction = 1) {
+  /* no balance moves for a voucher in a locked period — checked before the
+     ledgers, not after (15 Oct 2026) */
+  await require("../../services/accounting/fyLock").assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;
@@ -475,6 +478,48 @@ router.post("/", companyScope, async (req, res) => {
           ? `Paid via ${counterLg.name}`
           : `Payable to ${counterLg.name}`,
     });
+
+    /* ── Ledger lines added by hand (14 Oct 2026) ─────────────────────
+       "Add another ledger line" on the expense form: lines that move an
+       amount from one ledger to another. Each is a debit OR a credit on a
+       ledger of THIS company; together they must balance (the expense's own
+       lines balance by construction), so the expense's total is unchanged.
+       Saved with `isAdjustment: true`. Anything malformed refuses the whole
+       expense — a half-applied adjustment is worse than none. */
+    const addedLines = Array.isArray(body.addedLines) ? body.addedLines : [];
+    if (addedLines.length > 50)
+      return res.status(400).json({ error: "At most 50 added ledger lines on one expense" });
+    let addedDr = 0;
+    let addedCr = 0;
+    for (const [i, line] of addedLines.entries()) {
+      const n = `Added ledger line ${i + 1}`;
+      const type = line?.type;
+      const amt = G(line?.amount);
+      if (type !== "Dr" && type !== "Cr")
+        return res.status(400).json({ error: `${n}: must be a debit or a credit` });
+      if (!(amt > 0))
+        return res.status(400).json({ error: `${n}: amount must be more than zero` });
+      const lg = line?.ledgerId && mongoose.isValidObjectId(String(line.ledgerId))
+        ? await Acc_Ledger.findOne({ _id: line.ledgerId, companyId }).select("name groupName").lean()
+        : null;
+      if (!lg) return res.status(400).json({ error: `${n}: ledger not found in this company` });
+      if (type === "Dr") addedDr = G(addedDr + amt);
+      else addedCr = G(addedCr + amt);
+      ledgerEntries.push({
+        ledgerId: lg._id,
+        ledgerName: lg.name,
+        groupName: lg.groupName,
+        type,
+        amount: amt,
+        signedAmount: type === "Dr" ? amt : -amt,
+        narration: String(line?.narration || "").trim().slice(0, 300) || "Adjustment",
+        isAdjustment: true,
+      });
+    }
+    if (Math.abs(addedDr - addedCr) >= 0.01)
+      return res.status(400).json({
+        error: `Added ledger lines do not balance: Dr ${addedDr.toFixed(2)} ≠ Cr ${addedCr.toFixed(2)}`,
+      });
 
     // ── Build voucher document ──────────────────────────────────────
     const voucherType = mode === "pay_now" ? "payment" : "journal";

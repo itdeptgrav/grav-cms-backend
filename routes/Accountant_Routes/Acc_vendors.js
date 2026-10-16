@@ -1272,6 +1272,23 @@ router.post("/:id/merge", companyScopeOptional, async (req, res) => {
     let ghost = await Vendor.findById(mergeFromId).catch(() => null);
     let ghostLedger = null;
 
+    /* Refused BEFORE the first write (purchase orders move first) when a
+       voucher of the ghost's ledger is in a locked period (15 Oct 2026). The
+       candidates are the ledgers the merge below may pick. */
+    {
+      const cands = [];
+      if (ghost) {
+        const linked = await Acc_Ledger.findOne(scoped({ linkedVendorId: ghost._id })).select("_id").lean().catch(() => null);
+        if (linked) cands.push(linked._id);
+        else {
+          const rx = nameRx(ghost.companyName);
+          const byName = rx ? await Acc_Ledger.findOne(scoped({ name: rx, isActive: { $ne: false } })).select("_id").lean().catch(() => null) : null;
+          if (byName) cands.push(byName._id);
+        }
+      } else if (mongoose.Types.ObjectId.isValid(String(mergeFromId))) cands.push(new mongoose.Types.ObjectId(String(mergeFromId)));
+      await require("../../services/accounting/fyLock").assertLedgersOpen(cands, "A voucher of the vendor being merged in it");
+    }
+
     if (ghost) {
       // ── Path A: the ghost is a CMS Vendor ──────────────────────────────
       const poResult = await PurchaseOrder.updateMany(

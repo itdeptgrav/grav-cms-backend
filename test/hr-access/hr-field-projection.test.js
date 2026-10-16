@@ -127,8 +127,10 @@ describe("the classes step up one capability at a time", () => {
   });
 
   test("compensation and banking need compensation.read", () => {
-    expect(projectEmployee(record, ROLE_TEMPLATES.hr_editor).salary).toBeUndefined();
-    expect(projectEmployee(record, ROLE_TEMPLATES.hr_editor).bankDetails).toBeUndefined();
+    expect(projectEmployee(record, ROLE_TEMPLATES.hr_viewer).salary).toBeUndefined();
+    expect(projectEmployee(record, ROLE_TEMPLATES.hr_viewer).bankDetails).toBeUndefined();
+    /* An editor reads pay since 13 Oct 2026 (owner request). */
+    expect(projectEmployee(record, ROLE_TEMPLATES.hr_editor).salary).toBeDefined();
 
     const approver = projectEmployee(record, ROLE_TEMPLATES.hr_approver);
     expect(approver.salary).toBeDefined();

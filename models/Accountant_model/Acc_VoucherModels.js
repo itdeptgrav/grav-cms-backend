@@ -61,6 +61,10 @@ const ledgerEntrySchema = new mongoose.Schema(
     gstClassification: { type: String, trim: true }, // "Taxable", "Exempt", "Nil-Rated", "Non-GST"
     isPartyLedger: { type: Boolean, default: false },
     isDeemedPositive: { type: Boolean, default: true },
+    /* A line the accountant added by hand ("Add another ledger line") to move
+       an amount from one ledger to another — not built from the bill's items.
+       The purchase form reads it back into its own editable rows on edit. */
+    isAdjustment: { type: Boolean, default: false },
 
     narration: { type: String, trim: true },
   },
@@ -934,6 +938,15 @@ tallyVoucherSchema.post("save", async function afterVoucherSaved(doc) {
   }
 });
 
+/* A frozen financial year accepts no voucher write (13 Oct 2026) — see
+   services/accounting/fyLock.js. Attached here so every route is covered. */
+tallyVoucherSchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
+  dateField: "voucherDate",
+  label: "A voucher",
+  /* each voucher is in its own section (sales, receipts, expenses, payroll …),
+     so a lock can close some sections and leave others open (16 Oct 2026) */
+  voucher: true,
+});
 const Acc_Voucher = mongoose.model("Acc_Voucher", tallyVoucherSchema);
 const Acc_Godown = mongoose.model("Acc_Godown", tallyGodownSchema);
 

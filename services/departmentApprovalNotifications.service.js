@@ -155,13 +155,13 @@ async function employeeByEmail(email) {
  * approve their own change (the server refuses it with SELF_APPROVAL), so
  * telling them it needs approving is noise.
  */
-async function approversOf(slug, exceptEmail) {
+async function approversOf(slug, exceptEmail, { roles = ["owner", "approver"] } = {}) {
   const skip = String(exceptEmail || "").toLowerCase();
   let rows = [];
   try {
     rows = await DepartmentRole.find({
       departmentSlug: String(slug || "").toLowerCase(),
-      role: { $in: ["owner", "approver"] },
+      role: { $in: roles },
     })
       .select("email")
       .lean();
@@ -176,6 +176,44 @@ async function approversOf(slug, exceptEmail) {
       .map((r) => employeeByEmail(r.email)),
   );
   return people.filter(Boolean);
+}
+
+/**
+ * Active platform administrators who have an employee record to send to.
+ * They decide every department's requests (they count as owner) but hold no
+ * role row, so the list above never names them.
+ */
+async function platformAdmins(exceptEmail) {
+  const skip = String(exceptEmail || "").toLowerCase();
+  try {
+    const DeptUser = require("../models/Access/DeptUser");
+    const rows = await DeptUser.find({ isAdmin: true, isActive: { $ne: false } }).select("email").lean();
+    const people = await Promise.all(
+      rows
+        .filter((r) => String(r.email || "").toLowerCase() !== skip)
+        .map((r) => employeeByEmail(r.email)),
+    );
+    return people.filter(Boolean);
+  } catch (err) {
+    console.warn("[dept-notif] could not list platform admins:", err.message);
+    return [];
+  }
+}
+
+/**
+ * Who is told that a change is waiting (14 Oct 2026). Only people who can
+ * DECIDE it: an owner-only request (pay) goes to the owners, any other to the
+ * approvers and owners. An approver used to be told about pay changes they
+ * could not decide, while the platform administrator — who can decide
+ * everything — was never told at all. If none of those people could be
+ * reached, the platform administrators are told, so a held change never
+ * waits with nobody knowing.
+ */
+async function decidersOf(cr) {
+  const ownerOnly = cr?.requiredRole === "owner";
+  return approversOf(cr?.departmentSlug, cr?.requestedBy?.email, {
+    roles: ownerOnly ? ["owner"] : ["owner", "approver"],
+  });
 }
 
 /* ------------------------------------------------------------------ */
@@ -208,16 +246,28 @@ async function notifyChangeRequest(cr, event, { send = sendPush } = {}) {
       `${cr.summary ? ` — ${cr.summary}` : ""}`;
 
     if (event === "held") {
-      const recipients = await approversOf(slug, cr.requestedBy?.email);
-      if (!recipients.length) {
-        console.log(`[dept-notif] ${slug}: nobody to notify about a held change`);
-        return;
+      const message = {
+        title: cr.requiredRole === "owner" ? "Owner approval needed" : "Approval needed",
+        body: `${asked}: ${what}`,
+        url,
+      };
+      const recipients = await decidersOf(cr);
+      const results = await Promise.all(recipients.map((r) => send(r, message)));
+      const reached = results.filter(Boolean).length;
+      if (reached) return;
+
+      /* Nobody who holds the role could be reached (no role row, no employee
+         record, or no registered device): the platform administrators can
+         decide it too, so they are told instead of nobody. */
+      const told = new Set(recipients.map((r) => String(r._id || r.email)));
+      const admins = (await platformAdmins(cr.requestedBy?.email)).filter((a) => !told.has(String(a._id || a.email)));
+      const adminResults = await Promise.all(admins.map((a) => send(a, message)));
+      if (!adminResults.some(Boolean)) {
+        console.warn(
+          `[dept-notif] ${slug}: a held ${cr.requiredRole === "owner" ? "owner-only " : ""}change reached nobody ` +
+            `(${recipients.length} decider(s), ${admins.length} admin(s), none with a working device). It waits on the Approvals page.`,
+        );
       }
-      await Promise.all(
-        recipients.map((r) =>
-          send(r, { title: "Approval needed", body: `${asked}: ${what}`, url }),
-        ),
-      );
       return;
     }
 
@@ -246,4 +296,4 @@ async function notifyChangeRequest(cr, event, { send = sendPush } = {}) {
   }
 }
 
-module.exports = { notifyChangeRequest, sendPush, approversOf, approvalsUrl, getMessaging };
+module.exports = { notifyChangeRequest, sendPush, approversOf, decidersOf, platformAdmins, approvalsUrl, getMessaging };

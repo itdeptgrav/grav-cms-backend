@@ -1254,6 +1254,9 @@ app.use("/api/hr", conditionalGet);
 app.use("/hr", conditionalGet);
 app.use("/api/employees", conditionalGet);
 app.use("/api/accountant", conditionalGet);
+/* A write refused because its period is locked answers 423 FY_LOCKED from
+   every accounting route, whatever its own catch says (15 Oct 2026). */
+app.use("/api/accountant", require("./Middlewear/lockedPeriodStatus").lockedPeriodStatus);
 
 /* ─── HR AUTHORISATION CONTRACT — part 2 of 2 ─────────────────────────────
  *
@@ -1384,6 +1387,8 @@ app.use("/api/hr/overview", hrOverviewRoutes);
 
 // HR › Attendance › Shift Management — named shift definitions.
 app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_section"));
+/* HR's decision on overtime reports — the manager's approval hands them to HR (13 Oct 2026). */
+app.use("/api/hr/overtime", require("./routes/HrRoutes/Overtime_HR"));
 
 // The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
 // /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central
@@ -2909,6 +2914,10 @@ app.use(
 );
 const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
 app.use("/api/accountant/bank-recon", bankReconRoutes);
+/* Freeze / unfreeze financial years (13 Oct 2026). */
+app.use("/api/accountant/fy-locks", require("./routes/Accountant_Routes/Acc_fyLocks"));
+/* The inventory's stock by day / month / year end, for accounts (13 Oct 2026). */
+app.use("/api/accountant/stock-summary", require("./routes/Accountant_Routes/Acc_stockSummary"));
 
 app.use(
   "/api/accountant/voucher-files",

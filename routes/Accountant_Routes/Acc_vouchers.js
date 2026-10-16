@@ -9,6 +9,7 @@
 
 const express = require("express");
 const mongoose = require("mongoose");
+const { assertYearsOpen, assertVoucherOpen } = require("../../services/accounting/fyLock");
 const router = express.Router();
 const {
   Acc_Voucher,
@@ -314,6 +315,10 @@ async function liveNumberClash(
  * so older drafts saved before the rename still apply correctly.
  */
 async function applyLedgerBalances(voucher, direction = 1, session = null) {
+  /* A frozen year's balances never move (13 Oct 2026) — checked here too, so
+     a route that adjusts balances BEFORE the voucher save (which the model
+     guard would refuse) cannot leave a balance changed behind a refusal. */
+  await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher");
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;
@@ -466,6 +471,14 @@ function pickGstRate(candidates, fallback = 18) {
 
 // Lazy-require the CMS StockItem model so this file loads even where the
 // CMS inventory module isn't installed.
+const {
+  salesCatalogue,
+  purchaseCatalogue,
+  billHistory,
+  matchesQuery,
+  norm,
+} = require("../../services/accounting/voucherItemCatalogue");
+
 function loadCMSStockItem() {
   try {
     return require("../../models/CMS_Models/Inventory/Products/StockItem");
@@ -643,79 +656,91 @@ async function applyPurchaseOrderProvenance(body) {
   };
 }
 
+/* The sales-side item list, from the CMS only — services/accounting/
+   voucherItemCatalogue says where each figure comes from (13 Oct 2026).
+   ?customerLedgerId= puts that customer's PI lines first. */
+
+/** The latest bills' item lines for this company, latest first. */
+async function voucherLinesFor(companyId, types) {
+  const vouchers = await Acc_Voucher.find({
+    companyId,
+    voucherType: { $in: types },
+    status: { $nin: ["cancelled", "void"] },
+    "inventoryEntries.0": { $exists: true },
+  })
+    .sort({ voucherDate: -1, createdAt: -1 })
+    .limit(3000)
+    .select("inventoryEntries.stockItemId inventoryEntries.stockItemName inventoryEntries.rate inventoryEntries.taxRate inventoryEntries.taxAmount inventoryEntries.hsnCode inventoryEntries.isCharge")
+    .lean();
+  const lines = [];
+  for (const v of vouchers) for (const l of v.inventoryEntries || []) lines.push(l);
+  return lines;
+}
+
+/** The CMS customer behind an accounting customer ledger, if any. */
+async function cmsCustomerOf(companyId, ledgerId) {
+  if (!ledgerId || !mongoose.Types.ObjectId.isValid(String(ledgerId))) return null;
+  const led = await Acc_Ledger.findOne({ _id: ledgerId, companyId })
+    .select("name linkedCustomerId")
+    .lean();
+  if (!led) return null;
+  return { customerId: led.linkedCustomerId ? String(led.linkedCustomerId) : null, name: led.name || "" };
+}
+
 router.get("/stock-items", auth, companyScope, async (req, res) => {
   try {
-    const { companyId, q, limit = 500 } = req.query;
+    const { companyId, q, limit = 3000, customerLedgerId } = req.query;
     if (!companyId)
       return res.status(400).json({ error: "companyId required" });
-
-    const lim = parseInt(limit);
-    const rx = q
-      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
-      : null;
-
-    // ── Source 1: CMS StockItem catalog ────────────────────────────
+    const lim = parseInt(limit) || 3000;
     const CMSStockItem = loadCMSStockItem();
-    let cmsItems = [];
-    if (CMSStockItem) {
-      const cmsFilter = {};
-      if (rx) {
-        cmsFilter.$or = [
-          { name: rx },
-          { additionalNames: rx },
-          { hsnCode: rx },
-          { reference: rx },
-          { barcode: rx },
-        ];
+    let CustomerRequest = null;
+    try {
+      CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
+    } catch { /* no PI module in this deployment */ }
+
+    const [products, lines, requests, customer] = await Promise.all([
+      CMSStockItem
+        ? CMSStockItem.find({})
+            .sort({ name: 1 })
+            .select(
+              "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory isActive deletedAt variants._id variants.attributes variants.salesPrice variants.status",
+            )
+            .lean()
+        : [],
+      voucherLinesFor(companyId, ["sales", "credit_note"]),
+      CustomerRequest
+        ? CustomerRequest.find({ "quotations.0": { $exists: true } })
+            .sort({ createdAt: -1 })
+            .limit(2000)
+            .select("customerId customerInfo.name quotations.quotationNumber quotations.status quotations.createdAt quotations.items.stockItemId quotations.items.itemName quotations.items.description quotations.items.hsnCode quotations.items.unitPrice quotations.items.gstPercentage")
+            .lean()
+        : [],
+      cmsCustomerOf(companyId, customerLedgerId),
+    ]);
+
+    /* A customer's PI is theirs by the CMS customer the ledger is linked to,
+       or — for a ledger never linked — by the same name. */
+    const isCustomers = (r) =>
+      !!customer &&
+      ((customer.customerId && String(r.customerId || "") === customer.customerId) ||
+        (!customer.customerId && norm(r.customerInfo?.name) && norm(r.customerInfo?.name) === norm(customer.name)));
+    const piLines = [];
+    const quotes = [];
+    for (const r of requests)
+      for (const qt of r.quotations || []) {
+        if (qt.status === "rejected") continue;
+        quotes.push({ r, qt });
       }
-      const cmsRaw = await CMSStockItem.find(cmsFilter)
-        .sort({ name: 1 })
-        .limit(lim)
-        .select(
-          "name additionalNames hsnCode unit baseSalesPrice baseCost salesTax totalQuantityOnHand reference category genderCategory",
-        )
-        .lean();
+    quotes.sort((a, b) => new Date(b.qt.createdAt || 0) - new Date(a.qt.createdAt || 0));
+    for (const { r, qt } of quotes)
+      for (const it of qt.items || [])
+        piLines.push({ ...it, quotationNumber: qt.quotationNumber || "", forCustomer: isCustomers(r) });
 
-      cmsItems = cmsRaw.map((s) => ({
-        _id: s._id,
-        name: s.name,
-        aliases: s.additionalNames || [],
-        hsnCode: s.hsnCode || "",
-        baseUnit: s.unit || "Nos",
-        taxRate: parseTaxRate(s.salesTax),
-        standardSellingPrice: s.baseSalesPrice || 0,
-        standardCost: s.baseCost || 0,
-        closingQuantity: s.totalQuantityOnHand || 0,
-        gstApplicable: !!s.salesTax,
-        source: "cms",
-        reference: s.reference,
-        category: s.category,
-      }));
-    }
-
-    // ── Source 2: Acc_StockItem (accountant-side, company-scoped) ──
-    const tallyFilter = { companyId, isActive: true };
-    if (rx) {
-      tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
-    }
-    const tallyRaw = await Acc_StockItem.find(tallyFilter)
-      .sort({ name: 1 })
-      .limit(lim)
-      .select(
-        "name aliases hsnCode taxRate baseUnit altUnit standardSellingPrice standardCost closingQuantity gstApplicable",
-      )
-      .lean();
-
-    const tallyItems = tallyRaw.map((t) => ({ ...t, source: "tally" }));
-
-    // ── Merge — CMS items win when names collide (case-insensitive) ──
-    const seen = new Set(cmsItems.map((i) => (i.name || "").toLowerCase()));
-    const merged = [
-      ...cmsItems,
-      ...tallyItems.filter((t) => !seen.has((t.name || "").toLowerCase())),
-    ];
-
-    res.json({ items: merged, count: merged.length });
+    const items = salesCatalogue(products, billHistory(lines), piLines)
+      .filter((row) => matchesQuery(row, q))
+      .slice(0, lim);
+    res.json({ items, count: items.length, customerLinked: !!customer });
   } catch (e) {
     console.error("[stock-items]", e);
     res.status(500).json({ error: e.message });
@@ -2819,97 +2844,38 @@ router.post("/:id/link-po", auth, companyScopeOptional, async (req, res) => {
   }
 });
 
-/* GET /raw-materials                                                   */
+/* GET /raw-materials — the purchase-side item list, from the CMS only
+   (services/accounting/voucherItemCatalogue, 13 Oct 2026). */
 router.get("/raw-materials", auth, companyScopeOptional, async (req, res) => {
   try {
-    const { companyId, q, limit = 500 } = req.query;
-    const lim = parseInt(limit);
-    const rx = q
-      ? new RegExp(String(q).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i")
-      : null;
-    let rawItems = [];
-    try {
-      const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
-      const filter = {};
-      /* `vendorNicknames` is the purchase-side equivalent of a stock item's
-         additionalNames: the names a SUPPLIER puts on the same material. It
-         was never searched or returned, so a material the vendor calls
-         something else could not be found by the name on their bill, and the
-         line was typed out by hand. RawItem has carried the field all along —
-         it is simply empty on every one of the 303 items today, so nothing
-         changes until somebody records a nickname. */
-      if (rx)
-        filter.$or = [
-          { name: rx },
-          { sku: rx },
-          { hsnCode: rx },
-          { vendorNicknames: rx },
-          { "vendorNicknames.name": rx },
-        ];
-      const items = await RawItem.find(filter)
+    const { companyId, q, limit = 3000 } = req.query;
+    const lim = parseInt(limit) || 3000;
+    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
+    const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
+
+    const [rawItems, orders, lines] = await Promise.all([
+      RawItem.find({})
         .sort({ name: 1 })
-        .limit(lim)
-        .select("name sku unit category hsnCode gstRate basePrice vendorNicknames")
-        .lean();
-      rawItems = items.map((r) => ({
-        _id: r._id,
-        name: r.name,
-        sku: r.sku || "",
-        hsnCode: r.hsnCode || "",
-        baseUnit: r.unit || "Nos",
-        taxRate: r.gstRate || 0,
-        standardCost: r.basePrice || 0,
-        category: r.category || "",
-        /* Normalised to `aliases`, the name the picker already understands,
-           so the purchase side behaves exactly like the sales side. Entries
-           may be plain strings or {name, vendor} objects depending on who
-           wrote them. */
-        aliases: (r.vendorNicknames || [])
-          .map((v) => (typeof v === "string" ? v : v?.name || v?.nickname || ""))
-          .filter(Boolean),
-        source: "cms_raw",
-      }));
-    } catch {
-      try {
-        const Product = require("../../models/CMS_Models/Inventory/Products/Product");
-        const filter = {
-          type: { $in: ["raw_material", "rawMaterial", "raw"] },
-        };
-        if (rx) filter.$or = [{ name: rx }, { sku: rx }];
-        const items = await Product.find(filter)
-          .sort({ name: 1 })
-          .limit(lim)
-          .lean();
-        rawItems = items.map((r) => ({
-          _id: r._id,
-          name: r.name,
-          sku: r.sku || "",
-          hsnCode: r.hsnCode || "",
-          baseUnit: r.unit || "Nos",
-          taxRate: r.gstRate || 0,
-          standardCost: r.basePrice || r.costPrice || 0,
-          source: "cms_product",
-        }));
-      } catch {
-        /* no CMS product model */
-      }
-    }
-    if (companyId) {
-      const tallyFilter = { companyId, isActive: true };
-      if (rx)
-        tallyFilter.$or = [{ name: rx }, { aliases: rx }, { hsnCode: rx }];
-      const tallyRaw = await Acc_StockItem.find(tallyFilter)
-        .sort({ name: 1 })
-        .limit(lim)
-        .select("name aliases hsnCode taxRate baseUnit standardCost")
-        .lean();
-      const seen = new Set(rawItems.map((r) => r.name?.toLowerCase()));
-      for (const t of tallyRaw) {
-        if (!seen.has(t.name?.toLowerCase()))
-          rawItems.push({ ...t, source: "tally" });
-      }
-    }
-    res.json({ items: rawItems, count: rawItems.length });
+        .select(
+          "name sku unit customUnit category customCategory vendorNicknames primaryVendor variants._id variants.combination variants.vendorNicknames",
+        )
+        .lean(),
+      /* The latest purchase rate per material is what it costs now. Live
+         orders only — a cancelled or draft order's rate was never paid. */
+      PurchaseOrder.find({ status: { $nin: ["CANCELLED", "Cancelled", "DRAFT", "Draft"] } })
+        .sort({ orderDate: -1, createdAt: -1 })
+        .select("items.rawItem items.variantId items.unitPrice items.gstRate")
+        .limit(1000)
+        .lean(),
+      companyId ? voucherLinesFor(companyId, ["purchase", "debit_note"]) : [],
+    ]);
+    const poLines = [];
+    for (const o of orders) for (const l of o.items || []) poLines.push(l);
+
+    const items = purchaseCatalogue(rawItems, billHistory(lines), poLines)
+      .filter((r) => matchesQuery(r, q))
+      .slice(0, lim);
+    res.json({ items, count: items.length });
   } catch (e) {
     console.error("[raw-materials]", e);
     res.status(500).json({ error: e.message });
@@ -3276,6 +3242,9 @@ router.post("/:id/match", auth, async (req, res) => {
 
     const voucher = await Acc_Voucher.findById(req.params.id);
     billMatching.assertMatchable(voucher);
+    /* a voucher in a locked period is not re-matched — checked before any
+       bill reference is written on the invoices it names (15 Oct 2026) */
+    await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
 
     const state = await billMatching.applyAllocations(
       voucher,
@@ -3315,6 +3284,9 @@ router.delete("/:id/match", auth, async (req, res) => {
 
     const voucher = await Acc_Voucher.findById(req.params.id);
     billMatching.assertMatchable(voucher);
+    /* a voucher in a locked period is not re-matched — checked before any
+       bill reference is written on the invoices it names (15 Oct 2026) */
+    await assertVoucherOpen(voucher, [voucher.voucherDate], "A voucher in it");
 
     const state = await billMatching.clearAllocations(voucher, {
       partyLedgerId: req.body?.partyLedgerId || req.query?.partyLedgerId || null,
@@ -3808,6 +3780,8 @@ router.post("/", auth, companyScope, async (req, res) => {
           "That voucher number is already in use by an active voucher. Pick a different number.",
       });
     }
+    /* A frozen year or a locked month answers 423 with its code. */
+    if (e && e.code === "FY_LOCKED") return res.status(423).json({ error: e.message, code: e.code, period: e.period });
     res.status(400).json({ error: e.message });
   }
 });
@@ -3833,6 +3807,11 @@ router.put("/:id", auth, companyScope, async (req, res) => {
 
     const body = req.body || {};
     const wasPosted = existing.status === "posted";
+    /* A locked period — the voucher's date now or the one it is being moved
+       to — is refused HERE, before the old balances are reversed below: the
+       model would refuse the save anyway, but only after the reversal had
+       already moved the ledgers (15 Oct 2026). */
+    await assertVoucherOpen(existing, [existing.voucherDate, body.voucherDate], "A voucher in it");
 
     // Strip fields the client must not be able to overwrite directly.
     delete body._id;
@@ -4064,6 +4043,7 @@ router.put("/:id", auth, companyScope, async (req, res) => {
         error: "That voucher number is already in use by an active voucher.",
       });
     }
+    if (e && e.code === "FY_LOCKED") return res.status(423).json({ error: e.message, code: e.code, period: e.period });
     res.status(400).json({ error: e.message });
   }
 });

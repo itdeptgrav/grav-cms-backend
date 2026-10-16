@@ -895,6 +895,64 @@ router.post(
 );
 
 // ═════════════════════════════════════════════════════════════════════════════
+// GET /shelf-history?locationId=&code=  — the store map's "+ Add" history
+// ═════════════════════════════════════════════════════════════════════════════
+/* THE STORE MAP'S ADD-STOCK HISTORY (14 Oct 2026, owner: "a green dot on what
+   I already did, and in the popup the history — what it was, what changed,
+   what it is now").
+   The map's popup records an ordinary Credit / Debit through POST /issue with
+   the line note "Store map · <shelf code>" (it moves the in-stock quantity,
+   not the shelf). Lines recorded by its first version carried the shelf as a
+   location instead, so a manual adjustment whose location IS this shelf is
+   included too. Read-only: every figure is the movement's own before/after
+   (the variant's when the line names one). */
+const MAP_MARK = "Store map ·";
+const MANUAL_TYPES = ["ADD", "REDUCE", "VARIANT_ADD", "VARIANT_REDUCE"];
+router.get("/shelf-history", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const lid = objectId(req.query.locationId);
+    const code = String(req.query.code || "").trim();
+    if (!lid && !code) return res.status(400).json({ success: false, message: "Name the shelf (locationId or code)." });
+    const marker = code ? `${MAP_MARK} ${code}` : "";
+    const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const or = [];
+    if (marker) or.push({ notes: { $regex: esc(marker) } });
+    if (lid) or.push({ locationId: lid });
+    const items = await RawItem.find(scoped(req, { stockTransactions: { $elemMatch: { type: { $in: MANUAL_TYPES }, $or: or } } }))
+      .select("name sku unit customUnit variants._id variants.combination stockTransactions")
+      .lean();
+    const lines = [];
+    for (const it of items) {
+      const unit = it.customUnit || it.unit || "";
+      for (const tx of it.stockTransactions || []) {
+        if (!MANUAL_TYPES.includes(tx.type) || isAutomatic(tx)) continue;
+        const fromMap = Boolean(marker) && String(tx.notes || "").split(" | ").map((s) => s.trim()).includes(marker);
+        const onShelf = Boolean(lid) && tx.locationId && String(tx.locationId) === String(lid);
+        if (!fromMap && !onShelf) continue;
+        const v = tx.variantId ? (it.variants || []).find((x) => String(x._id) === String(tx.variantId)) : null;
+        const useVariant = tx.variantId && tx.variantPreviousQuantity != null;
+        lines.push({
+          id: String(tx._id), rawItemId: String(it._id), name: it.name, sku: it.sku || "",
+          variantId: tx.variantId ? String(tx.variantId) : null,
+          variant: (v?.combination || tx.variantCombination || []).join(" · "),
+          unit, direction: ["ADD", "VARIANT_ADD"].includes(tx.type) ? "credit" : "debit",
+          quantity: round4(tx.quantity),
+          before: round4(useVariant ? tx.variantPreviousQuantity : tx.previousQuantity),
+          after: round4(useVariant ? tx.variantNewQuantity : tx.newQuantity),
+          reason: tx.reason || "", by: tx.performedByName || "", at: tx.createdAt || null,
+          fromMap, movedShelf: Boolean(onShelf),
+        });
+      }
+    }
+    lines.sort((a, b) => new Date(a.at) - new Date(b.at));
+    return res.json({ success: true, lines });
+  } catch (err) {
+    console.error("shelf-history error:", err);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
 // GET /by-mo  — issuance records paginated
 // ═════════════════════════════════════════════════════════════════════════════
 router.get("/by-mo", requireCapability(CAPABILITIES.READ), async (req, res) => {

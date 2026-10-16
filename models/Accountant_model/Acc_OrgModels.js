@@ -426,6 +426,9 @@ const Acc_Invite =
   mongoose.models.Acc_Invite ||
   mongoose.model("Acc_Invite", accountantInviteSchema);
 
+/* a request about a voucher in a locked period is refused when raised (16 Oct 2026) */
+approvalRequestSchema.plugin((schema) => require("../../services/accounting/fyLock").approvalRequestGuard(schema));
+
 const Acc_ApprovalRequest =
   mongoose.models.Acc_ApprovalRequest ||
   mongoose.model("Acc_ApprovalRequest", approvalRequestSchema);
