@@ -3,7 +3,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
-  LiveKitBrowserCall, dialFailureState, outboundNumber, participantAlreadyGone, sipState,
+  LiveKitBrowserCall, dialFailureState, outboundNumber, participantAlreadyGone, sipAttribute, sipState,
 } = require("./livekitBrowserCall");
 
 test("SIP call states map onto the GRAV lifecycle", () => {
@@ -272,4 +272,28 @@ test("completed LiveKit recording exposes only its controlled storage key", asyn
     size: 1234,
     error: null,
   });
+});
+
+test("SIP attributes are read whether the SDK keeps or camel-cases their keys", async () => {
+  // livekit-server-sdk 2.15 returns "sipCallStatus"; 2.19 returns "sip.callStatus".
+  assert.equal(sipAttribute({ "sip.callStatus": "active" }, "sip.callStatus"), "active");
+  assert.equal(sipAttribute({ sipCallStatus: "active" }, "sip.callStatus"), "active");
+  assert.equal(sipAttribute({ sipCallId: "SCL_1" }, "sip.callID"), "SCL_1");
+  assert.equal(sipAttribute(undefined, "sip.phoneNumber"), null);
+
+  const service = new LiveKitBrowserCall({
+    url: "wss://rtc.grav.in", apiKey: "key", apiSecret: "secret", businessNumber: "+918065395337",
+    roomClientFactory: () => ({
+      listParticipants: async () => [{
+        identity: "sip_+919999900002", kind: 3, name: "Phone +919999900002",
+        attributes: { sipCallStatus: "active", sipCallId: "SCL_in", sipPhoneNumber: "+919999900002", sipTrunkPhoneNumber: "+918065395337" },
+      }],
+    }),
+  });
+  const caller = await service.incomingCaller({ roomName: "grav-voice-in-x" });
+  assert.equal(caller.callerPhone, "+919999900002");
+  assert.equal(caller.status, "IN_PROGRESS");
+  const status = await service.status({ roomName: "grav-voice-in-x", participantIdentity: "sip_+919999900002" });
+  assert.equal(status.status, "IN_PROGRESS");
+  assert.equal(status.sipCallId, "SCL_in");
 });

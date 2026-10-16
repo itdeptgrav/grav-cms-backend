@@ -36,6 +36,30 @@ newest-first (10 Aug, 03 Aug, 25 Jul…), `/production-record` lands on the
 Overview, tracker More menu without Ops QR. Known, pre-existing, not changed:
 the offline QC route's own parser reads only the 8-hex barcode form.
 
+# GRAV Voice: SIP call attributes read under livekit-server-sdk 2.15 (15 Oct 2026)
+
+**Not committed.** livekit-server-sdk 2.15 (this backend's version) camel-cases
+the keys of participant attributes: `sip.callStatus` arrives as `sipCallStatus`.
+So `LiveKitBrowserCall.status()` never saw "active", and `incomingCaller()` fell
+back to the participant's display name for the caller's number. This happens on
+LiveKit Cloud today. It is the real cause behind the "attributes arrive later"
+note in `grav-voice-per-user-lines-and-inbound-ringing.md`.
+
+- `sipAttribute()` in `services/telephony/livekitBrowserCall.js` reads both
+  spellings. It is used everywhere the class reads `sip.callStatus`,
+  `sip.callID`, `sip.phoneNumber` and `sip.trunkPhoneNumber`. Nothing else
+  changed.
+- Upgrading the SDK (2.19 keeps the dotted keys) is the longer-term fix.
+- Recordings still upload to Cloud Storage exactly as before (owner's decision:
+  keep them there for now).
+- Context: the owner is moving LiveKit Cloud to self-hosted LiveKit
+  ("GRAV Realtime", repo `sonu4435/grav-realtime`). CoWork and Voice switch by
+  environment variables only (`LIVEKIT_*`, `GRAV_VOICE_LIVEKIT_*`, trunk id).
+- Checked:
+  - Telephony tests 30/30 (1 new, for both spellings).
+  - The camel-cased keys were observed against a running self-hosted LiveKit
+    with SDK 2.15 and 2.19 side by side.
+
 ---
 
 # Cmd/Ctrl K: GRAV Music and desktop apps missing from Apps (10 Oct 2026)
