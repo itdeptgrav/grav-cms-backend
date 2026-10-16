@@ -156,4 +156,92 @@ async function applyLabelQuantityDelta({ session = null, barcode, from, to, acto
   }
 }
 
-module.exports = { applyLabelQuantityDelta, labelIsStock, notStockReason, REASON };
+/* ── THE LABEL'S VARIANT CORRECTED (16 Oct 2026, owner: "I just want to change
+   the product variant and the number") ────────────────────────────────────
+   A sticker printed for the wrong variant (Navy Blue for Black) is moved to a
+   variant ALREADY REGISTERED on the same raw item. With the stock box ticked
+   the goods follow the label: the label's OLD figure leaves the OLD variant
+   and its NEW figure lands on the NEW one — two ordinary stock rows, so the
+   item total moves by (to − from) and each variant by what it gained or lost.
+   The debit goes first and is guarded; if the credit then fails the debit is
+   put back, so a variant is never left short. The shelf the sticker sits on
+   follows the same way, best effort. Never throws — the block says what
+   happened, exactly like applyLabelQuantityDelta. */
+async function applyLabelVariantMove({ session = null, barcode, newVariant, from, to, actor, reason = "", editAt = new Date() }) {
+  const base = { applied: false, at: editAt, kind: "variant", delta: r4(Number(to) - Number(from)), unit: barcode?.unit || "" };
+  const refuse = (err) => ({ ...base, error: err.message, errorCode: err.code || "STOCK_MOVE_FAILED" });
+  try {
+    if (!labelIsStock(barcode)) return { ...base, skipped: true, error: notStockReason(barcode), errorCode: "NOT_STOCK" };
+    const q = RawItem.findById(barcode.rawItem).select(ITEM_SELECT);
+    const item = await (session ? q.session(session) : q);
+    if (!item) return { ...base, error: "The raw item behind this label is not on record (it may be in the trash), so its stock could not be moved.", errorCode: "ITEM_NOT_FOUND" };
+    const oldId = barcode.variantId && (item.variants || []).some((v) => String(v._id) === String(barcode.variantId)) ? barcode.variantId : null;
+    if (barcode.variantId && !oldId) return { ...base, error: "The label's old variant is no longer on the raw item, so its stock could not be moved.", errorCode: "VARIANT_NOT_FOUND" };
+    const newId = newVariant._id;
+
+    const outQ = await toBaseQuantity({ quantity: Math.abs(Number(from)), labelUnit: barcode.unit, item, session });
+    const inQ = await toBaseQuantity({ quantity: Math.abs(Number(to)), labelUnit: barcode.unit, item, session });
+    const oldName = (barcode.variantCombination || []).join(" · ") || "no variant";
+    const newName = (newVariant.combination || []).join(" · ");
+    const notes = (dir) => [
+      `Label: ${String(barcode._id)}`,
+      `Variant ${oldName} → ${newName}`,
+      `${r4(from)} → ${r4(to)} ${barcode.unit || ""}`.trim(),
+      reason ? `Reason: ${reason}` : "",
+      dir,
+      "Inventory › Label quantity",
+    ].filter(Boolean).join(" | ");
+    const tx = (combination, dir) => ({ reason: REASON, notes: notes(dir), ...actorOf(actor), variantCombination: combination || [] });
+
+    const out = await moveItem({ session, rawItemId: item._id, variantId: oldId, delta: -outQ.quantity, tx: tx(barcode.variantCombination, "off the old variant") });
+    let inn;
+    try {
+      inn = await moveItem({ session, rawItemId: item._id, variantId: newId, delta: inQ.quantity, tx: tx(newVariant.combination, "onto the new variant") });
+    } catch (err) {
+      await moveItem({ session, rawItemId: item._id, variantId: oldId, delta: outQ.quantity, tx: tx(barcode.variantCombination, "put back — the new variant could not take it") }).catch(() => {});
+      throw err;
+    }
+
+    /* the shelf, best effort: off under the old variant, on under the new */
+    let location = null;
+    const companyId = barcode.companyId || item.companyId || null;
+    const shelf = await shelfOfLabel(companyId, barcode);
+    if (shelf) {
+      try {
+        const common = {
+          companyId, siteId: null, item, warehouse: shelf.warehouse, location: shelf.location,
+          actor: { id: actor?.id, name: actor?.name || actor?.email || "Store" },
+          note: `${REASON} · variant ${oldName} → ${newName}${reason ? ` · ${reason}` : ""}`,
+          source: { kind: "label_quantity_edit", id: barcode._id, reference: String(barcode._id) },
+          barcodeId: barcode._id, barcodeLabel: `${r4(to)} ${barcode.unit || ""}`.trim(),
+          type: "adjustment",
+        };
+        const outVar = await locStock.locationVariantFor(session, companyId, item, oldId, shelf.warehouse._id, shelf.location._id);
+        const off = await locStock.applyLocationOut(session, { ...common, variantId: outVar, quantity: r4(Math.min(outQ.quantity, shelf.onHand)), idempotencyKey: `label-var-out:${String(barcode._id)}:${new Date(editAt).getTime()}` });
+        if (off?.ok) {
+          const inVar = await locStock.locationVariantFor(session, companyId, item, newId, shelf.warehouse._id, shelf.location._id);
+          const on = await locStock.applyLocationIn(session, { ...common, variantId: inVar, quantity: inQ.quantity, intent: "receive", idempotencyKey: `label-var-in:${String(barcode._id)}:${new Date(editAt).getTime()}` });
+          if (on?.ok) location = { warehouseId: shelf.warehouse._id, locationId: shelf.location._id, locationCode: shelf.location.code || "" };
+          else console.warn("[label variant stock] shelf movement in refused:", on?.reason);
+        } else console.warn("[label variant stock] shelf movement out refused:", off?.reason);
+      } catch (err) { console.warn("[label variant stock] shelf movement failed:", err.message); }
+    }
+
+    return {
+      applied: true, kind: "variant", at: editAt, delta: base.delta, unit: barcode.unit || "",
+      baseDelta: r4(inQ.quantity - outQ.quantity), baseUnit: inQ.unit,
+      rawItemId: item._id,
+      fromVariant: { variantId: oldId, combination: barcode.variantCombination || [], out: outQ.quantity, newQuantity: out.variantNew },
+      toVariant: { variantId: newId, combination: newVariant.combination || [], in: inQ.quantity, newQuantity: inn.variantNew },
+      previousQuantity: out.prevTotal, newQuantity: inn.newTotal,
+      transactionIds: [out.txnId, inn.txnId],
+      location, error: "", errorCode: "",
+    };
+  } catch (err) {
+    if (err?.code === "INSUFFICIENT_STOCK") err.message = "The old variant's balance does not cover the label's figure — the stock may already have been issued. The label's variant was changed; the stock was not.";
+    console.warn("[label variant stock] not applied:", err.message);
+    return refuse(err);
+  }
+}
+
+module.exports = { applyLabelQuantityDelta, applyLabelVariantMove, labelIsStock, notStockReason, REASON };

@@ -488,7 +488,16 @@ router.get("/summary", async (req, res) => {
    services/inventory/labelQuantityStock.service.js, with a ledger row
    "Label quantity corrected". The label is written FIRST and keeps its
    corrected figure even when the stock cannot move; the answer's
-   `stockAdjustment` block says what happened, and it is written on the edit. */
+   `stockAdjustment` block says what happened, and it is written on the edit.
+
+   VARIANT (16 Oct 2026, owner: "I just want to change the product variant and
+   the number"): an optional `variantId` — a variant ALREADY REGISTERED on the
+   label's raw item. When it differs from the label's, the label is moved to it
+   (variantId, variantCombination, variantSku) in the same write as the figure,
+   the edit records `variantFrom` / `variantTo`, and with `adjustStock` the
+   goods follow (labelQuantityStock.applyLabelVariantMove: the old figure off
+   the old variant, the new figure onto the new one). Without `variantId`, or
+   with the label's own, nothing here behaves differently from before. */
 router.patch("/:id/quantity", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -510,19 +519,42 @@ router.patch("/:id/quantity", async (req, res) => {
     const to = Math.round(quantity * 10000) / 10000;
     const from = Number.isFinite(Number(label.quantity)) ? Number(label.quantity) : null;
     const adjustStock = req.body?.adjustStock === undefined ? true : req.body.adjustStock === true || req.body.adjustStock === "true";
+
+    /* the variant, when one is asked for and it is not the label's own */
+    let newVariant = null;
+    const askedVariant = req.body?.variantId ? String(req.body.variantId) : "";
+    if (askedVariant && askedVariant !== String(label.variantId || "")) {
+      if (!mongoose.Types.ObjectId.isValid(askedVariant)) {
+        return res.status(400).json({ success: false, code: "VARIANT_INVALID", message: "That variant id is not valid." });
+      }
+      const item = await RawItem.findById(label.rawItem).select("name variants._id variants.combination variants.sku").lean();
+      newVariant = (item?.variants || []).find((v) => String(v._id) === askedVariant) || null;
+      if (!newVariant) {
+        return res.status(400).json({ success: false, code: "VARIANT_NOT_ON_ITEM", message: `That variant is not registered on ${label.rawItemName || "this raw item"}. Pick one of its own variants.` });
+      }
+    }
+    const variantFrom = newVariant ? { variantId: label.variantId || null, combination: label.variantCombination || [] } : null;
+    const variantTo = newVariant ? { variantId: newVariant._id, combination: newVariant.combination || [] } : null;
     const edit = {
       from, to, unit: String(label.unit || ""), reason,
       by: mongoose.Types.ObjectId.isValid(req.user?.id) ? new mongoose.Types.ObjectId(req.user.id) : null,
       byName: String(req.user?.name || req.user?.email || ""),
       at: new Date(),
       stock: null,
+      variantFrom, variantTo,
     };
-    if (from === to) {
+    if (from === to && !newVariant) {
       return res.json({ success: true, unchanged: true, message: `The label already says ${to} ${label.unit || ""}.`.trim(), label: { _id: String(label._id), quantity: to, unit: label.unit, quantityEdits: label.quantityEdits || [] } });
     }
     const r = await Barcode.updateOne(
-      { _id: label._id, quantity: label.quantity, voidedAt: null },
-      { $set: { quantity: to, quantityMeasured: true }, $push: { quantityEdits: edit } },
+      { _id: label._id, quantity: label.quantity, voidedAt: null, ...(newVariant ? { variantId: label.variantId || null } : {}) },
+      {
+        $set: {
+          quantity: to, quantityMeasured: true,
+          ...(newVariant ? { variantId: newVariant._id, variantCombination: newVariant.combination || [], variantSku: newVariant.sku || "" } : {}),
+        },
+        $push: { quantityEdits: edit },
+      },
     );
     if (r.modifiedCount !== 1) {
       return res.status(409).json({ success: false, code: "LABEL_CHANGED", message: "That label changed a moment ago. Scan it again to see what it says now." });
@@ -531,27 +563,29 @@ router.patch("/:id/quantity", async (req, res) => {
     /* the stock in hand, when asked — after the label, written on the edit */
     let stockAdjustment = null;
     if (adjustStock && from !== null) {
-      const { applyLabelQuantityDelta } = require("../../../../services/inventory/labelQuantityStock.service");
-      stockAdjustment = await applyLabelQuantityDelta({
-        barcode: label, from, to, reason, editAt: edit.at,
-        actor: { id: req.user?.id, name: req.user?.name, email: req.user?.email },
-      });
+      const { applyLabelQuantityDelta, applyLabelVariantMove } = require("../../../../services/inventory/labelQuantityStock.service");
+      const actor = { id: req.user?.id, name: req.user?.name, email: req.user?.email };
+      stockAdjustment = newVariant
+        ? await applyLabelVariantMove({ barcode: label, newVariant, from, to, reason, editAt: edit.at, actor })
+        : await applyLabelQuantityDelta({ barcode: label, from, to, reason, editAt: edit.at, actor });
       edit.stock = stockAdjustment;
       await Barcode.updateOne({ _id: label._id, "quantityEdits.at": edit.at }, { $set: { "quantityEdits.$.stock": stockAdjustment } });
     }
     const stockLine = !stockAdjustment ? "Stock was not touched."
+      : stockAdjustment.applied && stockAdjustment.kind === "variant" ? `Stock moved: −${stockAdjustment.fromVariant.out} off ${(stockAdjustment.fromVariant.combination || []).join(" · ") || "no variant"}, +${stockAdjustment.toVariant.in} onto ${(stockAdjustment.toVariant.combination || []).join(" · ")}.`
       : stockAdjustment.applied ? `Stock moved ${stockAdjustment.baseDelta > 0 ? "+" : "−"}${Math.abs(stockAdjustment.baseDelta)} ${stockAdjustment.baseUnit || ""} (now ${stockAdjustment.newQuantity}).`.replace(/\s+\(/, " (")
       : stockAdjustment.skipped ? `Stock not moved: ${stockAdjustment.error}`
       : `Stock was NOT moved: ${stockAdjustment.error}`;
 
-    const after = await Barcode.findById(label._id).select("quantity unit quantityEdits rawItemName variantCombination rawItemSku").lean();
+    const after = await Barcode.findById(label._id).select("quantity unit quantityEdits rawItemName variantId variantCombination rawItemSku").lean();
+    const variantLine = newVariant ? `Variant ${(variantFrom.combination || []).join(" · ") || "none"} → ${(variantTo.combination || []).join(" · ")}. ` : "";
     return res.json({
       success: true,
-      message: `Label now says ${to} ${label.unit || ""}${from !== null ? ` (was ${from})` : ""}. ${stockLine}`.replace(/\s+/g, " ").trim(),
+      message: `${variantLine}Label now says ${to} ${label.unit || ""}${from !== null ? ` (was ${from})` : ""}. ${stockLine}`.replace(/\s+/g, " ").trim(),
       edit,
       stockAdjustment,
       warnings: stockAdjustment && !stockAdjustment.applied && !stockAdjustment.skipped ? [stockAdjustment.error] : [],
-      label: { _id: String(after._id), quantity: after.quantity, unit: after.unit, quantityEdits: after.quantityEdits || [], rawItemName: after.rawItemName, variantCombination: after.variantCombination, rawItemSku: after.rawItemSku },
+      label: { _id: String(after._id), quantity: after.quantity, unit: after.unit, quantityEdits: after.quantityEdits || [], rawItemName: after.rawItemName, variantId: after.variantId || null, variantCombination: after.variantCombination, rawItemSku: after.rawItemSku },
     });
   } catch (error) {
     console.error("Error changing a label's quantity:", error);
