@@ -18,7 +18,7 @@
 // through an `f_jpg/` transformation for exactly that reason.
 "use strict";
 
-const PDFDocument = require("pdfkit");
+/* pdfkit is required where it is used, not here: loading it at the top made every server start pay for it. */
 
 const StoreSettings = require("../models/CMS_Models/Inventory/Operations/StoreSettings");
 const StockItem = require("../models/CMS_Models/Inventory/Products/StockItem");
@@ -206,6 +206,7 @@ async function buildManufacturingOrderPdf(request, workOrders = [], opts = {}) {
     }),
   );
 
+  const PDFDocument = require("pdfkit");
   const doc = new PDFDocument({ size: "A4", margin: MARGIN, info: {
     Title: `Manufacturing Order MO-${request.requestId}`,
     Author: "GRAV Clothing",

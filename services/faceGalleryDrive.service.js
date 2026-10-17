@@ -42,7 +42,7 @@
  *   FACE_DRIVE_BACKUP=0               turn the mirror off entirely
  */
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 const FOLDER_NAME = "Face Registrations";

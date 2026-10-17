@@ -10,16 +10,11 @@
  *   GOOGLE_DRIVE_FOLDER_ID       ← optional, folder ID from Drive URL
  */
 
-const cloudinary = require("cloudinary").v2;
-const { google } = require("googleapis");
+// Loaded and configured from the environment on first use — see utils/lazyCloudinary.
+const { cloudinary } = require("../utils/lazyCloudinary");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
-// ── Cloudinary config ─────────────────────────────────────
-cloudinary.config({
-    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
-    api_secret: process.env.CLOUDINARY_API_SECRET,
-});
 
 // ── Service Account auth (never expires) ─────────────────
 function getServiceAccountAuth() {

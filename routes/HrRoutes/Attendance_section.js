@@ -3,7 +3,7 @@ const express = require("express");
 const axios = require("axios");
 const cron = require("node-cron");
 const router = express.Router();
-const ExcelJS = require("exceljs");
+/* exceljs is required where it is used, not here: loading it at the top made every server start pay for it. */
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 
 /* What an attendance read needs from an employee record — and, more to the
@@ -6023,6 +6023,7 @@ router.get("/export-daily", EmployeeAuthMiddlewear, async (req, res) => {
         showed = expected - c.absent;
       return expected > 0 ? Math.round((showed / expected) * 100) : 100;
     };
+    const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
     wb.creator = "Grav Clothing HRMS";
     const ws = wb.addWorksheet("Daily Manpower", {
@@ -7320,6 +7321,7 @@ router.get("/export-muster-roll", EmployeeAuthMiddlewear, async (req, res) => {
         return (a.department || "").localeCompare(b.department || "");
       return (a.employeeName || "").localeCompare(b.employeeName || "");
     });
+    const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
     wb.creator = "Grav Clothing HRMS";
     wb.created = new Date();

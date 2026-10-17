@@ -2687,7 +2687,9 @@ function labelMove(barcode, { lineQty, lineUnit, baseQty, baseUnit, direction })
 async function applyLabelMove(label, session) {
   if (!label || label.unchanged || !label.delta) return null;
   const guard = label.delta < 0 ? { quantity: { $gte: -label.delta - 1e-6 } } : {};
-  const moved = await Barcode.findOneAndUpdate({ _id: label.barcodeId, ...guard }, { $inc: { quantity: label.delta } }, { new: true, session: session || null });
+  /* the issue is kept ON the label, so whoever receives it can read what went out */
+  const issue = label.mrf ? { $push: { issues: { ...label.mrf, quantity: -label.delta, unit: label.unit, at: new Date() } } } : {};
+  const moved = await Barcode.findOneAndUpdate({ _id: label.barcodeId, ...guard }, { $inc: { quantity: label.delta }, ...issue }, { new: true, session: session || null });
   if (!moved) throw fail("VALIDATION", `The scanned label no longer holds ${-label.delta} ${label.unit} — it changed while this was being recorded.`, { reason: "EXCEEDS_LABEL", barcodeId: String(label.barcodeId) });
   return { barcodeId: String(label.barcodeId), before: Math.round((moved.quantity - label.delta) * 10000) / 10000, after: moved.quantity, unit: label.unit };
 }
@@ -2705,6 +2707,7 @@ async function applyIssue({ mrf, planned, actorId, actorName: performedByName = 
     /* the scanned label's own figure moves with the line (pre-checked here,
        so an over-issue off a label refuses before anything is applied) */
     const labelPlan = labelMove(label, { lineQty: issuedQty, lineUnit: mrfItem.unit, baseQty: deductQty, baseUnit: mrfItem.baseUnit, direction: "out" });
+    if (labelPlan) labelPlan.mrf = { mrfId: mrf._id, mrfNumber: mrf.mrfNumber || "", mrfItemId: mrfItem._id, requestedForDept: mrf.requestedForDept || "" };
 
     /* Warehouse Stock V1: when a source location was chosen, the issue also
        writes a location-OUT movement — sharing ONE source identity with the
@@ -3149,6 +3152,7 @@ router.post(
        figure goes back UP with the return (2 Oct 2026) */
     const returnLabel = await resolveLineLabel(req, mrfItem, req.body?.barcodeId);
     const returnLabelPlan = labelMove(returnLabel, { lineQty: qty, lineUnit: mrfItem.unit, baseQty: creditQty, baseUnit: mrfItem.baseUnit, direction: "in" });
+    if (returnLabelPlan) returnLabelPlan.mrf = { mrfId: mrf._id, mrfNumber: mrf.mrfNumber || "", mrfItemId: mrfItem._id, requestedForDept: mrf.requestedForDept || "" };
     const who = actorName(req);
     const mrfItemId = String(mrfItem._id);
     const returnedAt = new Date();

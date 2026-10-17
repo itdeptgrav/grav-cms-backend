@@ -243,9 +243,12 @@ router.get("/verify", async (req, res) => {
     return res.status(200).json({ success: true, data: responseData });
   } catch (error) {
     console.error("Verify error:", error.message);
+    /* Only a bad or expired token is a 401: the app signs people out on it.
+       A database hiccup is the server's problem, not the session's. */
+    const tokenFault = ["JsonWebTokenError", "TokenExpiredError", "NotBeforeError"].includes(error.name);
     return res
-      .status(401)
-      .json({ success: false, message: "Invalid or expired token" });
+      .status(tokenFault ? 401 : 500)
+      .json({ success: false, message: tokenFault ? "Invalid or expired token" : "Could not check the session right now" });
   }
 });
 
@@ -328,7 +331,7 @@ router.post("/change-password", async (req, res) => {
     }
     if (!isValid)
       return res
-        .status(401)
+        .status(400)
         .json({ success: false, message: "Current password is incorrect" });
 
     /* Plain text: the Employee pre-save hook hashes it. Hashing here as well

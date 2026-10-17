@@ -34,7 +34,7 @@
 // including the result rows themselves, in well under a second.
 "use strict";
 
-const ExcelJS = require("exceljs");
+/* exceljs is required where it is used, not here: loading it at the top made every server start pay for it. */
 const semantics = require("./semantics");
 
 /* ─────────────────────────────────────────────────────────────────────────── */
@@ -260,6 +260,7 @@ async function writeWorkbook({ layout, rows, stream, sheetName }) {
   const columns = exportColumns(layout);
   const widths = columnWidths(columns, rows);
 
+  const ExcelJS = require("exceljs");
   const workbook = new ExcelJS.stream.xlsx.WorkbookWriter({
     stream,
     useStyles: true,

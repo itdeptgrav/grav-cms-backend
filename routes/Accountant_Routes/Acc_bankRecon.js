@@ -22,7 +22,6 @@ const express = require("express");
 const { liveBalances, liveBalanceOf, openingSigned } = require("../../services/accounting/ledgerBalance");
 const mongoose = require("mongoose");
 const multer = require("multer");
-const XLSX = require("xlsx");
 /* The statement reader (Indian Bank, HDFC, SBI, ICICI…) — services/accounting/bankStatementParser.js. */
 const { parseBankStatement } = require("../../services/accounting/bankStatementParser");
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");

@@ -22,7 +22,7 @@
 // writing into the other's folder.
 "use strict";
 
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 const FOLDER_NAME = "Maintenance";

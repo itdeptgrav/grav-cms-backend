@@ -61,6 +61,18 @@ function inFeet(l = {}) {
   };
 }
 
+/* SIZES THAT ARE NOT XS…3XL (17 Oct 2026, owner — a shirt in size 30 opened
+   on an empty sheet): any other size a lay is typed with is kept in
+   `ratioExtra` ({ "30": 3 }) and counts in garments a ply and pieces cut like
+   a column size. A size is a short label; "." and "$" cannot be keys. */
+const extraKey = (k) => String(k || "").trim().replace(/[.$]/g, "-").slice(0, 12);
+/** A lay's sizes outside the log-book columns, { size: garments a ply }. */
+function extrasOf(l = {}) {
+  const out = {};
+  for (const [k, v] of Object.entries(l.ratioExtra || {})) { const n = Number(v) || 0; if (n > 0) out[k] = n; }
+  return out;
+}
+
 /** A lay as typed → the stored shape, or { error } naming the first problem. */
 function normaliseLay(input = {}) {
   const ratio = {};
@@ -69,13 +81,21 @@ function normaliseLay(input = {}) {
     if (n !== null && (n < 0 || !Number.isInteger(n))) return { error: `Size ${s}: the ratio is a whole number of garments, 0 or more.` };
     ratio[s] = n || 0;
   }
+  const ratioExtra = {};
+  for (const [k, v] of [...Object.entries(input.ratio || {}), ...Object.entries(input.ratioExtra || {})]) {
+    if (SIZES.includes(k)) continue;
+    const key = extraKey(k); const n = num(v);
+    if (!key || n === null) continue;
+    if (n < 0 || !Number.isInteger(n)) return { error: `Size ${key}: the ratio is a whole number of garments, 0 or more.` };
+    if (n > 0) ratioExtra[key] = n;
+  }
   const date = input.date ? new Date(input.date) : null;
   if (!date || Number.isNaN(date.getTime())) return { error: "Give the lay's date." };
   const styleNo = str(input.styleNo);
   if (!styleNo) return { error: "Give the style number." };
   const plies = num(input.plies);
   if (plies === null || plies <= 0 || !Number.isInteger(plies)) return { error: "No. of plies must be a whole number above 0." };
-  if (!SIZES.some((s) => ratio[s] > 0)) return { error: "Give the size ratio — how many garments of each size the marker holds." };
+  if (!SIZES.some((s) => ratio[s] > 0) && !Object.keys(ratioExtra).length) return { error: "Give the size ratio — how many garments of each size the marker holds." };
   const markerLength = num(input.markerLength);
   const markerUnit = input.markerUnit === "ft" ? "ft" : "m";
   if (markerLength === null || markerLength <= 0) return { error: `Marker length (${markerUnit === "ft" ? "ft" : "m"}) must be above 0.` };
@@ -109,6 +129,7 @@ function normaliseLay(input = {}) {
       markerUnit,
       markerEff: markerEff === null ? null : round(markerEff),
       ratio,
+      ratioExtra,
       plies,
       fabricIssued: fabricIssued === null ? null : round(fabricIssued),
       fabricReturned: fabricReturned === null ? null : round(fabricReturned),
@@ -121,7 +142,7 @@ function normaliseLay(input = {}) {
 /** The log book's worked-out columns for one lay. Blank where the workbook leaves them blank. */
 function computeLay(l = {}) {
   const ratio = l.ratio || {};
-  const garmentsPerPly = SIZES.reduce((n, s) => n + (Number(ratio[s]) || 0), 0);
+  const garmentsPerPly = SIZES.reduce((n, s) => n + (Number(ratio[s]) || 0), 0) + Object.values(extrasOf(l)).reduce((a, b) => a + b, 0);
   const plies = num(l.plies) || 0;
   const pcsCut = garmentsPerPly * plies;
   const issued = num(l.fabricIssued);
@@ -166,6 +187,9 @@ function summarize(lays = []) {
   const pcsWithFabric = rows.filter((r) => r.fabricConsumed !== null).reduce((n, r) => n + r.pcsCut, 0);
   const sizeWise = {};
   for (const s of SIZES) sizeWise[s] = rows.reduce((n, r) => n + (Number(r.ratio?.[s]) || 0) * (Number(r.plies) || 0), 0);
+  /* the other sizes, beside the columns */
+  const sizeWiseExtra = {};
+  for (const r of rows) for (const [k, v] of Object.entries(extrasOf(r))) sizeWiseExtra[k] = (sizeWiseExtra[k] || 0) + v * (Number(r.plies) || 0);
   return {
     lays: rows.length,
     totalPlies: sum("plies"),
@@ -179,7 +203,8 @@ function summarize(lays = []) {
     avgCons: consumed === null || !pcsWithFabric ? null : round(consumed / pcsWithFabric, 6),
     flaggedLays: rows.filter((r) => r.status && r.status !== "OK").length,
     sizeWise,
-    sizeTotal: SIZES.reduce((n, s) => n + sizeWise[s], 0),
+    sizeWiseExtra,
+    sizeTotal: SIZES.reduce((n, s) => n + sizeWise[s], 0) + Object.values(sizeWiseExtra).reduce((a, b) => a + b, 0),
   };
 }
 
@@ -234,4 +259,4 @@ function normaliseHeader(input = {}) {
   };
 }
 
-module.exports = { SIZES, STATUS_TOLERANCE, FOOT_M, normaliseLay, normaliseHeader, computeLay, summarize, seasonDay, seasonName, dayFrom, inFeet, markerLengthM };
+module.exports = { extrasOf, SIZES, STATUS_TOLERANCE, FOOT_M, normaliseLay, normaliseHeader, computeLay, summarize, seasonDay, seasonName, dayFrom, inFeet, markerLengthM };

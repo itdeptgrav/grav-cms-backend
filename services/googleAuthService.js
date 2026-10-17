@@ -1,5 +1,5 @@
 // GRAV-CMS-BACKEND/services/googleAuthService.js
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 
 function getOAuth2Client() {
     const client = new google.auth.OAuth2(

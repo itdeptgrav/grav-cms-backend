@@ -31,7 +31,7 @@
  *   GOOGLE_DRIVE_LETTERS_FOLDER_ID      optional: pin the letters folder
  */
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 // ── Service-account auth (never expires) ─────────────────────────────────────

@@ -24,7 +24,7 @@
 
 "use strict";
 
-const { Pool } = require("pg");
+/* pg is required where it is used, not here: loading it at the top made every server start pay for it. */
 
 /** host/database only — never the credentials. Safe to print and to log. */
 function describeTarget(url) {
@@ -79,6 +79,7 @@ function pool(kind) {
   const url = process.env[VARIABLES[kind]];
   if (!url) throw new MissingReportingUrl(kind);
 
+  const { Pool } = require("pg");
   const p = new Pool({
     connectionString: url,
     // A migration or a full sync is one process doing one thing; a large pool

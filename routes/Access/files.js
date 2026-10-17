@@ -57,7 +57,8 @@ const multer = require("multer");
    workbooks — see routes/Accountant_Routes/Acc_bankRecon.js, the HR importer
    and services/tallyParser.service.js. It is also the only one of the two
    spreadsheet libraries here that reads legacy .xls, which exceljs cannot. */
-const XLSX = require("xlsx");
+/* Required on first use: loading xlsx at the top made every server start pay for it. */
+const xlsx = () => require("xlsx");
 
 const { verifyCmsToken, readToken } = require("../../config/jwt");
 const { Doc_File, kindOf, previewKindOf } = require("../../models/Files/Doc_File");
@@ -1250,7 +1251,7 @@ router.get("/:id/sheet", async (req, res) => {
 
     let wb;
     try {
-      wb = XLSX.read(
+      wb = xlsx().read(
         buf,
         isCsv
           ? {
@@ -1303,7 +1304,7 @@ router.get("/:id/sheet", async (req, res) => {
         return { name, rows: [], totalRows: 0, totalCols: 0, truncated: false };
       }
 
-      const range = XLSX.utils.decode_range(ref);
+      const range = xlsx().utils.decode_range(ref);
       const totalRows = range.e.r - range.s.r + 1;
       const totalCols = range.e.c - range.s.c + 1;
       const lastRow = Math.min(range.e.r, range.s.r + SHEET_MAX_ROWS - 1);
@@ -1313,7 +1314,7 @@ router.get("/:id/sheet", async (req, res) => {
       for (let r = range.s.r; r <= lastRow; r++) {
         const line = [];
         for (let c = range.s.c; c <= lastCol; c++) {
-          const cell = ws[XLSX.utils.encode_cell({ r, c })];
+          const cell = ws[xlsx().utils.encode_cell({ r, c })];
           /* `.w` is the formatted text the spreadsheet itself shows; `.v` is
              the underlying value, used only when there is no format. */
           line.push(cell ? String(cell.w ?? cell.v ?? "") : "");

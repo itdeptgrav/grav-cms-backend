@@ -101,6 +101,21 @@ const barcodeSchema = new mongoose.Schema(
        replaced and every change is kept here, oldest first — from, to, why,
        who, when. Stock is not moved by it; the label's figure is what the
        sticker says. */
+    /* WHAT WAS ISSUED OFF THIS LABEL (17 Oct 2026, owner). An MRF issue takes
+       the issued quantity off `quantity` (a roll issued whole reads 0), so the
+       department receiving it — Cutting scanning its fabric in — needs what
+       went OUT, not what is left. One entry per issue (+) or return (−), in
+       the label's unit. Written by mrfRoutes' applyLabelMove. */
+    issues: [{
+      _id: false,
+      mrfId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      mrfNumber: { type: String, trim: true, default: "" },
+      mrfItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+      requestedForDept: { type: String, trim: true, default: "" },
+      quantity: { type: Number, default: 0 },
+      unit: { type: String, trim: true, default: "" },
+      at: { type: Date, default: null },
+    }],
     quantityEdits: [{
       _id: false,
       from: { type: Number, default: null },

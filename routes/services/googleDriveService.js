@@ -1,5 +1,5 @@
 // GRAV-CMS-BACKEND/routes/services/googleDriveService.js
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { getOAuth2Client } = require("./googleAuthService");
 
 function getDriveClient() {

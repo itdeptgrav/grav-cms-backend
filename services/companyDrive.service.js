@@ -20,7 +20,7 @@
  * one of them silently starts writing into the other's folder.
  */
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 const FOLDER_NAME = process.env.GOOGLE_DRIVE_FILES_FOLDER_NAME || "Company Drive";

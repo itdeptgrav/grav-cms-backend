@@ -35,7 +35,7 @@
 
 const mongoose = require("mongoose");
 const zlib = require("zlib");
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 // EJSON (Extended JSON) preserves ObjectId/Date/Decimal128 exactly on restore.

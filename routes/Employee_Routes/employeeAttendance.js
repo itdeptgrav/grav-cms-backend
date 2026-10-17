@@ -56,6 +56,11 @@ const STATUS_META = {
   MP: { label: "Miss Punch", color: "orange" },
   WFH: { label: "Work From Home", color: "blue" },
   CO: { label: "Comp. Off", color: "violet" },
+  /* half-day leave (services/leaveDateMap.js): present half the day */
+  "P/CL": { label: "Half Day · Casual Leave", color: "indigo" },
+  "P/SL": { label: "Half Day · Sick Leave", color: "orange" },
+  "P/PL": { label: "Half Day · Privilege Leave", color: "purple" },
+  "P/LWP": { label: "Half Day · Unpaid", color: "red" },
 };
 
 // ─── Late-count promotion ─────────────────────────────────────────────────────
@@ -318,11 +323,34 @@ router.get("/monthly", AllEmployeeAppMiddleware, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 //  POST /sync-today
 // ═══════════════════════════════════════════════════════════════════════════════
+/* ONE SYNC AT A TIME (17 Oct 2026). Any employee may press "sync" in the
+   app, and each press started a full day sync for the whole company, so a
+   crowd pressing at shift start ran dozens at once. Now a press joins the sync
+   already running, or reuses one that finished in the last two minutes; the
+   answer is the same as before. */
+const SYNC_REUSE_MS = 2 * 60 * 1000;
+let syncInFlight = null;
+let lastSync = { at: 0, result: null };
+function sharedTodaySync(syncTodayOnly) {
+  if (syncInFlight) return syncInFlight;
+  if (Date.now() - lastSync.at < SYNC_REUSE_MS) return Promise.resolve(lastSync.result);
+  syncInFlight = Promise.resolve()
+    .then(() => syncTodayOnly())
+    .then((result) => {
+      lastSync = { at: Date.now(), result };
+      return result;
+    })
+    .finally(() => {
+      syncInFlight = null;
+    });
+  return syncInFlight;
+}
+
 router.post("/sync-today", AllEmployeeAppMiddleware, async (req, res) => {
   try {
     const { syncTodayOnly } = require("../HrRoutes/Attendance_section");
     if (typeof syncTodayOnly === "function") {
-      const result = await syncTodayOnly();
+      const result = await sharedTodaySync(syncTodayOnly);
       return res.json({
         success: true,
         message: result

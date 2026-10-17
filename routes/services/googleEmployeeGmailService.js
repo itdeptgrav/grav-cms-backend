@@ -2,7 +2,7 @@
 // Per-employee Gmail — each employee connects their own Google account.
 // Their refresh token is stored in Firestore cowork_employees/{empId}.gmailToken
 
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { db, admin } = require("../../config/firebaseAdmin");
 
 function buildOAuth2Client(gmailToken) {

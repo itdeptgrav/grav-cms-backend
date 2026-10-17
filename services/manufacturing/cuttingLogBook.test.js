@@ -71,3 +71,13 @@ test("an empty season summarises to zeros and blanks, never NaN", () => {
   assert.equal(s.avgCons, null);
   assert.equal(JSON.stringify(s).includes("NaN"), false);
 });
+
+test("a lay may carry sizes that are not columns; they count in garments a ply and pieces cut (17 Oct 2026)", () => {
+  const lb = require("./cuttingLogBook");
+  const { lay, error } = lb.normaliseLay({ date: "2026-10-17", styleNo: "S-1", markerLength: 10, markerUnit: "ft", plies: 2, ratio: { M: 1, "30": 3, "32.5": 1 } });
+  assert.equal(error, undefined);
+  assert.deepEqual(lay.ratioExtra, { 30: 3, "32-5": 1 });
+  assert.equal(lb.computeLay(lay).pcsCut, 10);
+  assert.equal(lb.summarize([lay]).sizeTotal, 10);
+  assert.equal(lb.normaliseLay({ date: "2026-10-17", styleNo: "S-1", markerLength: 10, plies: 1, ratio: { "30": 3 } }).error, undefined, "a lay of only such sizes is a lay");
+});

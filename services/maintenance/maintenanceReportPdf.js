@@ -29,7 +29,7 @@
 "use strict";
 
 const fs = require("fs");
-const PDFDocument = require("pdfkit");
+/* pdfkit is required where it is used, not here: loading it at the top made every server start pay for it. */
 
 const PAGE = { w: 595.28, h: 841.89 };
 const M = 44;
@@ -91,6 +91,7 @@ function pdfFileName(r) {
 function buildReportPdf(r, { company = "GRAV Clothing", images = { before: [], after: [] } } = {}) {
   const fonts = pickFonts();
   const T = (s) => safeText(s, fonts.unicode);
+  const PDFDocument = require("pdfkit");
   const doc = new PDFDocument({
     size: "A4", margins: { top: M, bottom: M + 24, left: M, right: M }, bufferPages: true,
     info: { Title: `Maintenance Report ${r.reportNumber}`, Subject: `${r.orderNumber} — ${r.subject?.name || r.title || ""}`, Author: company, Creator: "GRAV CMS · Maintenance", CreationDate: new Date(r.submittedAt || Date.now()) },

@@ -27,7 +27,7 @@ const path = require("path");
 const fs = require("fs");
 const os = require("os");
 const { Readable } = require("stream");
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { db, admin } = require("../../config/firebaseAdmin");
 const {
   verifyCoworkToken,

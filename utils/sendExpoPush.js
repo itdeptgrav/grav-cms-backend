@@ -20,10 +20,13 @@
 
 "use strict";
 
-const { Expo } = require("expo-server-sdk");
 const Employee = require("../models/Employee");
 
-const expo = new Expo();
+/* Built on first use: loading expo-server-sdk at the top made every server
+   start pay for it. */
+const Expo = () => require("expo-server-sdk").Expo;
+let expoClient = null;
+const expo = () => (expoClient ||= new (Expo())());
 
 // Lazy-load firebaseAdmin so this file works even before Firebase is configured
 let _messaging = null;
@@ -150,7 +153,7 @@ async function sendExpoPush(employeeIdOrIds, opts) {
 
       // ── Mobile push (Expo) ─────────────────────────────────────────
       if (emp.pushToken) {
-        if (!Expo.isExpoPushToken(emp.pushToken)) {
+        if (!Expo().isExpoPushToken(emp.pushToken)) {
           console.warn(
             `[SEND-PUSH] ⚠ Invalid Expo token for ${name} — cleaning`,
           );
@@ -169,7 +172,7 @@ async function sendExpoPush(employeeIdOrIds, opts) {
             ...(badge !== undefined ? { badge } : {}),
           };
           try {
-            const tickets = await expo.sendPushNotificationsAsync([message]);
+            const tickets = await expo().sendPushNotificationsAsync([message]);
             const ticket = tickets[0];
             if (ticket.status === "ok") {
               result.mobile.queued++;

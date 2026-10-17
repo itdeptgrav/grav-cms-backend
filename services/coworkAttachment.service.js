@@ -28,7 +28,7 @@
  *   GOOGLE_DRIVE_COWORK_FOLDER_ID       ← optional: pin the Cowork folder
  */
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 const { db } = require("../config/firebaseAdmin");
 const admin = require("firebase-admin");

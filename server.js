@@ -846,6 +846,24 @@ const firstConnection = new Promise((resolve) => {
   signalFirstConnection = resolve;
 });
 
+/* Development builds any index a schema declares that the database lacks —
+   what `autoIndex` used to do — but 20 s after boot, one model at a time, so
+   no request ever waits for it. Production does not (its indexes exist; a new
+   one is created by this in development, or by hand). Once per process. */
+let indexesQueued = false;
+function buildIndexesLater() {
+  if (indexesQueued || process.env.NODE_ENV === "production" || process.env.AUTO_INDEX === "1" || process.env.AUTO_INDEX === "0") return;
+  indexesQueued = true;
+  setTimeout(async () => {
+    let built = 0, failed = 0;
+    for (const name of mongoose.modelNames()) {
+      try { await mongoose.model(name).createIndexes(); built += 1; }
+      catch { failed += 1; }
+    }
+    console.log(`[indexes] checked ${built} models in the background${failed ? ` (${failed} could not — run with AUTO_INDEX=1 to see why)` : ""}`);
+  }, 20000).unref();
+}
+
 const connectDB = async (attempt = 1) => {
   try {
     await mongoose.connect(
@@ -860,9 +878,23 @@ const connectDB = async (attempt = 1) => {
            as "everything takes two minutes". The indexes already exist in
            production; a NEW index still gets created by the next dev boot
            against the same database, or by hand. */
-        autoIndex: process.env.NODE_ENV !== "production",
+        /* OFF everywhere since 17 Oct 2026 (owner: "when the server starts or
+           restarts in development it should start instantly"). Measured on a
+           dev restart: connected at 6 s, then the first query on each model
+           waited 4–8 s for its own index check (CuttingSeason 4.1 s,
+           WorkOrder 3.6 s, PpcOrderTarget 7.7 s) — ~20 s before a page
+           answered. New indexes are still built in development, but in the
+           BACKGROUND after boot (`buildIndexesLater` below), where no query
+           waits for them. AUTO_INDEX=1 restores the old blocking behaviour. */
+        autoIndex: process.env.AUTO_INDEX === "1",
+        /* Same reason: with it on, each model's first query waited for a
+           createCollection round trip (the first ~4 s after connecting). A
+           collection is created by its first write anyway; none of ours needs
+           creation options. */
+        autoCreate: process.env.AUTO_INDEX === "1",
       },
     );
+    buildIndexesLater();
     console.log(
       attempt === 1
         ? "✅ MongoDB connected successfully"
@@ -4046,16 +4078,48 @@ app.post("/api/cms/production/sync/manual", async (req, res) => {
 
    Pinned by test/production/s0-security-containment.test.js. */
 
-app.get("/api/app/version", (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
-      minVersion: process.env.APP_MIN_VERSION || "1.0.0",
-      updateUrl: "https://cms.grav.in/app/download",
-      message: "A new version of GRAV is available. Please update to continue.",
-    },
-  });
+/* THE EMPLOYEE APP'S SETTINGS, FROM THE SERVER (17 Oct 2026). Public (the
+   app reads it before sign-in), values from the developer side's live
+   settings ("Employee app" group, services/devConfig.js), live within 30 s.
+   /api/app/version stays for builds older than 2.0.1-vc66. */
+async function employeeAppConfig() {
+  const { getSetting } = require("./services/devConfig");
+  const read = async (k, d) => { try { return await getSetting(k); } catch (_) { return d; } };
+  let statusLabels = {};
+  try { statusLabels = JSON.parse((await read("app.statusLabels", "")) || "{}"); } catch (_) {}
+  return {
+    minVersion: await read("app.minVersion", "1.0.0"),
+    latestVersion: await read("app.latestVersion", "2.0.1"),
+    message: await read("app.updateMessage", "A new version of GRAV is available. Please update to continue."),
+    updateUrl: "https://play.google.com/store/apps/details?id=com.grav.crm",
+    requireUpdateSince: (await read("app.requireUpdateSince", "")) || null,
+    notice: (await read("app.notice", "")) || null,
+    noticeTone: await read("app.noticeTone", "info"),
+    hiddenWorkTiles: String(await read("app.hiddenWorkTiles", "")).split(",").map((x) => x.trim()).filter(Boolean),
+    statusLabels,
+    /* what still counts as open for the app's red dots; withdraw_pending is a
+       leave somebody asked to take back, still waiting on a manager */
+    openStatuses: ["pending", "manager_approved", "awaiting_hr", "requested", "withdraw_pending"],
+    badgeRefreshSeconds: await read("app.badgeRefreshSeconds", 90),
+    updateCheckMinutes: await read("app.updateCheckMinutes", 15),
+    serverTime: new Date().toISOString(),
+  };
+}
+app.get("/api/app/config", async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, data: await employeeAppConfig() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+app.get("/api/app/version", async (req, res) => {
+  try {
+    const c = await employeeAppConfig();
+    res.json({ success: true, data: { latestVersion: c.latestVersion, minVersion: c.minVersion, updateUrl: c.updateUrl, message: c.message } });
+  } catch (err) {
+    res.json({ success: true, data: { latestVersion: process.env.APP_LATEST_VERSION || "1.0.0", minVersion: process.env.APP_MIN_VERSION || "1.0.0", updateUrl: "https://cms.grav.in/app/download", message: "A new version of GRAV is available. Please update to continue." } });
+  }
 });
 
 if (!skipBackgroundJob("hourly attendance sync (eTimeOffice pull + write)")) {

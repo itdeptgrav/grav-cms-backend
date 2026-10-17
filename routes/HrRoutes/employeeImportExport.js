@@ -28,8 +28,9 @@ const router = express.Router();
 const multer = require("multer");
 // xlsx READS uploads well. It cannot WRITE styles — the community build drops
 // them silently — so anything this file produces goes through ExcelJS instead.
-const XLSX = require("xlsx");
-const ExcelJS = require("exceljs");
+/* Required on first use: loading xlsx at the top made every server start pay for it. */
+const xlsx = () => require("xlsx");
+/* exceljs is required where it is used, not here: loading it at the top made every server start pay for it. */
 const Employee = require("../../models/Employee");
 const {
   deriveConfirmationDate,
@@ -305,7 +306,7 @@ const parseDate = (val) => {
     if (!val) return undefined;
     if (val instanceof Date) return isNaN(val.getTime()) ? undefined : val;
     if (typeof val === "number") {
-        const p = XLSX.SSF.parse_date_code(val);
+        const p = xlsx().SSF.parse_date_code(val);
         return p ? new Date(p.y, p.m - 1, p.d) : undefined;
     }
     const s = String(val).trim();
@@ -493,7 +494,7 @@ const applyExtraField = (emp, meta, rawValue) => {
  */
 const findHeaderRow = (sheet) => {
     const known = new Set(Object.keys(HEADER_MAP).map(normalizeHeader));
-    const grid = XLSX.utils.sheet_to_json(sheet, {
+    const grid = xlsx().utils.sheet_to_json(sheet, {
         header: 1,
         raw: false,
         defval: "",
@@ -517,7 +518,7 @@ const findHeaderRow = (sheet) => {
 };
 
 const parseSheet = async (buffer) => {
-    const wb = XLSX.read(buffer, { type: "buffer", cellDates: true, raw: false });
+    const wb = xlsx().read(buffer, { type: "buffer", cellDates: true, raw: false });
     const sheet = wb.Sheets[wb.SheetNames[0]];
 
     // The export/template has:
@@ -531,7 +532,7 @@ const parseSheet = async (buffer) => {
     // row that matches the most known column names is the header row.
     const headerRow = findHeaderRow(sheet);
 
-    const raw = XLSX.utils.sheet_to_json(sheet, { raw: false, defval: "", range: headerRow });
+    const raw = xlsx().utils.sheet_to_json(sheet, { raw: false, defval: "", range: headerRow });
     if (!raw || raw.length === 0) {
         throw new Error("No data rows found. Make sure you are using the correct template.");
     }
@@ -1141,6 +1142,7 @@ async function buildEmployeeWorkbook({ employees = [], cfg, mode = "export", bla
         );
     }
 
+    const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
     await wb.xlsx.readFile(TEMPLATE_PATH);
 

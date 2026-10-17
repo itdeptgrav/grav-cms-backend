@@ -56,11 +56,19 @@ test("the lay is compared with PPC's ask, size by size", () => {
   assert.match(p.planCheck(plan, [{ styleNo: "XX-9", ratio: { M: 3 }, plies: 40 }]).notes.join(" "), /not one PPC planned/);
 });
 
-test("sizes that are not log-book columns are compared in the total only, and no ratio is guessed", () => {
+test("a size that is not a log-book column is its own column, holding its planned pieces on one ply (17 Oct 2026)", () => {
   const f2 = new Map([["w1", { styleNo: "AP-1", size: "30" }]]);
   const plan = p.planOf([{ ...LAY, lines: [{ workOrderId: "w1", moId: "m1", pieces: 12 }] }], { facts: f2 });
-  assert.equal(p.suggestLay(plan).values.plies, "");
-  assert.match(p.planCheck(plan, []).notes[0], /30/);
+  /* nothing left blank (owner, 17 Oct 2026): a PPC lay with no cut plan puts its pieces in their sizes on one ply */
+  const ppc = p.suggestLay(plan).values;
+  assert.deepEqual([ppc.ratio["30"], ppc.plies], ["12", "1"], "a PPC lay's size 30 holds its planned pieces on one ply");
+  const even = p.suggestLay(p.planOf([{ ...LAY, lines: [{ workOrderId: "w1", moId: "m1", pieces: 12 }] }], { facts: new Map([["w1", { styleNo: "AP-1", size: "M" }]]) })).values;
+  assert.ok(Number(even.plies) >= 1 && Number(even.ratio.M) * Number(even.plies) === 12, "pieces that divide into a small marker still get the marker and plies");
+  const s = p.suggestLay(plan, { sizeQuantities: true }).values;
+  assert.deepEqual([s.ratio["30"], s.plies], ["12", "1"], "an order's size 30 fills its own column");
+  const c = p.planCheck(plan, [{ ratio: {}, ratioExtra: { 30: 10 }, plies: 1 }]);
+  assert.deepEqual(c.rows.find((r) => r.size === "30"), { size: "30", planned: 12, cut: 10, diff: -2, extra: true });
+  assert.equal(c.cut, 10);
 });
 
 test("a lay is due by the earliest of its orders, at the highest priority", () => {
@@ -69,4 +77,18 @@ test("a lay is due by the earliest of its orders, at the highest priority", () =
   assert.deepEqual(p.dueOf([]), { targetTo: "", deliveryDeadline: "", priority: "" });
   const lays = p.laysFromTargets([T({ from: "2026-10-15", to: "2026-10-20", dayPlan: [{ date: "2026-10-16", time: "10:30", workOrderId: "w1", pieces: 4, layKey: "k" }] })]);
   assert.equal(lays[0].lines[0].targetTo, "2026-10-20", "each line carries its target's end");
+});
+
+test("a season started from an order puts each size's remaining pieces in its column, on one ply", () => {
+  const facts = new Map([["w1", { size: "XL", bomCons: 1.2 }], ["w2", { size: "s", bomCons: 1.2 }], ["w3", { size: "XL", bomCons: 1.2 }]]);
+  const lay = { layKey: "order:m1:p1", date: "2026-10-17", time: "", start: "", label: "", pieces: 0, cutPlan: null,
+    lines: [{ workOrderId: "w1", moId: "m1", pieces: 214 }, { workOrderId: "w2", moId: "m1", pieces: 286 }, { workOrderId: "w3", moId: "m1", pieces: 10 }] };
+  const plan = p.planOf([lay], { facts });
+  const s = p.suggestLay(plan, { sizeQuantities: true });
+  assert.equal(s.values.ratio.XL, "224");
+  assert.equal(s.values.ratio.S, "286");
+  assert.equal(s.values.ratio.M, "");
+  assert.equal(s.values.plies, "1");
+  assert.equal(s.values.bomCons, "1.2");
+  assert.deepEqual(s.from, ["the work orders' quantities"]);
 });

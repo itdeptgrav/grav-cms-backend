@@ -117,6 +117,42 @@ const DEFINITIONS = [
   { key: "notice.tone", type: "string", default: "info", enum: ["info", "warn", "critical"],
     group: "Announcement", label: "Banner tone" },
 
+  /* ── Employee app ──────────────────────────────────────────────────── */
+  /* Read by the GRAV employee app (Desktop/App) through the public
+     GET /api/app/config, on launch and on every return to the foreground —
+     so these change the app on phones with NO new build (17 Oct 2026). */
+  { key: "app.minVersion", type: "string", default: process.env.APP_MIN_VERSION || "1.0.0",
+    group: "Employee app", label: "Oldest installed version allowed",
+    description: "A phone on an older NATIVE version (e.g. 2.0.1) is told it must update from the store. Leave at 1.0.0 to force nobody.",
+    validate: (v) => { if (!/^\d+\.\d+\.\d+$/.test(v)) throw new Error("Use a version like 2.0.1"); } },
+  { key: "app.latestVersion", type: "string", default: process.env.APP_LATEST_VERSION || "2.0.1",
+    group: "Employee app", label: "Latest store version",
+    validate: (v) => { if (!/^\d+\.\d+\.\d+$/.test(v)) throw new Error("Use a version like 2.0.1"); } },
+  { key: "app.updateMessage", type: "string",
+    default: "A new version of GRAV is available. Please update to continue.",
+    group: "Employee app", label: "Store update message" },
+  { key: "app.requireUpdateSince", type: "string", default: "",
+    group: "Employee app", label: "Phones must take the latest fix",
+    description: "An ISO date-time (e.g. 2026-10-17T18:00:00+05:30). A phone whose app code is older than this downloads the newest over-the-air update and restarts at once, instead of on its next launch. Empty = updates apply quietly on the next restart.",
+    validate: (v) => { if (v && Number.isNaN(Date.parse(v))) throw new Error("Use an ISO date-time, or leave empty"); } },
+  { key: "app.notice", type: "string", default: "",
+    group: "Employee app", label: "Notice on the app's home screen",
+    description: "A strip at the top of Home on every phone while non-empty (planned downtime, a holiday change)." },
+  { key: "app.noticeTone", type: "string", default: "info", enum: ["info", "warn", "critical"],
+    group: "Employee app", label: "Notice tone" },
+  { key: "app.hiddenWorkTiles", type: "string", default: "",
+    group: "Employee app", label: "Hide Work tiles",
+    description: "Comma-separated: Regularize, Leave, Overtime, Attendance, Performance, Documents, WhosAway. Hidden from the Work tab at once." },
+  { key: "app.statusLabels", type: "string", default: "",
+    group: "Employee app", label: "Status wording (JSON)",
+    description: 'Overrides for the words shown on a request status, e.g. {"pending":"Waiting","manager_approved":"Approved by manager"}. Empty = the wording built into the app.',
+    validate: (v) => { if (!v) return; let o; try { o = JSON.parse(v); } catch (_) { throw new Error("Not valid JSON"); } if (!o || typeof o !== "object" || Array.isArray(o) || Object.values(o).some((x) => typeof x !== "string")) throw new Error('Use {"status":"Words", …}'); } },
+  { key: "app.badgeRefreshSeconds", type: "number", default: 90, min: 30, max: 900,
+    group: "Employee app", label: "Refresh the red dots every (seconds)" },
+  { key: "app.updateCheckMinutes", type: "number", default: 15, min: 5, max: 720,
+    group: "Employee app", label: "Look for an app update every (minutes)",
+    description: "While the app is open or comes back to the front." },
+
   /* ── Housekeeping ──────────────────────────────────────────────────── */
   { key: "alerts.retentionDays", type: "number", default: 45, min: 3, max: 365,
     group: "Housekeeping", label: "Keep resolved alerts (days)",

@@ -1,16 +1,9 @@
 "use strict";
 
-const {
-  AccessToken,
-  EgressClient,
-  EgressStatus,
-  EncodedFileOutput,
-  EncodedFileType,
-  GCPUpload,
-  RoomServiceClient,
-  SipClient,
-} = require("livekit-server-sdk");
-const { ParticipantInfo_Kind } = require("@livekit/protocol");
+/* Required on first use: loading the LiveKit SDK at the top made every server
+   start pay for it, and most starts never place a call. */
+const livekit = () => require("livekit-server-sdk");
+const livekitProtocol = () => require("@livekit/protocol");
 
 function required(value, name) {
   const clean = String(value || "").trim();
@@ -92,9 +85,9 @@ class LiveKitBrowserCall {
     this.businessNumber = outboundNumber(config.businessNumber);
     this.recordingBucket = String(config.recordingBucket || "").trim();
     this.recordingCredentials = String(config.recordingCredentials || "").trim();
-    this.roomClientFactory = config.roomClientFactory || ((url, key, secret) => new RoomServiceClient(url, key, secret));
-    this.sipClientFactory = config.sipClientFactory || ((url, key, secret) => new SipClient(url, key, secret));
-    this.egressClientFactory = config.egressClientFactory || ((url, key, secret) => new EgressClient(url, key, secret));
+    this.roomClientFactory = config.roomClientFactory || ((url, key, secret) => new (livekit().RoomServiceClient)(url, key, secret));
+    this.sipClientFactory = config.sipClientFactory || ((url, key, secret) => new (livekit().SipClient)(url, key, secret));
+    this.egressClientFactory = config.egressClientFactory || ((url, key, secret) => new (livekit().EgressClient)(url, key, secret));
   }
 
   static fromEnv(env = process.env) {
@@ -153,6 +146,7 @@ class LiveKitBrowserCall {
       throw error;
     }
     const { egress } = this.clients();
+    const { EncodedFileOutput, EncodedFileType, GCPUpload } = livekit();
     const output = new EncodedFileOutput({
       fileType: EncodedFileType.MP3,
       filepath: required(storageKey, "recording storage key"),
@@ -170,6 +164,7 @@ class LiveKitBrowserCall {
 
   recordingResult(info, storageKey = null) {
     if (!info) return null;
+    const { EgressStatus } = livekit();
     const file = info.fileResults?.[0] || (info.result?.case === "file" ? info.result.value : null);
     const status = Number(info.status);
     return {
@@ -207,6 +202,7 @@ class LiveKitBrowserCall {
     const { rooms } = this.clients();
     // Employee + the original customer + invited conference members.
     await rooms.createRoom({ name: roomName, emptyTimeout: 120, maxParticipants: 12 });
+    const { AccessToken } = livekit();
     const token = new AccessToken(this.apiKey, this.apiSecret, {
       identity,
       name: displayName || "GRAV employee",
@@ -292,7 +288,7 @@ class LiveKitBrowserCall {
       // attributes can arrive a little later. Detecting inbound calls only by
       // attributes therefore misses the exact interval in which the browser
       // needs to start ringing.
-      return item.kind === ParticipantInfo_Kind.SIP
+      return item.kind === livekitProtocol().ParticipantInfo_Kind.SIP
         || Boolean(sipAttribute(attributes, "sip.callID") || sipAttribute(attributes, "sip.phoneNumber") || sipAttribute(attributes, "sip.trunkPhoneNumber"));
     });
     if (!participant) return null;
