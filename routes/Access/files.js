@@ -12,8 +12,13 @@
  *   POST   /api/files/folders/:id/trash | /restore
  *   DELETE /api/files/folders/:id     permanent, and only when empty
  *
- *   GET    /api/files                 the drive's rows, as the UI's nodes
+ *   GET    /api/files                 the drive's rows, as the UI's nodes (?mine=1: yours)
  *   POST   /api/files                 upload → Drive (private) + a Doc_File row
+ *   PUT    /api/files/:id/content     save over it: new bytes, same row (Sheets)
+ *   GET    /api/files/recent          your recently opened workbooks (Sheets' Recent)
+ *   POST   /api/files/:id/opened      you opened it — to the top of your Recent
+ *   PATCH  /api/files/:id/recent      { pinned } on your Recent
+ *   DELETE /api/files/:id/recent      off your Recent (the document stays)
  *   GET    /api/files/:id/preview     → { previewKind, previewUrl, downloadUrl, … }
  *   GET    /api/files/:id/text        a text document, decoded and capped
  *   GET    /api/files/:id/sheet       a workbook, as a capped grid
@@ -721,6 +726,9 @@ router.get("/", async (req, res) => {
 
     if (req.query.tag) q.tags = String(req.query.tag);
     if (req.query.shared === "1") q.sharedWith = { $nin: ["", null] };
+    /* Only this person's own documents — Sheets' Recent list. A session with
+       no record id owns nothing here, so it gets an empty list, not everyone's. */
+    if (req.query.mine === "1") q.ownerId = isId(user.id) ? user.id : null;
 
     /* An exact path match, so "Finance / Invoices" does not also return
        everything filed one level up. Sent as JSON because a folder name may
@@ -799,6 +807,154 @@ router.post("/", upload.single("file"), async (req, res) => {
   } catch (err) {
     console.error("[files] POST /:", err?.message);
     return res.status(500).json({ success: false, message: "Could not store the document." });
+  }
+});
+
+/* ══ RECENT — SHEETS' "RECENTLY OPENED", PER PERSON ════════════════════════
+ * Excel's Recent: every workbook you open goes to the top, whoever owns it;
+ * pinned ones stay above the rest; removing one takes it off YOUR list and
+ * leaves the document alone. Stored on the document (`openedBy`, see the
+ * model). A document you may no longer read drops out of the list by itself.
+ */
+const RECENT_LIMIT = 50;
+/** One entry per person per document; the newest this many people kept per document. */
+const OPENED_BY_KEEP = 200;
+const WORKBOOK = /\.(xlsx|xlsm|xls|ods|csv)$/i;
+
+/** "<subject>:<id>" — a DeptUser and an Employee may share an id string, never a key. */
+function recentKeyOf(user) {
+  return `${user.subject || "dept_user"}:${user.id}`;
+}
+
+router.get("/recent", async (req, res) => {
+  const user = requireSession(req, res, "see your recent workbooks");
+  if (!user) return;
+  try {
+    const key = recentKeyOf(user);
+    const rows = await Doc_File.find({ "openedBy.userKey": key, trashed: false, name: WORKBOOK }).limit(500);
+    const list = rows
+      .filter((r) => mayRead(user, r))
+      .map((r) => {
+        const mine = (r.openedBy || []).find((o) => o.userKey === key);
+        return { ...r.toNode(), openedAt: mine?.at || null, pinned: Boolean(mine?.pinned) };
+      })
+      .sort((a, b) => Number(b.pinned) - Number(a.pinned) || new Date(b.openedAt) - new Date(a.openedAt))
+      .slice(0, RECENT_LIMIT);
+    return res.json({ success: true, workbooks: list });
+  } catch (err) {
+    console.error("[files] GET /recent:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not load your recent workbooks." });
+  }
+});
+
+/** Find a row this session may read, or answer for it. */
+async function readableRow(req, res, user) {
+  if (!isId(req.params.id)) {
+    res.status(404).json({ success: false, message: "Document not found." });
+    return null;
+  }
+  const row = await Doc_File.findById(req.params.id);
+  if (!row || row.trashed || outOfScope(companyOf(req), row) || !mayRead(user, row)) {
+    res.status(404).json({ success: false, message: "Document not found." });
+    return null;
+  }
+  return row;
+}
+
+router.post("/:id/opened", async (req, res) => {
+  const user = requireSession(req, res, "open a workbook");
+  if (!user) return;
+  try {
+    const row = await readableRow(req, res, user);
+    if (!row) return;
+    const key = recentKeyOf(user);
+    const now = new Date();
+    const list = row.openedBy || [];
+    const mine = list.find((o) => o.userKey === key);
+    const next = [{ userKey: key, at: now, pinned: Boolean(mine?.pinned) }, ...list.filter((o) => o.userKey !== key)].slice(0, OPENED_BY_KEEP);
+    /* updateOne, not save(): opening a document is not editing it, so its
+       `updatedAt` — what Files shows as Modified — must not move. */
+    await Doc_File.updateOne({ _id: row._id }, { $set: { openedBy: next } }, { timestamps: false });
+    return res.json({ success: true, openedAt: now });
+  } catch (err) {
+    console.error("[files] POST /:id/opened:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not record that." });
+  }
+});
+
+router.patch("/:id/recent", async (req, res) => {
+  const user = requireSession(req, res, "pin a workbook");
+  if (!user) return;
+  try {
+    if (typeof req.body?.pinned !== "boolean") {
+      return res.status(400).json({ success: false, message: "pinned must be true or false." });
+    }
+    const row = await readableRow(req, res, user);
+    if (!row) return;
+    const key = recentKeyOf(user);
+    const r = await Doc_File.updateOne(
+      { _id: row._id, "openedBy.userKey": key },
+      { $set: { "openedBy.$.pinned": req.body.pinned } },
+      { timestamps: false },
+    );
+    if (!r.matchedCount) return res.status(404).json({ success: false, message: "That workbook is not on your Recent list." });
+    return res.json({ success: true, pinned: req.body.pinned });
+  } catch (err) {
+    console.error("[files] PATCH /:id/recent:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not change that." });
+  }
+});
+
+router.delete("/:id/recent", async (req, res) => {
+  const user = requireSession(req, res, "change your recent workbooks");
+  if (!user) return;
+  try {
+    if (!isId(req.params.id)) return res.status(404).json({ success: false, message: "Document not found." });
+    await Doc_File.updateOne({ _id: req.params.id }, { $pull: { openedBy: { userKey: recentKeyOf(user) } } }, { timestamps: false });
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("[files] DELETE /:id/recent:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not change that." });
+  }
+});
+
+/* ══ PUT /api/files/:id/content ════════════════════════════════════════════
+ * Save over a document: new bytes, same row, same Drive object. What Sheets
+ * does on Save for a workbook that already lives here (grav-cms
+ * lib/sheets/workbooks.js). Kept apart from PATCH /:id on purpose: that one
+ * edits what is said ABOUT a document and refuses `bytes` and `driveFileId`
+ * (IMMUTABLE below); this one changes the document itself, and nothing else.
+ */
+router.put("/:id/content", upload.single("file"), async (req, res) => {
+  const user = requireSession(req, res, "save a document");
+  if (!user) return;
+
+  try {
+    if (!isId(req.params.id)) {
+      return res.status(404).json({ success: false, message: "Document not found." });
+    }
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: "No file was sent." });
+    }
+    const row = await Doc_File.findById(req.params.id);
+    if (!row || row.trashed || outOfScope(companyOf(req), row)) {
+      return res.status(404).json({ success: false, message: "Document not found." });
+    }
+    if (!mayWrite(user, row)) {
+      return res.status(403).json({ success: false, message: "You cannot change this document." });
+    }
+
+    const stored = await drive.replaceCompanyFile(row.driveFileId, req.file.buffer, {
+      mimeType: req.file.mimetype || row.mimeType || "application/octet-stream",
+    });
+    row.bytes = stored.bytes;
+    row.mimeType = stored.mimeType;
+    await row.save();
+
+    return res.json({ success: true, file: row.toNode() });
+  } catch (err) {
+    console.error("[files] PUT /:id/content:", err?.message);
+    return res.status(500).json({ success: false, message: "Could not save the document." });
   }
 });
 

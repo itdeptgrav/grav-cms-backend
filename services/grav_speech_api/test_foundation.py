@@ -8,6 +8,7 @@ from pathlib import Path
 from services.grav_speech_api.auth import AuthenticationError, sign, verify
 from services.grav_speech_api.contracts import ContractError, parse_create_job
 from services.grav_speech_api.job_store import JobStore
+from services.grav_speech_api.transcript_quality import deoverlap_presentation, windows
 
 
 class SpeechFoundationTest(unittest.TestCase):
@@ -67,6 +68,29 @@ class SpeechFoundationTest(unittest.TestCase):
             JobStore(path)
             with sqlite3.connect(path) as db:
                 self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+
+    def test_context_windows_preserve_raw_evidence_for_semantic_recovery(self):
+        grouped = windows([
+            {"index": 1, "speaker": "Speaker 2", "startSeconds": 51.8, "endSeconds": 61.4,
+             "rawRomanText": "Hailand label", "qualityFlags": []},
+            {"index": 2, "speaker": "Speaker 2", "startSeconds": 61.9, "endSeconds": 68.6,
+             "rawRomanText": "offline stores hain", "qualityFlags": []},
+        ])
+        self.assertEqual(len(grouped), 1)
+        self.assertEqual(grouped[0]["turnIndexes"], [1, 2])
+        self.assertIn("Hailand label offline stores hain", grouped[0]["rawRomanText"])
+
+    def test_presentation_removes_only_exact_context_overlap(self):
+        reviews = [
+            {"selectedRomanText": "offline stores hain then we have around five stores in Dubai"},
+            {"selectedRomanText": "Then we have around five stores in Dubai Then we have online sales"},
+            {"selectedRomanText": "We have five categories hai hamare paas"},
+            {"selectedRomanText": "We have five categories hai hamare paas five category hai ek to shirt hai"},
+        ]
+        deoverlap_presentation(reviews)
+        self.assertEqual(reviews[1]["presentationRomanText"], "Then we have online sales")
+        self.assertEqual(reviews[3]["presentationRomanText"], "five category hai ek to shirt hai")
+        self.assertEqual(reviews[1]["selectedRomanText"], "Then we have around five stores in Dubai Then we have online sales")
 
 
 if __name__ == "__main__":

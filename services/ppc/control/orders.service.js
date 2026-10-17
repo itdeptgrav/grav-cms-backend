@@ -253,7 +253,12 @@ async function snapshotUncached(companyId, { asOfDay = todayKey(), moIds = null,
   ]) : [new Map(), []];
   const eventsByMo = new Map();
   for (const [d, list] of events) for (const e of list) { const k = e.moId; if (!k) continue; if (!eventsByMo.has(k)) eventsByMo.set(k, new Map()); const m = eventsByMo.get(k); if (!m.has(d)) m.set(d, []); m.get(d).push(e); }
-  return { companyId: String(companyId), asOfDay, index, headers, events, eventsByMo, targets, targetsByMo: groupBy(targets, (t) => String(t.manufacturingOrderId)) };
+  /* Order-page PROPOSALS are not targets yet (the department plan is the
+     gate): every board, report and calendar reads `targets` and must not see
+     them; the department plan reads `proposals`. */
+  const proposals = targets.filter((t) => t.status === "proposed");
+  const live = targets.filter((t) => t.status !== "proposed");
+  return { companyId: String(companyId), asOfDay, index, headers, events, eventsByMo, targets: live, proposals, targetsByMo: groupBy(live, (t) => String(t.manufacturingOrderId)) };
 }
 
 async function listOrders(companyId, filters = {}) {
@@ -421,9 +426,13 @@ async function orderDetail(companyId, moId, asOfDay = todayKey()) {
     const people = [...groupBy(events_, (e) => e.personName || e.personKey || "").entries()].filter(([k]) => k).map(([name, l]) => ({ name, pieces: sum(l), lastAt: lastAt(l) })).sort((a, b) => b.pieces - a.pieces);
     return {
       ...p,
-      standard: std ? { samMinutesPerPiece: std.samMinutesPerPiece, operators: std.operators, hoursPerDay: std.hoursPerDay, efficiencyPct: std.efficiencyPct, capacityPerDay: std.capacity?.perDay ?? null, capacityPerHour: std.capacity?.perHour ?? null, remainingTime: standards.timeFor(p.remaining, std) } : null,
+      standard: std ? { samMinutesPerPiece: std.samMinutesPerPiece, operators: std.operators, hoursPerDay: std.hoursPerDay, efficiencyPct: std.efficiencyPct, capacityPerDay: std.capacity?.perDay ?? null, capacityPerHour: std.capacity?.perHour ?? null, remainingTime: standards.timeFor(p.remaining, std), batch: standards.batchOf(std, p.department) } : null,
       activeTarget: activeT ? evaluated(activeT) : null,
-      targetHistory: mine.filter((t) => t.status !== "active").map(evaluated),
+      targetHistory: mine.filter((t) => t.status !== "active" && t.status !== "proposed").map(evaluated),
+      /* the order page's proposal waiting on the department's plan, and the
+         last one the plan answered (accepted / declined) */
+      proposal: (() => { const x = mine.filter((t) => t.status === "proposed").sort((a, b) => new Date(b.assignedAt) - new Date(a.assignedAt))[0]; return x ? { ...evaluated(x), status: "proposed" } : null; })(),
+      lastAnswer: (() => { const x = mine.filter((t) => t.status === "accepted" || t.status === "declined").sort((a, b) => new Date(b.endedAt || 0) - new Date(a.endedAt || 0))[0]; return x ? { status: x.status, at: x.endedAt, by: x.endedBy?.name || "", reason: x.endReason || "" } : null; })(),
       byDay, people,
       workOrders: workOrders.filter((w) => w.departments.find((x) => x.department === p.department).done > 0).map((w) => ({ id: w.id, number: w.number, product: w.product, variant: w.variant, quantity: w.quantity, done: w.departments.find((x) => x.department === p.department).done })),
       efficiencyToday: std && p.today ? ev.efficiencyOf(p.today, { hoursFrom: "", hoursTo: "" }, asOfDay, std, new Date()) : null,

@@ -96,6 +96,24 @@ const laySchema = new mongoose.Schema({
   updatedBy: who,
 }, { timestamps: true });
 
+/* THE PPC LAY IT WAS STARTED FOR (16 Oct 2026). A season started from PPC's
+   Cutting plan keeps the lay(s) and what they asked of each work order, as
+   they were then — PPC may re-plan later and the season still says what it
+   was handed. `suggestion` is the lay row it was handed to start from (the
+   log book's own cell values); the comparison with what was cut is made on
+   read (services/manufacturing/cuttingSeasonPlan.js), never stored. Null on
+   a season started without a plan, which stays allowed. */
+const planSchema = new mongoose.Schema({
+  lays: { type: [new mongoose.Schema({ layKey: String, date: String, time: String, start: String, label: String, pieces: Number }, { _id: false })], default: [] },
+  lines: { type: [new mongoose.Schema({ workOrderId: String, workOrderNumber: String, moId: String, moNumber: String, customerName: String, targetId: String, productName: String, styleNo: String, size: String, colour: String, photo: String, bomCons: Number, pieces: Number, fabricKey: String, fabricName: String, fabricShade: String }, { _id: false })], default: [] },
+  fabrics: { type: [new mongoose.Schema({ key: String, rawItemId: String, variant: String, name: String, pieces: Number }, { _id: false })], default: [] },
+  pieces: { type: Number, default: 0 },
+  cutPlan: { type: mongoose.Schema.Types.Mixed, default: null },
+  suggestion: { type: mongoose.Schema.Types.Mixed, default: null },
+  takenAt: { type: Date, default: null },
+  takenBy: who,
+}, { _id: false });
+
 const cuttingSeasonSchema = new mongoose.Schema({
   companyId: { type: mongoose.Schema.Types.ObjectId, required: true, index: true },
   name: { type: String, required: true, trim: true, maxlength: 120 },
@@ -131,6 +149,7 @@ const cuttingSeasonSchema = new mongoose.Schema({
   /* filled at Close; a live tally is computed on read while active */
   products: { type: [productSchema], default: [] },
   piecesCount: { type: Number, default: 0 },
+  plan: { type: planSchema, default: null },
 }, { timestamps: true, collection: "cutting_seasons" });
 
 /* An auto-named season takes its name from what was typed into it, on every
@@ -144,5 +163,6 @@ cuttingSeasonSchema.pre("validate", function nameFromLogBook() {
 cuttingSeasonSchema.index({ companyId: 1, status: 1, createdAt: -1 });
 cuttingSeasonSchema.index({ companyId: 1, "rawItems.barcodeId": 1 });
 cuttingSeasonSchema.index({ companyId: 1, "pieces.workOrderId": 1, "pieces.unitNumber": 1 });
+cuttingSeasonSchema.index({ companyId: 1, "plan.lays.layKey": 1 });
 
 module.exports = mongoose.models.CuttingSeason || mongoose.model("CuttingSeason", cuttingSeasonSchema);

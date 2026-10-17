@@ -273,6 +273,39 @@ async function listMessages(actorKey, { folder = "inbox", query = "", pageToken 
   };
 }
 
+/**
+ * The inbox's unread count and its newest few unread messages, for the home
+ * (services/home/homeMessages.js). Deliberately light: the count is one
+ * labels.get, and each message is a METADATA read (From, Subject, Date and
+ * Google's snippet) — never the full bodies listMessages decodes.
+ */
+async function unreadSummary(actorKey, { limit = 4 } = {}) {
+  const { gmail } = await gmailFor(actorKey);
+  const [label, list] = await Promise.all([
+    gmail.users.labels.get({ userId: "me", id: "INBOX" }),
+    gmail.users.messages.list({ userId: "me", q: "in:inbox is:unread", maxResults: Math.min(Math.max(Number(limit) || 4, 1), 10) }),
+  ]);
+  const ids = (list.data.messages || []).map((m) => m.id);
+  const metas = await Promise.all(ids.map((id) => gmail.users.messages.get({
+    userId: "me", id, format: "metadata", metadataHeaders: ["From", "Subject", "Date"],
+  })));
+  const items = metas.map(({ data }) => {
+    const headers = headersOf(data.payload?.headers || []);
+    /* "Arpita Sen <arpita@x.com>" → "Arpita Sen" */
+    const from = String(headers.from || "").replace(/\s*<[^>]*>\s*$/, "").replace(/^"|"$/g, "").trim() || headers.from || "";
+    return {
+      id: data.id,
+      channel: "external",
+      from,
+      subject: headers.subject || "(no subject)",
+      preview: data.snippet || "",
+      at: data.internalDate ? new Date(Number(data.internalDate)) : headers.date || null,
+      href: `/mail/inbox?open=external:${encodeURIComponent(data.id)}`,
+    };
+  });
+  return { unread: Number(label.data.messagesUnread) || 0, items };
+}
+
 async function getThread(actorKey, threadId) {
   const { gmail } = await gmailFor(actorKey);
   const id = providerId(threadId, "Thread ID");
@@ -372,5 +405,5 @@ async function setMessageState(actorKey, messageId, state) {
 
 module.exports = {
   appUrl, redirectUri, status, createConnectUrl, completeConnection, disconnect,
-  listMessages, getThread, send, reply, setMessageState,
+  listMessages, getThread, send, reply, setMessageState, unreadSummary,
 };

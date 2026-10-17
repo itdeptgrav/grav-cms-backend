@@ -158,7 +158,7 @@ router.post("/login", async (req, res) => {
     if (user.role === "mpc-measurement")
       redirectPath = "/mpc-measurement/dashboard";
     if (user.role === "cutting_master")
-      redirectPath = "/cutting-master/dashboard";
+      redirectPath = "/cutting-master/dashboard/overview";
     if (user.role === "accountant") redirectPath = "/accountant/";
     if (user.role === "packaging_dispatch")
       redirectPath = "/packaging-dispatch/dashboard";

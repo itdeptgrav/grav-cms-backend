@@ -915,6 +915,46 @@ router.get("/:id", salesAuth, async (req, res) => {
   }
 });
 
+/*
+ * PATCH /api/cms/crm/sample-styles/:id/studio-assignment
+ *
+ * Makes one R&D style visible to exactly one GRAV Studio designer.  Studio
+ * itself cannot make this assignment: its bearer key is intentionally only
+ * allowed to read its own assigned styles and append immutable submissions.
+ * A manager may assign any designer; an R&D user may assign their own CMS
+ * identity only.  The future CMS UI uses this endpoint before it asks Studio
+ * to link a local .grav file to the style.
+ */
+router.patch("/:id/studio-assignment", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const designer = req.body?.designer && typeof req.body.designer === "object" ? req.body.designer : {};
+    const email = String(designer.email || "").trim().toLowerCase();
+    const name = String(designer.name || "").trim().slice(0, 200);
+    const designId = String(req.body?.designId || "").trim().slice(0, 200);
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "A valid Studio designer email is required." });
+    }
+
+    const manager = await canApprove(req.user);
+    const rndSelfAssignment = RND_ROLES.includes(req.user?.role) && email === String(req.user?.email || "").trim().toLowerCase();
+    if (!manager && !rndSelfAssignment) {
+      return res.status(403).json({ success: false, message: "Only a Sales manager may assign another Studio designer." });
+    }
+
+    style.studio = style.studio || {};
+    style.studio.designer = { name, email };
+    if (designId) style.studio.designId = designId;
+    await style.save();
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
+  } catch (err) {
+    console.error("[sampleStyles] PATCH /:id/studio-assignment", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // A client-supplied materials.rawItems array, cleaned to what the schema
 // accepts. quantity is genuinely optional here — the Merchandiser is often
 // picking WHAT'S needed before anyone has measured HOW MUCH — so unlike

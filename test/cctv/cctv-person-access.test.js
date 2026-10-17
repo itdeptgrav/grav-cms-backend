@@ -47,10 +47,16 @@ beforeAll(async () => {
   // The fake CCTV site: checks the service key like grav-cctv does.
   fakeCctv = http.createServer((req, res) => {
     const ok = req.headers["x-cctv-service-key"] === process.env.CCTV_SERVICE_KEY;
+    const requestUrl = new URL(req.url, "http://cctv.test");
+    const legacyOk = requestUrl.searchParams.get("key") === process.env.CCTV_KEY;
     let body = "";
     req.on("data", (c) => { body += c; });
     req.on("end", () => {
       if (!cctvUp) { res.writeHead(503); return res.end("{}"); }
+      if (req.method === "GET" && requestUrl.pathname === "/api/cameras" && legacyOk) {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify(REGISTRY.map((camera, index) => ({ ...camera, index }))));
+      }
       if (!ok) { res.writeHead(401); return res.end("{}"); }
       if (req.method === "GET" && req.url === "/api/internal/cameras") {
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -311,7 +317,18 @@ describe("GET /api/cctv/internal/access — the decision the CCTV site enforces"
 
 /* ══ Sign-in hand-off ═════════════════════════════════════════════════════ */
 
-describe("POST/GET /api/cctv/sso — a 90-second token that names the person, never the shared key", () => {
+describe("CMS CCTV entry — access probe plus hosted-app hand-off", () => {
+  test("the digital twin access probe returns authority but never a sign-in URL or key", async () => {
+    await seed();
+    const p = await person();
+    const res = await call("/api/cctv/access", { token: p.token });
+    expect(res).toMatchObject({ status: 200, body: { success: true, allowed: true, admin: false, cameras: 0 } });
+    expect(res.body.person.email).toBe(p.email);
+    expect(res.body).not.toHaveProperty("url");
+    expect(JSON.stringify(res.body)).not.toContain("key");
+    expect((await call("/api/cctv/access")).status).toBe(401);
+  });
+
   test("an allowed person gets the CCTV /sso URL with a verifiable HS256 token naming them", async () => {
     await seed();
     const p = await person();
@@ -360,6 +377,93 @@ describe("POST/GET /api/cctv/sso — a 90-second token that names the person, ne
       process.env.CCTV_SSO_SECRET = keep;
     }
   });
+
+  test("the deployed app's backend-only compatibility key is used only when JWT SSO is not configured", () => {
+    const keepSecret = process.env.CCTV_SSO_SECRET;
+    const keepKey = process.env.CCTV_KEY;
+    try {
+      delete process.env.CCTV_SSO_SECRET;
+      process.env.CCTV_KEY = "test-only-camera-key";
+      expect(cctvLink.mintSsoUrl({ id: "person" })).toBe(`${process.env.CCTV_APP_URL}/?key=test-only-camera-key`);
+    } finally {
+      process.env.CCTV_SSO_SECRET = keepSecret;
+      if (keepKey === undefined) delete process.env.CCTV_KEY;
+      else process.env.CCTV_KEY = keepKey;
+    }
+  });
+});
+
+describe("GET /api/cctv/twin/cameras — real cameras for the spatial view", () => {
+  test("a person sees only granted hosted cameras, their capabilities, and no invented coordinates", async () => {
+    await seed();
+    const a = await admin();
+    const p = await person();
+    await grant(a.token, p.email, RAHUL);
+    const res = await call("/api/cctv/twin/cameras", { token: p.token });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ success: true, source: "hosted-cctv", total: 2, calibrated: 0 });
+    expect(res.body.cameras.map((camera) => camera.key)).toEqual(["nvr2:8", "nvr1:9"]);
+    expect(res.body.cameras[0]).toMatchObject({
+      displayName: "HR Office",
+      permissions: RAHUL[0],
+      spatial: { status: "UNCALIBRATED", worldPositionM: null, rotationDeg: null },
+    });
+    expect(JSON.stringify(res.body)).not.toContain(process.env.CCTV_SERVICE_KEY);
+  });
+
+  test("an administrator sees the complete hosted registry", async () => {
+    await seed();
+    const a = await admin();
+    const res = await call("/api/cctv/twin/cameras", { token: a.token });
+    expect(res.status).toBe(200);
+    expect(res.body.total).toBe(REGISTRY.length);
+    expect(res.body.cameras.every((camera) => camera.permissions.live && camera.permissions.audio && camera.permissions.playback)).toBe(true);
+  });
+
+  test("only a verified platform administrator can save room and camera mapping", async () => {
+    await seed();
+    const a = await admin();
+    const p = await person();
+    await grant(a.token, p.email, RAHUL);
+    const body = {
+      cameraKey: "nvr1:11",
+      room: { name: "Conference Room", widthFt: 10, depthFt: 12, heightFt: 9 },
+      camera: { xFt: 9.7, zFt: 0.5, heightFt: 8.8, yawDeg: -40, pitchDeg: -24, horizontalFovDeg: 82 },
+      imageSize: { width: 1000, height: 500 },
+      controlPoints: [],
+    };
+    expect((await call("/api/cctv/twin/configuration", { method: "PUT", token: p.token, body })).status).toBe(403);
+    const saved = await call("/api/cctv/twin/configuration", { method: "PUT", token: a.token, body });
+    expect(saved).toMatchObject({ status: 200, body: { success: true, spatial: { status: "PROVISIONAL", roomId: "conference-room" } } });
+  });
+
+  test("a hosted-registry outage keeps an administrator's saved twin camera visible", async () => {
+    await seed();
+    const a = await admin();
+    const body = {
+      cameraKey: "nvr1:11",
+      room: { name: "Conference Room", widthFt: 10, depthFt: 12, heightFt: 9 },
+      camera: { xFt: 9.7, zFt: 0.5, heightFt: 8.8, yawDeg: -40, pitchDeg: -24, horizontalFovDeg: 82 },
+      imageSize: { width: 1000, height: 500 },
+      controlPoints: [],
+    };
+    expect((await call("/api/cctv/twin/configuration", { method: "PUT", token: a.token, body })).status).toBe(200);
+
+    cctvLink._resetForTests();
+    cctvUp = false;
+    const res = await call("/api/cctv/twin/cameras", { token: a.token });
+
+    expect(res).toMatchObject({
+      status: 200,
+      body: {
+        success: true,
+        source: "saved-twin-configuration",
+        stale: true,
+        total: 1,
+        cameras: [{ key: "nvr1:11", displayName: "Conference Room", spatial: { status: "PROVISIONAL" } }],
+      },
+    });
+  });
 });
 
 /* ══ The camera list for the editor ═══════════════════════════════════════ */
@@ -383,5 +487,23 @@ describe("GET /api/admin/cctv/cameras — read from the CCTV site, never a secon
     const p = await person();
     expect((await call("/api/admin/cctv/cameras", { token: p.token })).status).toBe(403);
     expect((await call("/api/admin/cctv/cameras")).status).toBe(401);
+  });
+
+  test("the deployed app's legacy camera endpoint remains backend-only", async () => {
+    const keepService = process.env.CCTV_SERVICE_KEY;
+    const keepKey = process.env.CCTV_KEY;
+    try {
+      delete process.env.CCTV_SERVICE_KEY;
+      process.env.CCTV_KEY = "legacy-test-camera-key";
+      cctvLink._resetForTests();
+      const out = await cctvLink.fetchCameras({ fresh: true });
+      expect(out.cameras).toHaveLength(REGISTRY.length);
+      expect(out.cameras[0]).toMatchObject({ key: "nvr2:8", index: 0, displayName: "HR Office" });
+    } finally {
+      process.env.CCTV_SERVICE_KEY = keepService;
+      if (keepKey === undefined) delete process.env.CCTV_KEY;
+      else process.env.CCTV_KEY = keepKey;
+      cctvLink._resetForTests();
+    }
   });
 });

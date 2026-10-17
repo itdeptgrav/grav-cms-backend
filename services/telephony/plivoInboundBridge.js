@@ -28,6 +28,18 @@ function liveKitSipUri(number, env = process.env) {
   return `sip:${number}@${endpoint};transport=tcp`;
 }
 
+function configuredInboundNumber(value, env = process.env) {
+  const normalize = (input) => {
+    const raw = String(input || "").trim().replace(/[\s()-]/g, "");
+    if (/^\d{10}$/.test(raw)) return `+91${raw}`;
+    if (/^91\d{10}$/.test(raw)) return `+${raw}`;
+    return /^\+[1-9]\d{7,14}$/.test(raw) ? raw : null;
+  };
+  const requested = normalize(value);
+  const configured = normalize(env.GRAV_VOICE_INBOUND_NUMBER || env.PLIVO_CALLER_ID);
+  return requested && configured && requested === configured ? requested : null;
+}
+
 function dialXml({ number, actionUrl, env = process.env, timeout = 45 } = {}) {
   const sipUri = liveKitSipUri(number, env);
   if (!sipUri) return null;
@@ -99,6 +111,7 @@ function validPlivoRequest(req, env = process.env) {
 }
 
 module.exports = {
+  configuredInboundNumber,
   dialXml,
   dialStatusUrl,
   liveKitSipEndpoint,

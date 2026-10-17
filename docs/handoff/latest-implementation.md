@@ -1,64 +1,554 @@
-# Sewing completion is QC's in-line pass; Ops QR on the Overview; orders newest first (15 Oct 2026)
+# CCTV twin: Rapier physics (16 Oct 2026)
 
-**Not committed.** Owner: the supervisor's Sewing Completion scan page
-duplicated a scan QC already makes — a piece that passes the FIRST QC
-checkpoint (in-line, end of the sewing line) is sewn. So:
+**Not committed.** See the contract's Rapier note.
+- **grav-cms:**
+  - `@dimforge/rapier3d-compat@0.19.3` added (package.json and lockfile).
+  - New `twin/twinRapier.mjs` and `twin/twinRapier.test.mjs`.
+  - TwinScene: dynamic import, `solidStep`, falls back to `separate()`.
+  - twinMotion: chairs as soft route obstacles.
+- **Tests:** twin 140/140, including 4 on the real Rapier engine.
+- **Video:** `tmp/cctv-review/cctv_vs_twin_walk_v4_rapier.mp4`.
+- **Open:** run `next build` to confirm the WASM package bundles in
+  production.
 
-- `services/manufacturing/sewingCompletion.js` is the one writer of
-  `productioncompletionscanrecords`: `recordSewingCompletion` (the old
-  mark-done logic, moved: format, work order, quantity, optional route rule,
-  recorded-once-ever dedup, bucketed by the IST day the scan HAPPENED) and
-  `completeFromQcPass` (records when the verdict is `passed` at the
-  lowest-serial active stage, or when no stages are configured; never
-  throws). `isCompletingStage` is pure and tested
-  (`sewingCompletion.test.js`, 6/6).
-- `POST /manufacturing/qc/save-inspection` and `/save-inspection-offline`
-  call it after the verdict is written and answer `sewingCompletion:
-  {attempted, recorded, alreadyRecorded, skippedReason?}`; the offline path
-  uses the device's `recordedAt`. The CMS station toast adds "recorded as
-  sewn".
-- `POST /production-completion/mark-done` still works for any older caller,
-  through the same service. `/preview` unchanged.
-- CMS: the Sewing Completion nav entry and page are gone (the URL forwards to
-  the Overview); the Ops QR button moved from the tracker's More menu to the
-  Overview header; the Orders page opens on "Newest" (was "Deadline"), and
-  every "scanned on the Production Record page" wording now says the first
-  QC checkpoint.
+---
 
-Checked 15 Oct 2026 against the dev server with scratch pieces of a Black
-Pant work order (all removed afterwards): P1 pass → recorded (by the
-inspector's name); P2 pass on the same piece → `not-first-stage`, no second
-row; P1 defect → `not-a-pass`; the rework pass at P1 → recorded; offline P1
-pass → recorded at the device's time; legacy mark-done of the first piece →
-"already recorded earlier", "hello" invalid. Browser: Overview shows Ops QR
-and opens the panel, nav without Sewing Completion, Orders sorted
-newest-first (10 Aug, 03 Aug, 25 Jul…), `/production-record` lands on the
-Overview, tracker More menu without Ops QR. Known, pre-existing, not changed:
-the offline QC route's own parser reads only the 8-hex barcode form.
+# CCTV twin: the conference door; leaving properly (16 Oct 2026)
 
-# GRAV Voice: SIP call attributes read under livekit-server-sdk 2.15 (15 Oct 2026)
+**Not committed.** See the contract's 16 Oct door note.
+- **Live data:**
+  - Factory layout v12 adds `door-1` to the conference room (v11 backed up
+    in `tmp/cctv-review/backups/`).
+  - The preview fixture `liveReplay.json` has the same door.
+- **Twin:**
+  - TwinScene: leaving rules, the room-aware `walkableBounds`, door leaves
+    that swing open, the stand-up chair roll-back, chair-aware routes.
+  - twinMotion: `progressOnPath`, the shuffle rule in `nextYaw`, chairs in
+    `makeRouter`.
+  - twinPhysics: a person steps off a wall-blocked chair.
+  - twinFurniture: hinged (glass) door leaf.
+  - twinAvatar: walks to a door steer by progress along the path; keeps the
+    walking heading for 3 s after walking.
+- **Tests:** twin 135/135.
+- **Video:** `tmp/cctv-review/cctv_vs_twin_walk_v3.mp4`.
 
-**Not committed.** livekit-server-sdk 2.15 (this backend's version) camel-cases
-the keys of participant attributes: `sip.callStatus` arrives as `sipCallStatus`.
-So `LiveKitBrowserCall.status()` never saw "active", and `incomingCaller()` fell
-back to the participant's display name for the caller's number. This happens on
-LiveKit Cloud today. It is the real cause behind the "attributes arrive later"
-note in `grav-voice-per-user-lines-and-inbound-ringing.md`.
+---
 
-- `sipAttribute()` in `services/telephony/livekitBrowserCall.js` reads both
-  spellings. It is used everywhere the class reads `sip.callStatus`,
-  `sip.callID`, `sip.phoneNumber` and `sip.trunkPhoneNumber`. Nothing else
-  changed.
-- Upgrading the SDK (2.19 keeps the dotted keys) is the longer-term fix.
-- Recordings still upload to Cloud Storage exactly as before (owner's decision:
-  keep them there for now).
-- Context: the owner is moving LiveKit Cloud to self-hosted LiveKit
-  ("GRAV Realtime", repo `sonu4435/grav-realtime`). CoWork and Voice switch by
-  environment variables only (`LIVEKIT_*`, `GRAV_VOICE_LIVEKIT_*`, trunk id).
-- Checked:
-  - Telephony tests 30/30 (1 new, for both spellings).
-  - The camel-cased keys were observed against a running self-hosted LiveKit
-    with SDK 2.15 and 2.19 side by side.
+# CCTV twin: a human walk cycle (16 Oct 2026)
+
+**Not committed.** See the contract's 16 Oct note.
+- **twinSkeleton.mjs:** `gaitJoints` rewritten (foot placement, IK knees,
+  pelvis carried by the stance leg, arm swing); `stepLengthFor` added.
+- **twinAvatar.js:** step length from speed; the phone-at-ear arm is kept.
+- **twinMotion.mjs:** catch-up at 1.7 m/s.
+- **Tests:** twin 133/133, including no foot slip, swing lift and pelvis bob.
+- **Video:** `tmp/cctv-review/cctv_vs_twin_walk_v2.mp4`.
+
+---
+
+# CCTV twin: walks round tables; 30 fps side-by-side (15 Oct 2026, 22:25)
+
+**Not committed.** See the contract's 22:25 note.
+- **Twin:**
+  - `makeRouter` and `carrotOnPath` in twinMotion.mjs.
+  - Avatars steer along routes, with `behindM` catch-up.
+  - The router is built in TwinScene.
+- **Tests:** twin 132/132.
+- **Video:** `cctv_vs_twin_walk_30fps.mp4` (sent): NVR playback beside the
+  headless-Chrome recording of the twin, same moments.
+
+---
+
+# CCTV twin: one person, one figure; checked against recorded CCTV (15 Oct 2026, 21:55)
+
+**Not committed.** See the contract's 21:55 note.
+- **Twin:**
+  - `TrackHandoff` (twinSteady.mjs), wired before SteadyPeople.
+  - The `moving` flag; "seated moments ago" applies only where they sat.
+  - `toward` in HumanMover and `nextYaw`.
+  - `uprightTorso` while walking.
+  - People kept off walls except at doors.
+- **Tests:** twin 130/130.
+- **Video:** `recorded_cctv_vs_twin_walk.mp4` (sent): NVR playback of the
+  16:10–16:11 minute beside the twin replaying that minute, 12 fps.
+- **Shirt-colour flip fixed** at 22:05 (`StickyColours`); twin tests 131/131.
+- **Worker `--track-hold` 6 s → 3 s** (owner's choice). Restart the worker.
+
+---
+
+# CCTV twin: human movement between keyframes (15 Oct 2026, 21:45)
+
+**Not committed.** See the contract's 21:45 note.
+- **twinMotion.mjs:** `HumanMover`, `nextYaw`, `nextGait`, `springOffset`.
+- **twinSkeleton.mjs:** arm swing in `gaitJoints`; `blendJoints`.
+- **twinAvatar.js and TwinScene.js** use them.
+- **Tests:** twin 123/123.
+- **Checked:** an offline 60 fps simulation of the twin's own motion chain
+  (SteadyPeople → reconcileOccupants → MotionTrack → HumanMover → nextYaw →
+  nextGait) on four recordings, old rules against new; results in the
+  contract note. The page loads without errors. The live animation wasn't
+  watched: the browser pane was hidden, which pauses animation frames.
+
+---
+
+# CCTV twin: physics and real-world rules, audited (15 Oct 2026, 21:00)
+
+**Not committed.** See the contract's 21:00 note.
+- **Twin:**
+  - `settleOnSurfaces`: support, a search for a clear spot, overlaps eased
+    apart.
+  - `deckSlots`: hands on the palm rest; elbows kept out of the table.
+  - Chairs held inside walls by `separate`.
+  - A sit-down rebuilds the body.
+  - `handsOnBox` tolerance 0.42.
+  - `twinAudit.mjs`, exposed as `window.__twinAudit()` in the harness.
+- **Tests:** twin 117/117. Backend and worker unchanged since 20:35
+  (100/100, OK).
+- **Audit:** run on the 1-, 2- and 3-person recordings until clean; the only
+  remainder is a seated person's first second on screen.
+
+---
+
+# CCTV twin: left chair root cause, turned-away sitter, laptop use, phone, bag (15 Oct 2026, 20:35)
+
+**Not committed.** See the contract's 20:35 note.
+- **Twin:**
+  - A chair's "seen" stamp now comes only from a detection, and an occupied
+    unseen chair stays.
+  - Seated facing follows `facingEvidence`.
+  - A crouch at a chair is drawn as probably seated.
+  - `handsOnBox` decides laptop use.
+  - `bagOnSurface` places bags; objects cut off at the bottom edge are placed
+    from their box middle; bags are drawn lying, in their own colour.
+- **Worker:**
+  - `seated_on_chair`;
+  - CROUCHED anchors ankles last;
+  - in-hand phone scans every 1 s, confirmed by 2 of 6;
+  - `object_colour` for bags.
+- **Backend:** passes a bag's colour through as `appearance.colour`.
+- **Tests:** backend 100/100, pose and worker OK, twin 112/112.
+- **Checked:**
+  - the 40 s side-by-side (`cctv_vs_twin_v3.mp4`, sent);
+  - the earlier yellow-shirt recording, replayed offline: he now sits on his
+    own chair, which follows him, facing -137.
+- **Not verified live:** the phone-in-hand and seated-on-chair changes. He
+  had left the room before the new worker ran.
+- **Restart the worker and the backend.**
+
+---
+
+# CCTV twin: laptop position, open/closed, dev view (15 Oct 2026, 20:00)
+
+**Not committed.** See the contract's 20:00 note.
+- **Twin:**
+  - `laptopOnSurface` gives a laptop's middle and whether it is closed; the
+    closed one is drawn with its lid shut.
+  - `TwinDevView` shows raw model output in Camera view: a bug button for
+    administrators, with Side by side, Live and Over twin modes. It plays the
+    live stream through `JpegSplitter`.
+- **Worker:** sends each person's box (`imageBoxPx`).
+- **Backend:**
+  - adds `visual.detector` (the box, the raw posture, the anchor, and every
+    hand score);
+  - adds `GET /api/cctv/twin/stream`, an admin-only MJPEG relay (`relayStream`)
+    at 5 fps, capped at 10 minutes.
+- **Tests:** backend 99/99, pose and worker OK, twin 106/106.
+- **Checked in the preview harness:**
+  - All three modes work, with no console errors. The stream path runs on a
+    fake MJPEG built from the synthetic frame, at 3.9–4.0 fps.
+  - Over twin puts the raw boxes on the drawn objects.
+  - The closed laptop is drawn flat, and the left laptop sits on its box.
+  - The real stream route is covered only by its Jest test (relay, throttle,
+    stop). It wasn't opened in a browser, which needs live sign-in.
+- **Restart the worker and the backend** for person boxes in the dev view.
+
+---
+
+# CCTV twin: hallucinated laptops (15 Oct 2026, 19:35)
+
+**Not committed.** See the contract's "Hallucinated laptops" note.
+- **Worker** (`StaticObjectMap`): `PUBLISH_MIN_CONF` (LAPTOP 0.6), the
+  `PART_SHARE` / `_part_of` laptop halves rule, and a second box in the same
+  scan absorbed. The laptop-screen-as-MONITOR case is folded into the laptop.
+- **Twin:** `duplicateDeskItems`.
+- **Tests:** pose 84 OK, worker OK, backend Jest 97/97, twin 104/104.
+- **Live capture (no publish):** three laptops published, matching the three
+  on the table. The twin replay shows the same three.
+- **Restart the worker** for the worker side.
+
+---
+
+# CCTV twin: desk items, phones, the left man's laptop (15 Oct 2026, 18:55)
+
+**Not committed.** See the contract's notes from 18:20 to 18:55.
+- **Twin:** `deskItemPlacement` (no floor laptops; items face their user or
+  chair), `assignDeskUsers` (the laptop is drawn in front of its seated user,
+  with hands on it and "using laptop" on the label), and solid bodies.
+- **Worker:** laptop parts suppressed, chairs at least 48 px tall, the
+  handbag and backpack merged, the 640 px hand scan with a two-hand phone grip,
+  and `drop_held_phones`.
+- **Tests:** backend Jest 97/97, Python pose and worker OK, twin 103/103.
+- **Checked in the replay at 40 s:** both sitters show "Seated · using laptop".
+  The left man has his laptop in front of him and his hands on it.
+- **Restart the worker** for the worker-side parts.
+
+---
+
+# CCTV twin: root cause of the fluctuation — chairs that came and went (15 Oct 2026, 18:00)
+
+**Not committed.** See the contract's "Root cause of the remaining
+fluctuation" note. Worker: `StaticObjectMap` / `ChairMap` replace the
+per-scan confirmers for room objects. Twin: confirmed-within-30-s chairs,
+`seatMemory`, and a 3 s facing hold. Tests: backend 97/97, pose 76/76, twin
+99/99. **The live worker must be restarted**: the running one dates from
+13:20 and has none of today's worker changes.
+
+---
+
+# CCTV twin: chairs match the room; sitters in their chairs (15 Oct 2026, 17:30)
+
+**Not committed.** See the contract's "Chairs: one per real chair" note.
+Backend: chair placement from base and backrest. Twin: seated on the seen chair
+within 0.7 m of the pelvis, steady seen chairs, unconfirmed in-view layout
+chairs hidden (`inView` from the camera projection), a sitter's chair attached
+under them, and chair turns. Tests: backend 97/97, pose 72/72, twin 99/99.
+Restart the worker (for the earlier crouch fix) and reload the twin.
+
+---
+
+# CCTV twin: fluctuation measured on the rendered twin and cut (15 Oct 2026, 16:45)
+
+**Not committed.** See the contract's "Fluctuation measured on the rendered
+twin" note. Twin: `StickyText` labels, `HoldMissing` objects, the
+`jointsMoved` deadband, held last pose, bone easing at 3/s, the facing
+deadband, sticky hand grabs, and the harness-only `window.__twinScene`.
+Worker: no SEATED → CROUCHED. Tests: backend 96/96, pose 72/72, twin 97/97.
+Per minute, label changes 26 → 4 and facing drift 2.3 → 0.02°/s. Restart the
+worker and reload the twin.
+
+---
+
+# CCTV twin: side-by-side issues fixed; steadiness (15 Oct 2026, 16:20)
+
+**Not committed.** See the contract's "Issues from the side-by-side, and
+steadiness" note. New: `components/cctv/twin/twinSteady.mjs` (+ test).
+Worker: `drop_replaced`, sticky confirmed objects with looser association,
+object scans at 1920 px with BOTTLE 0.25, ankles last when seated, shirt from
+the chest, a 10 s standing hold. Twin: wrist-on-laptop arms, lap hands
+under the table, laptop facing, seat behind the laptop, a 0.08 m snap, crown
+people never moved, a letterboxed camera view, slower arm switching and lean.
+Tests: backend 96/96, pose 71/71, worker helpers 13/13, twin 93/93. Live, over
+60 s: 1 position step (6 cm) for two seated people. Restart the worker and
+reload the twin.
+
+---
+
+# CCTV twin: footage vs twin side by side; posture, lean and seats (15 Oct 2026, 15:50)
+
+**Not committed.** See the contract's "Footage vs twin, side by side" note.
+Worker: `KNEE_POSTURE_CONFIDENCE` 0.5, knee-weighted evidence, strong-evidence
+confirmation, the shoulder drop needed for STANDING → SEATED, a confirmed
+posture floored at 0.75, `PostureSmoother.lean` and `postureHint`, hips first
+when standing, admission confidence 0.5. Backend: `postureHint` passthrough,
+`heightAbovePoint` and the feet-vs-hips check. Twin: no "probably seated"
+against a standing hint, a "probably standing" label, lean limits of 50°/35°,
+lean → facing, seat 0.28 m behind the table with `leanDeg`, snaps of
+0.25/0.45 m and none for crown-placed people, rolled chairs facing the table
+edge or the laptop, and standing table clearance of 0.15 m. Tests: backend
+96/96, pose 66/66, worker helpers 12/12, twin 86/86. `twinGeometry.mjs` was
+emptied by an editing mistake during this work and recovered from the dev
+server's source map, with today's later edits re-applied and covered by tests.
+Restart the worker (the running one dates from 13:20, before today's 15:11
+fixes) and reload the twin.
+
+---
+
+# CCTV twin: people cut off by the frame bottom; anchor method held (15 Oct 2026, 14:30)
+
+**Not committed.** See the contract's "People cut off by the bottom of the
+frame" note. Worker: new `BOX_TOP_HEIGHT` anchor (box top = crown, at 1.3 m
+seated/unknown and 1.75 m standing), `anchor_candidates` + `AnchorModeHold`
+(1 s), and `AnchorStabilizer.forget` on a method change. Backend:
+`BOX_TOP_HEIGHT` in `ANCHOR_MODES`/`HEIGHT_ANCHORS` (0.8–2.0 m,
+`CROWN_HEIGHT_ESTIMATE`). Twin: the anchor counts as legs-unseen (eligible
+for "probably seated"), with an inspector label. Tests: backend 94/94, pose
+60/60, twin 71/71. Live check: the near-end man has 0 method switches in
+105 frames and is placed within 12 cm. Restart the worker; reload the twin.
+
+---
+
+# CCTV twin: observation study, footage vs twin (15 Oct 2026, 13:00)
+
+**Not committed.** Two live captures compared with stills every 15 s; see the
+contract's "Observation study" note. Worker: separate object model (fixes
+object collapse and tracker pollution), anchor order. Twin: legs-unseen rule,
+hand-at-face cue, chair matching (clamped ignored, 1 m, 0.9 m, 0.5 m), colour
+boost. Tests: backend 93/93, pose 55/55, worker helpers 2/2, twin 71/71.
+Restart the worker; reload the twin.
+
+---
+
+# CCTV twin: replay of real data; people behind tables placed right (15 Oct 2026, 12:30)
+
+**Not committed.** Owner: live page looks distorted next to the preview.
+Worker: `--no-publish`, `--dump`, `--max-seconds` (capture without touching
+the live feed; no final frame), `POSE_SHOULDER_HEIGHT` / `POSE_HIP_HEIGHT`
+anchors. Backend: height anchors table (`HEIGHT_ANCHORS`), test. Twin:
+object labels on hover/selection, lighter rings, room names hidden in camera
+view, preview `?scenario=replay` (reads `app/preview/cctv-twin/liveReplay.json`,
+a local capture: anonymous body points and shirt colours, no images or
+identities). The Next dev server on :3001 had stopped; it was restarted from
+the launch config. Tests: backend 93/93, pose 55/55, twin 70/70.
+
+---
+
+# CCTV twin: natural poses chosen by the camera (15 Oct 2026, 12:15)
+
+**Not committed.** Owner: poses/positions looked unnatural and broken.
+Twin only: `NaturalPose` (3 tests) drives the avatar instead of per-joint
+lifting; hands-on-objects limited to low hands within 0.2 m;
+`handRaised` hint. Twin tests 70/70; preview checked (seated at laptop,
+phone at ear, standing). Reload the twin page; no worker restart needed.
+
+---
+
+# CCTV twin: the whole ground floor (15 Oct 2026, 12:00)
+
+**Not committed (code); config written (v9, backup v8 in the scratchpad).**
+Owner shared drawing A-101 rev A. Backend: `factoryFloorPlan.js` (22 rooms,
+19 doors, 12 openings) + 5 tests; `apply_factory_floor_plan.js`;
+`normalizedFurniture` exported. Twin: wall openings, doorways cut walls on both
+sides, nested-room floors offset, room names centred on a multi-room plan,
+overview hint names the drawing; preview `?scenario=factory`. Tests: backend
+92/92, twin 67/67. Not done: the other cameras (Cutting floor, Store room, …)
+still need placing in their rooms; where the Conference Room sits relative to
+this floor is unknown.
+
+---
+
+# CCTV twin: clothing colours, hands on objects, small objects (15 Oct 2026, 11:45)
+
+**Not committed.** Owner: "I want exact". Worker: `clothing_colours` +
+`AppearanceSmoother` (3 tests), object scans at 1280 px, NOTEBOOK. Backend:
+`appearance` colours whitelisted (test). Twin: figures wear the colours,
+`handsOnObjects`/`armReach` (test), softer probably-seated rule, notebook and
+leather-bag models, darker screens. The "2 detected objects" screenshot was
+taken 4 s after a worker restart; replaying the worker's object pipeline on
+live frames confirms 14 (3 laptops, 5 bottles, 3 chairs, phone, mouse,
+keyboard). Tests: backend 87/87, pose 54/54, worker helpers 2/2, twin 67/67.
+Restart the worker; reload the twin page.
+
+---
+
+# CCTV twin: decisions over seconds; phantoms, flailing and flicker (15 Oct 2026, 11:30)
+
+**Not committed.** Owner: "total chaos" — decide over a longer time frame.
+Worker: TrackAdmission (2 s), posture dwell (3 s), slower face/object/phone
+scans. Backend: seen feet beyond a wall are outside (corridor walker through
+the glass door). Twin: StablePose (3.5 s per-bone medians) + limitJoints,
+sticky probably-seated. Tests: backend 86/86, pose 51/51, worker helpers 2/2,
+twin 66/66. Restart the worker; reload the twin page.
+
+---
+
+# CCTV twin: light physics between people, chairs and tables (15 Oct 2026, 11:30)
+
+**Not committed.** Frontend only (no worker restart): `twinPhysics.mjs`
+(separate + easeOffset, 6 tests), avatar physics offset, scene
+`resolveCollisions` each frame, workspace passes each seated person's chair.
+Twin tests 64/64; preview runs without errors. Reload the twin page.
+
+---
+
+# CCTV twin: bag, faster feed, no phantom crouch (15 Oct 2026, 11:15)
+
+**Not committed.** Live comparison after the camera refit: three people seated
+at the right chairs, empty chairs on the right placed from detection, laptops
+right. Fixed what was left: the leather bag (YOLO-World sees it at 0.41-0.50,
+COCO not at all, and World's 1-in-4 scans could never reach COCO's 3-of-5
+window) now confirms on its own 2-of-3 window, with a "briefcase" prompt;
+face matching (~0.4-0.5 s) runs in a background thread instead of blocking
+tracking (feed was 1.1-1.5 fps); keypoints on the frame edge count as unseen
+(the cut-off man's guessed ankles made him "crouched"); the status bar counts
+"probably seated". Tests: worker helpers 2/2, pose 48/48, backend 86/86,
+twin 58/58. Restart the worker to use it.
+
+---
+
+# CCTV twin: camera refit, measured table, bodies out of furniture (15 Oct 2026, 11:00)
+
+**Not committed (code); config written.** Twin config row
+`cctv.factory_twin.primary` is now v8: camera refitted from vanishing points
+(room depth 4.15 m, HFOV 65°, tilt −35.7°, roll −10.3°) and the table measured
+through it (1.13 m wide). Backup of v6 in the session scratchpad. Twin: seat
+height for seated bodies, `keepOutOfSolids`, probably-seated rule, chair push-
+back, no chairs inside tables. Tests: backend 86/86, pose 48/48, twin 58/58.
+Restart the worker so chairs and bags are published.
+
+---
+
+# CCTV twin: detected chairs, bags, firmer estimated bodies (15 Oct 2026, 10:45)
+
+**Not committed.** Worker publishes CHAIR and HANDBAG; backend whitelists them
+(86/86); twin moves layout chairs to detected ones and draws extras (54/54);
+estimated people less transparent. Posture with hidden legs is blocked on the
+camera model's vertical geometry: needs the room depth and table size
+measured. Restart the worker to use it.
+
+---
+
+# CCTV twin: Original frames reach the worker (15 Oct 2026, 10:35)
+
+**Not committed.** The worker requested Original and the CCTV app served it, but
+OpenCV's capture rescaled every frame to the first (640×360 stand-in). New
+`scripts/cctv_twin_stream.py` (MjpegReader, 5 tests) replaces it; checked live:
+1280×720 frames, views identical to Standard. Restart the worker to use it.
+
+---
+
+# CCTV twin: cut-off person placed, chairs follow sitters, Original stream (15 Oct 2026, late morning)
+
+**Not committed.** After the restart: 10 track ids in 349 lines (was 64 in
+2,495), no more outside-polygon refusals; the remaining refusals were the person
+cut off by the frame bottom. Backend: `projectHeadEstimate` + anchor
+`POSE_HEAD_ESTIMATE` (86/86). Worker: head anchor when cut off (pose 48/48),
+`--quality original` default (main stream via `prio=full`), frame-size log line.
+Twin: `reconcileOccupants` moves chairs to seated people (snap ≤ 0.35 m, roll
+≤ 1.6 m, else inferred chair), chair memory per layout position, scene
+`setSeating` glides chair meshes; inspector explains each case (53/53). Not yet
+seen live: restart the worker; check that 1280×720 frames arrive and the room
+outline still lines up in Camera view.
+
+---
+
+# CCTV twin: fluctuation fixed at the source; objects from Original stills (15 Oct 2026, evening)
+
+**Not committed.** Owner: 3D detections fluctuate a lot; try option 2 (stills).
+Measured on the live worker's 2,495 status lines: 24% with someone refused as
+outside the mapping polygon (frame edges are outside it), 284 placed/refused
+flips, 64 tracker ids for ~3 people, 162 frames of untracked `det-*` phantoms
+— mostly logic, not picture quality. Backend: feet outside the polygon now get
+the bounded estimate (contract section 2 amended). Worker:
+`cctv_twin_pose.TrackStitcher` (one id per body across tracker switches),
+held duplicates dropped, untracked boxes not published,
+`cctv_twin_detail.DetailStills` (Original still every 15 s for room objects,
+2-of-3 confirmation, safe fallback). CCTV app (`itdeptgrav/Grav_Ai_CCTV`, not
+ours): `GET /snapshot/<i>?quality=original` — patch at
+`docs/handoff/patches/grav-ai-cctv-original-snapshot.patch`, with 7 new checks
+in its `test_quality.py`; its quality, bandwidth, access and live-stability
+suites all pass. Not deployed anywhere. Tests: backend 83/83, pose 45/45, detail
+5/5. Not verified live: the worker must be restarted (it is still the 08:40
+process), and the stills only start once the CCTV patch is deployed.
+
+---
+
+# CCTV twin: bodies solved from the pose detector, on a rigged character (15 Oct 2026, late)
+
+**Not committed.** Owner: smooth poses, not hard-coded, inherited from the pose
+detector and fed into a properly rigged character. Twin (`grav-cms`):
+`twinRig.js` (new) — procedural skinned mannequin, 20 bones, blended weights;
+`twinSkeleton.mjs` (new) — `PoseSolver` (17 keypoints → 15 3D joints through
+the saved camera; per-person view ray; pelvis from ankles / hip+head rays;
+leg depth scored against it; hidden legs by IK, hidden arms held),
+`OneEuro`, `PoseTrack` (keyframes, monotone cubic playback), `neutralJoints`,
+`gaitJoints`; `twinAvatar.js` rewritten on them (same interface for
+`TwinScene`; phone on the hand bone); `twinPoseLift.mjs`
+`poseFromObservation` replaces `rigFromObservation` + `gestureArms`
+(templates removed). Workspace passes `pose` inputs; poll 750 → 500 ms.
+Worker `--pose-interval` default 0.6 → 0.3 s. Fixes found while verifying:
+the solver used the optical axis as the unseen direction (tilted off-axis
+people up to 24°); the first solve of a seated person aimed at a standing
+chest; a still person re-sending identical points was treated as stale after
+4 s; playback eased to zero speed at every keyframe (pulsing). Preview
+fixtures now face their walking direction, type at desk height and drop
+off-frame points. Verified in `/preview/cctv-twin`: rendered bones land on the
+solved joints (≤1 cm), seated typist's hands at 0.79 m on the laptop, walker
+upright, no console errors. Tests: frontend twin 51/51, pose 40/40. Restart
+the worker to pick up the faster pose rate.
+
+---
+
+# CCTV twin: rigged avatars, gestures, confirmed objects (15 Oct 2026)
+
+**Not committed.** Owner asked for more natural people (arms following real
+movement), phone/laptop animations, and YOLO-World objects — reliably.
+Worker: smoothed 17-point keypoints, gestures, phone-at-wrist evidence on
+person crops, objects confirmed 3-of-5 across COCO + YOLO-World scans
+(`scripts/cctv_twin_pose.py`, worker). Backend: validates/scales `pose2d`,
+whitelists gestures/interactions, publishes only confirmed portable objects
+with image boxes. Twin: `twinPoseLift.mjs` lifts keypoints to limb directions
+through the saved camera; avatar arms/torso follow them by confidence, fall
+back to gesture shapes, typing taps and a phone prop appear only on evidence;
+desk items are realistic models resting on surveyed tabletops. Live finding:
+the substream misnames objects (bag → "potted plant" 0.59) and misses the open
+laptop, so the confirmations gate means few objects appear today. Tests:
+backend 82/82, pose 40/40, frontend twin 34/34. The face-identity work another
+session added this morning was left untouched. Restart the worker to use it.
+
+---
+
+# CCTV twin: camera setup redesigned as "line up the room" (14 Oct 2026, night)
+
+**Not committed.** Owner: the camera setup was not intuitive. New default flow
+(`grav-cms/components/cctv/twin/TwinCameraSetup.js` + `twinCameraMatch.mjs`):
+1 room size + click the camera's corner on a plan beside the live frame;
+2 drag/zoom the measured room outline over the live frame until the floor
+edges match (walls labelled A/B in both views); 3 optional measured check
+marks, shown as cm error, then save. Floor pairs are generated from the lined-up
+camera; unverified alignments publish estimated positions. Backend: `method`,
+`checkPoints`, roll, `verified`, live cap. Old pairing kept as "Manual floor
+points". Tests: backend 76/76, frontend twin 27/27; preview harness flow
+clicked through; real backend save logic run on the generated payload.
+
+---
+
+# CCTV twin: person in view but room empty (14 Oct 2026, evening)
+
+**Not committed.** Cause: the saved Conference Room calibration (v5) has three
+of its four floor points along the left wall, so the mapping is degenerate and
+every person off that wall was rejected (the old linear proxy used to hide
+this by clamping). Fixed: degenerate sets are refused at save and flagged when
+already saved; people who cannot be placed now show as "in view · position
+unknown" with a Re-map prompt; setup can capture the live frame
+(`GET /api/cctv/twin/still`). Tests: backend `npx jest test/cctv` 73/73,
+frontend twin 21/21. **Action:** re-map nvr1:11 with ≥ 4 points spread across
+the floor (no three in a row), using "Use current camera frame"; then restart
+the worker.
+
+---
+
+# CCTV twin: redesigned UI, pose-based posture, layout editor (14 Oct 2026)
+
+**Not committed.** Request: redo the CCTV twin's UI and look, and fix its logic,
+3D view and sitting/standing. Contract written first:
+`docs/decisions/cctv-twin-posture-layout-contract.md` (posture evidence, anchors,
+feed lease, surveyed furniture, calibration gate; implementation notes at the end).
+
+- Backend (`services/cctv/factoryTwin*.js`, `routes/cctvSso.js`): posture gated
+  on pose evidence; world yaw from camera-relative facing; anchor-aware position
+  quality with a homography-based estimate replacing the linear proxy; per-camera
+  session lease + `final` release; pipeline health returned as `feed`/`feeds`;
+  `PUT /api/cctv/twin/layout` (admin, version-checked, `DETECTED` refused);
+  furniture kept across re-calibration; activation refused above 12 px / 0.35 m.
+  Fixed: a non-admin calling `GET /twin/observations` without `cameraRef` got
+  every camera's tracks.
+- Worker (`scripts/cctv-twin-person-worker.py`, new `scripts/cctv_twin_pose.py`):
+  hard-coded `SEATED` removed; yolov8n-pose on tracked crops, posture smoother
+  with an occlusion hold, `--no-pose` people-only mode, health + final frame.
+- Frontend (grav-cms): `components/cctv/FactoryTwinWorkspace.js` rewritten;
+  new `components/cctv/twin/` (scene engine, avatars, furniture, setup panel,
+  pure geometry/catalogue/presentation modules + tests); `/cctv` home and access
+  gate restyled; dev harness `app/preview/cctv-twin` (fixtures, 404 in prod).
+- Checked: backend `npx jest test/cctv` 69/69; Python
+  `scripts/cctv_twin_pose_test.py` 24/24; frontend twin node tests 19/19; the
+  preview harness clicked through in the browser (3D/Plan/Camera views, person
+  inspector, layout drag/rotate/publish, mapping steps, phone layout). Live
+  feed, read-only: pose ≈ 10 ms/crop on CPU, detector ≈ 175 ms, posture held
+  SEATED 16/16 for one seated person.
+- Not checked: the real `/cctv/twin` page signed in (needs a login), standing or
+  multiple people on site footage, ESLint (not installed in grav-cms).
+- To start sending pose, restart the pilot worker: `npm run cctv:twin:person-worker`.
+  Until then its people show posture unknown.
 
 ---
 
@@ -2447,37 +2937,624 @@ directly and work either way, but the pages its lines open call those APIs.
   browser.
 
 
-## IE: operations assignment and per-work-order line planning (16 Oct 2026)
+---
 
-Owner's ask: the IE order page must show the product photo etc.; IE assigns /
-changes the operations against work orders (one or many at once — "the main
-thing"); line planning per work order on the supervisor's 2D/3D floor, with
-shortcuts (multi-WO, copy / reference another WO), stored on the WO for PPC.
+## CCTV twin: phone in hand by hand length (16 Oct)
 
-Backend (grav-backend):
-- `models/CMS_Models/Manufacturing/WorkOrder/WorkOrder.js` — `operationsPlan`
-  and `linePlan` sub-documents (additive, no default).
-- `services/industrialEngineering/ieWorkOrderPlanning.service.js` (+ `.test.js`,
-  4 node:test cases) — reads, set/append/copy operations, save/copy/clear line
-  plan, floor read, plan sources, registered operations, operators.
-- `routes/CMS_Routes/IndustrialEngineering/ieRoutes.js` — `/work-orders/*`.
-- `services/industrialEngineering/ieOrders.service.js` — MO rows carry photo,
-  variant, operation rows + plan stamp, line-plan summary.
+`scripts/cctv_twin_pose.py` measures hand-to-phone distance in the person's own
+hand length, not torso length:
 
-Frontend (grav-clothing):
-- `app/industrial-engineering/orders/mo/[moId]/page.js` (rebuilt),
-  `…/mo/[moId]/line-plan/page.js` (new),
-  `components/industrialEngineering/orders/{WorkOrderRow.js (rebuilt),
-  OperationsDrawer.js, LinePlanBoard.js, workOrderPlanning.mjs (+ test, 4 cases)}`,
-  `app/production-supervisor/dashboard/tracker/components/FloorCanvas1D.js`
-  (`slotBadges`, `machineSlotTap` props), `lib/industrialEngineering/api.js`,
-  `app/industrial-engineering/ieShell.test.mjs` (scope of the read-only sweep).
+- `hand_length_px` takes the larger of the torso estimate and the shoulder
+  estimate, and still works with the hips hidden.
+- The hand extends along the forearm, and evidence from both hands combines.
+- The earlier camera-specific "above the wrist" rule is gone.
 
-Verification: backend unit tests pass; the FerretDB harness
-(`/home/claude/work/e2e/ie-plan.js`, real models + real service, ownership
-bound stubbed) passes 19 checks — read with photo/variant, floor read,
-register search, set / append / copy operations (closed WO skipped, version
-bumps, stamps), save one plan on two WOs each resolving its own operation
-rows, copy plan, re-save, sources, clear, refusals. Frontend: pure rules
-tests pass; every new JSX file parses (esbuild); `ieShell.test.mjs` 33 pass /
-2 fail exactly as at HEAD. Not run here: `next build`, a browser session.
+Live replays:
+
+- leaning man, phone in both hands: 0.93–0.96, was flickering 0–0.84;
+- man reading a phone in one hand: 0.86–0.96, was 0–0.24;
+- everyone else: 0.
+
+`cctv_twin_pose_test` 92/92. A phone held low and edge-on is still not
+detected; that is a resolution limit, see the decisions doc. Needs a worker
+restart.
+
+## PPC cutting target: hour by hour (16 Oct 2026, owner: "hour 1 – 0, hour 2 – 200 pcs")
+
+Cutting has no rate. The stage page's Schedule for Cutting is now **Hour by
+hour** (default) or **By a finish date**. Hour by hour is a grid — the nine
+shift hours (09:30–18:30) down, days across — where each cell is the garments
+due off the tables in that hour; most are 0. **Fill from the lay plan**
+(`planMath.layHourPlan`) loads the lays onto N tables, each lay taking
+plies × spreading min/ply + cutting min/lay, rolling past 18:30 into the next
+working day, and drops its garments in the hour it finishes; any cell can then
+be typed over. The grid is sent as `dayPlan` (one entry per non-empty hour,
+`time` = the hour's end, `label` "HH:MM–HH:MM"); the evaluator already treats
+each as due whole at its time, and `describeTarget` says "hour by hour".
+
+- Calculate lays now picks, per colour, a marker carrying only sizes that
+  colour needs (most garments a ply), instead of the first marker for all.
+- Server ceiling for an hour plan: the allowance, or what a sound cut plan
+  cuts of REQUIRED sizes (whole-ply rounding: 1,238 → 1,240); sizes nobody
+  ordered never raise it.
+- The control read now exposes `workingDays`, `ramp`, `hours`, `cap`,
+  `dayPlan` on a target; the order's Plan chain in the hour view puts a
+  batch whole in the hour it is due.
+
+Tests: planMath 14, planChain 15, cutPlan 9, targetMeaning 9 (frontend);
+services/ppc 44 (backend). `npx jest test/ppc`: 388 pass, 4 fail — the PPC
+department-seeding cases (`ensureAccessDepartments.js`, another lane's
+uncommitted change), unrelated to targets. Verified in
+`/preview/ppc/order/stage?stage=cutting&fresh=1`. Nothing committed.
+
+### …and the technical part belongs to IE (same day, owner: "just planning and plotting is what PPC does")
+
+PPC's stage page no longer takes a cut order plan (markers, ratios, plies,
+allowance) or spreading/cutting minutes. Cutting's hour grid stays; its fill
+now reads IE's figures. `IeDepartmentStandard.cutting {tables, garmentsPerLay,
+minutesPerLay}` (Cutting only; all three or none — `validateCutting`) is set
+on IE › Settings › Department standards, in a second line under the Cutting
+row, and travels to PPC as `departments[].standard.cutting` on the control
+order read (`departmentStandards.cuttingOf`). PPC shows it in one line ("2
+tables, a lay of about 300 garments every 2 h 10 min") and **Fill the hours**
+cuts the selected quantity into lays of that size on those tables; without it,
+PPC types the hours and is told IE has not set them. The cut-plan engines
+(`services/ppc/cutPlan.js`, `lib/ppc/cutPlan.mjs`) are kept but no PPC screen
+uses them — a per-order cut plan, if wanted, is IE's screen to build. Preview:
+`/preview/ppc/order/stage?stage=cutting&fresh=1` (`&noie=1` for the unset
+state) and `/preview/ie/standards`.
+
+### …and the work orders and the schedule are one grid (same day, owner: "they need to be linked")
+
+The stage page has ONE section, **Plan**: a row per work order with a
+balance, a column per day (By day) or per shift hour of a chosen day (By
+hour), and in each cell how many of that work order are due then. Row totals
+are the work orders' quantities (the allocations), the grid total is the
+target, column totals are each day's / hour's load — one work order in a lay,
+several in one lay, two in a trimming day are all just cells.
+`components/ppc/plan/planBoard.mjs` (pure, 7 tests): `totalsOf`,
+`planEntries`, `regrain`, and three fills that only write cells — to a
+finish date (even, work order after work order), at IE's capacity a day / an
+hour, and for cutting in IE's lays (lays of IE's size, never two colours in
+one lay, each lay due whole in the hour it comes off a table).
+
+Server: `dayPlan` entries carry `workOrderId` (model + `validateBody`, up to
+3000 entries); `checkTarget` refuses an entry for a work order outside the
+target, or a work order whose entries do not add up to its allocation;
+`describeTarget` says "N garments across K work orders, day by day / hour by
+hour". The old pace modes (daily / hourly rate, ramp) are no longer on this
+page; the server still evaluates them for targets set elsewhere.
+
+### …and cutting is planned by lay (same day, owner: "no lay options?")
+
+Cutting's grid has a third view, **By lay** (its default): a column per lay,
+each headed by its day, the shift hour it comes off the table and its table
+(T1…, as many as IE's tables), and a cell is how many of a work order go into
+that lay. Which work orders share a lay and when it is cut is PPC's plan;
+marker and plies stay IE's. The column foot shows the lay's total, its work
+orders and colours, and flags "two fabrics in one lay" and "above IE's lay
+size". **+ Lay** adds the next hour; a lay can be removed. "In IE's lays"
+fills lays directly. Switching to By hour / By day keeps every garment (a lay
+becomes its hour); switching back turns each filled hour into a lay.
+planBoard.mjs: `laysToCells`, `layEntries` (entries labelled "Lay N · T1",
+due at the end of the lay's hour), `cellsToLays`, `nextLay`, `layFacts`;
+`fillByLays` also returns `layList` / `layCells` (9 tests). The server's
+`describeTarget` reads such a plan as "N garments across K work orders in L
+lays …; each lay's garments are due when it comes off the table".
+
+### …one timeline, redesigned with Impeccable (same day, owner: "by hour, by day, by lay shouldn't feel different")
+
+No view switch any more. The plan is ONE timeline: rows are work orders
+(product first, then colour · size · WO number), columns are days, and any
+day opens IN PLACE into its nine shift hours (chevron on the day header;
+the open day's first hour carries a "‹ Fri 16 Oct" close control). A cell is
+a day ("due by its end") or an hour of a day; both live in the same cells, so
+opening or closing a day never moves a garment. A closed day with hours
+planned shows their sum and opens on click. In cutting, an hour with garments
+in it IS a lay — chips "Lay 3" / "Lays 1–2" (with IE's lay size, an hour
+holding two tables' lays reads as two) — and the footer flags two fabrics
+only where colours outnumber lays, and more lays than IE's tables. Balance
+and Planned are one pinned column ("150 / 150 ✓"). Fills live behind one
+**Fill** button (evenly to a date; in IE's lays or at IE's capacity), Clear
+beside it. planBoard.mjs now exports `dayHasHours`, `rowDay`, `layNumbers`
+(→ {first,last,count}), `layWord`, `slotFacts`, `timelineDays`; the lay-grain
+helpers and `regrain` are gone (8 tests). Server reads "Lays 1–2" labels.
+Pinned header cells carry a ground layer because grav-ui.css clears every
+`thead th` background with !important.
+
+### …and every department in its own unit (same day, owner: "do something similar, in context, for trimming, ironing and all")
+
+`lib/production/stageProfiles.mjs` (CMS) names how each department works,
+and the one timeline reads it:
+
+- **batch** — Cutting (lays per table), Washing (loads per machine; a load
+  mixing shades is flagged), Embroidery (runs per machine; a run mixing
+  designs is flagged). An hour with garments in it IS a batch ("Loads 1–2"),
+  filled from IE's batch line; more batches in an hour than IE's machines is
+  flagged. The first day opens into hours.
+- **flow** — Sewing, Trimming, Ironing, Printing, QC: each day and hour is
+  read against IE's capacity ("over 420"); fill at capacity.
+- **pack** — Packing: as flow, plus the cartons each day / hour makes at
+  IE's carton size.
+- **ship** — Dispatch: by day only; a day with garments is a shipment
+  ("Shipment 1"); the fill is "all in one shipment on <date>", not a trickle.
+
+IE: `IeDepartmentStandard.batch {machines, perBatch, minutesPerBatch}`
+replaces the cutting-only `cutting` field (still read for cutting by
+`batchOf`); `BATCH_FIELDS` says which department needs which (packing: carton
+size only); all or none, refused in words. IE's form shows the line under
+each batch department in its own words. The control read carries
+`standard.batch`. planBoard.mjs: `fillByBatches` (groupBy colour | product),
+`batchNumbers`, `batchLabel`, `shipments`, `fillOneDay` (11 tests); the
+server's sentence reads lays, loads, runs and shipments.
+
+## Cutting overview, laid out like Marketing's (16 Oct 2026, owner)
+
+`GET /api/cms/manufacturing/cutting-master/overview?from=&to=` (in
+cuttingMasterRoutes, before /barcode-search; the router's own auth) is one
+read built from `CuttingMasterRecord` — the cutting masters' dated cut
+sessions — by `services/manufacturing/cuttingOverview.js` (pure, 2 tests):
+every day of the range (zero where nothing was recorded), the shift's hour
+buckets (shiftHours), people, work orders, totals (pieces, sessions, work
+orders, people, active days, per active day, peak day); range at most 92
+days. The route adds each work order's quantity, cut-so-far, order ref and
+customer. Read-only. On the dev DB (16 Oct): 91 records, latest 15 Oct, 200
+pieces in the 17:30 hour.
+
+CMS: `/cutting-master/dashboard/overview` is now `components/cutting/
+CuttingOverview.js` on the cutting layout's new `bare` mode (no legacy
+canvas, as Marketing's pages): header with Today / 7 / 30 days, Export,
+Refresh; Marketing's six-figure KPI strip with bars; the dominant chart (by
+day as a line; ONE day as hour bars, because a lay comes off whole); "What
+needs attention" from PPC's cutting targets (behind first, link to the
+order) and "Who cut"; Find piece; the work-order table (cut in range, cut of
+order, by whom, last cut); measurement orders only when there are any; a
+footnote. `components/cutting/cuttingOverview.mjs` (3 tests). Preview:
+`/preview/cutting/overview` (`?empty=1`). The old tiles, master cards and
+org/bulk accordions are gone; their data is in the table and the CSV.
+
+### …led by Assigned work, with PPC's target on each order (same day, owner: "needs the most highlighting, and redirects to assigned work")
+
+The overview now OPENS with an "Assigned work" panel (above the KPI strip):
+one sentence of the whole ("2,858 pieces to cut across 4 orders · PPC asks
+849 today, 612 done"), red lines for targets awaiting Cutting's answer and
+orders behind, an "Open assigned work →" button, and the orders still to cut
+(the same list Assigned Work reads, `GET …/cutting-master/manufacturing-orders`)
+most urgent first — PPC target awaiting an answer, behind, on a target, no
+target by delivery — each row showing today vs PPC's ask, cut / order with a
+bar, pieces left and the delivery date (red when past), and opening
+`/cutting-master/dashboard/assigned-work/<moId>`. Six rows, then "N more in
+Assigned work". `workQueue` in cuttingOverview.mjs (tested); the separate
+"What needs attention" rail panel is gone — its targets are on these rows.
+
+**Revised the same afternoon (owner: "not so big … a header black slab with a
+brief overview, don't shift the rest down"; "don't merge with the existing
+UI").** The Assigned-work panel and its order rows are gone. The page head is
+unchanged (title, range, Export, Refresh); under it sits ONE slim dark slab
+(`WorkSlab`, `var(--slab)`), the whole of it a link to Assigned work: To cut
+(pieces · orders), PPC today (done / asked), Awaiting answer and Behind (lit
+in the slab's rose only when non-zero), and an "Open →" control. `workQueue`
+still computes its figures.
+**…and a little fuller (owner: "not so thin, a few more details").** The slab
+is now a two-tier dark block: title + one-line sentence + "Open assigned
+work"; five stacked figures (To cut · pieces across N orders; PPC today ·
+done / asked with % of today's ask; Awaiting answer; Behind; Past delivery —
+the last three lit only when non-zero); and a "Most urgent" strip naming the
+first order of `workQueue` with why and what is left, opening that order.
+`workQueue.summary.overdue` added (tested).
+**…with the products (owner: "if using so much space, add product details /
+pics").** `GET …/cutting-master/manufacturing-orders` now also returns, per
+order, `products[]` (≤6, largest first): `{name, image, quantity, cut,
+variants}` — from the work orders the route already read for PPC's targets,
+grouped by stock item; the photo is the variant's (`pickStockItemImage`),
+else any variant's, because every photo in this database sits on a variant.
+Additive; Assigned Work ignores it. The slab's "Most urgent" is now the
+three most urgent orders as cards: ref · customer, why (lit when awaiting /
+behind / past delivery), pieces left, and up to three products each with its
+photo (a 96px Cloudinary crop) or initial, "cut / pieces" and variant count,
+"+N more product(s)"; each card opens its order.
+
+## Assigned Work, in the overview's language (16 Oct 2026, owner: "fix the UI of this too, keep the box shape")
+
+`/cutting-master/dashboard/assigned-work` is now `components/cutting/
+AssignedWork.js` on the layout's `bare` mode (nav key fixed: the page passed
+`activeMenu="cutting-master"`, which lit nothing). Page head + Refresh; a
+six-figure strip (orders to cut, pieces to cut, PPC today, awaiting answer,
+behind, past delivery — the last three red when non-zero); one toolbar
+(search over order, customer AND product; Status To cut · Cut · All with
+counts, default To cut; type All · Bulk · Measurement — the old toolbar had
+only an "All" button; cards / list, remembered). The CARDS keep their box
+shape and grid: ref, customer, measurement name, type chip; product photos
+(overlapping thumbnails, initials when none) with the main product, "+N more"
+and work-order count; PPC's standing in words (awaiting answer / behind with
+today's figure / on target / past delivery / none / fully cut); cut / total
+with % and bar, left, people pending for measurement orders; due date (red
+"Was due" when past and not cut) and created date; Open →. The list view
+carries the same per row. Ordering is `workQueue(…, { all: true })`, the
+overview's own (finished last). Preview: `/preview/cutting/assigned-work`;
+both cutting previews share `app/preview/cutting/fixtures.js`.
+**…compressed, with particulars (owner: "some particulars like dates /
+hours, compress the slab while keeping the details").** ~220px at 1440 (was
+~560). Head row: "Assigned work" + "Fri 16 Oct · 12:17 · 6 h 13 min of shift
+left · N/h needed for PPC" (the shortfall summed ORDER BY ORDER — a surplus
+on one order does not cut another's — over the shift minutes left; ticks each
+minute), the five figures inline (value + short note), Open assigned work.
+Three compact urgent cards: ref · customer and pieces left; why; facts — due
+date with "in N d" / "N d late", PPC window · per day · days left, "N/h needed
+now", % cut; one line of up to three products (24px photo, name, cut/qty;
+full detail on hover) and "+N". cuttingOverview.mjs: `shiftNow`,
+`perHourNeeded`, `minutesWords`, row `daysToDue` and target `from/to/perDay/
+daysLeft/neededPerDay` (6 tests).
+**…formatting polished (Impeccable polish pass).** Head: day · clock and
+shift-left on two lines; six figures between hairlines (To cut, PPC today,
+NEEDED NOW as its own figure, Awaiting, Behind, Past delivery), each label /
+value / one consistent sub-line. Urgent cards: ref over customer with
+"pieces left" on the right; a status line with a dot; then a fixed
+three-column fact grid — Delivery (date / in N days · N days late), PPC
+target (window / per day · days left), Cut (% with a bar / N/h needed now or
+cut of total) — via one `SlabFact` shape; then overlapping product photos and
+"<lead product> and N more". The fact grid's three columns are set INLINE:
+globals.css folds any bare `grid-cols-3` to one column under 768px; the head
+figures use responsive classes (2 / 3 / 6). Verified at 1440 and 375 (no
+sideways scroll).
+
+## PPC's department plan — one lay, several orders (16 Oct 2026, owner)
+
+"A lay could be for 2–3 orders … it should come from PPC … give PPC a
+department-wise page." PPC stays ORDER-wise in storage (one PpcOrderTarget
+per order + department, no new collection); the department plan is a new
+WAY to write those targets.
+
+- **Pure**: `services/ppc/departmentPlan.js` (3 tests) — `cellsFromTargets`
+  (the department's active targets → grid cells; paced targets listed apart)
+  and `plansFromCells` (the grid → one dayPlan per order; entries labelled
+  ACROSS orders — Cutting's 10:30 hour is "Lay 1" on every order in it, two
+  machines' worth "Lays 1–2"; `layKey` = department:day[Thour] is the shared
+  identity; refusals: over the balance, not a shift hour, an hour on
+  dispatch, a work order not open there).
+- **Service**: `services/ppc/departmentPlan.service.js` — `read` (open work
+  orders at the department across all orders from `orders.snapshot`, with
+  order, delivery, product, photo, colour, size, balance; the grid; other
+  targets; IE's capacity / batch) and `save` (every order's share checked with
+  `previewTarget` first — nothing written while any order is refused — then
+  `setTarget` per order with `planSource: "department"`; department-plan
+  targets no longer on the plan are cancelled).
+- **Routes** (orderTargetsRoute): `GET|POST /api/cms/ppc/targets/department/
+  :dept/plan` (PLANNING_READ / PLANNING_WRITE).
+- **Model**: `dayPlan[].layKey`, `planSource` ("" | order | department);
+  validateBody carries both; the evaluated target returns them.
+- **CMS**: PPC → Departments → <dept> has a **Plan** tab first
+  (`components/ppc/plan/DepartmentPlan.js`): the order plan's grid
+  (`PlanBoard`, now exported, with `groupOf` order header rows: order ·
+  customer · due / days late · planned here), fills across orders (batches
+  grouped by colour — design for embroidery — earliest delivery first inside
+  a colour), a summary (orders, pieces, lays, hours shared by >1 order,
+  targets planned another way) and Save plan. The order plan page opens with
+  the order's current share and says when it comes from the department plan,
+  linking to it. Cutting's overview has "PPC's lays today" (`laysFor`,
+  tested): each lay with its time, label, total and every order's share,
+  linking to the order and to Cutting seasons.
+- Verified: real read (Cutting 39 open WOs / 6 orders; Trimming 143 / 9);
+  a two-order lay dry-checked against the real database with previewTarget —
+  both orders accepted, same `layKey`, both "Lay 1" — NOTHING WRITTEN.
+  Previews: `/preview/ppc/department-plan?dept=cutting|washing|…`.
+- Not yet: "Start lay" pre-filling a cutting season, and the Cutting order
+  page redesign (slab, today's lays for the order, Cut next lay).
+**…without the right panel (owner: "concept is good, make the UI better,
+remove the sidebar").** The department plan is full width; its summary
+(Orders, Pieces planned / open with %, Lays with how many are shared,
+Period), the note and Save sit in ONE dark bar pinned to the bottom of the
+screen (`sticky bottom-3`), with errors / success above it. "Planned another
+way" is a one-line note above the grid. Empty hour cells now show a faint
+"–" field so it is plain they can be typed into; the save button says
+"Nothing planned yet" when nothing is.
+
+### …same fabric, one lay (owner: "same fabric = one lay — add those logical things")
+
+A cutting lay is now grouped by FABRIC, not by the colour word.
+`departmentPlan.fabricOf` (tested): of a work order's `rawMaterials`, the one
+whose RawItem `category` matches /fabric/ (metres alone are not enough —
+fusing, waistband and thread are in metres too); several → the one needed
+most; key = raw item + variant; name + shade for people. The department plan
+read attaches `fabric` to every open work order (one WorkOrder + one RawItem
+read). Real data, 16 Oct 2026: 10 of 39 open cutting work orders name a
+fabric; "SuitingFabric 63/37PC Plain · Black" (REQ-0007 + REQ-0003) and
+"Shirting Fabric · Ice White" (REQ-0011 + REQ-0003) are each shared.
+
+CMS: `groupKey(line, "fabric")` (planBoard.mjs, tested) — fabric, else colour
+— drives the lay fill (`stageProfiles` cutting `mixBy: "fabric"`) and the
+lay check ("2 fabrics" when fabrics outnumber the lays in an hour); the hour
+footer also says "N orders" for a shared lay and "room for N" when a lay is
+under half of IE's lay size. Rows show the fabric. The department plan has a
+"Same fabric, several orders — can share a lay" strip (each fabric used by
+>1 order, with every order's balance) and "Plan together", which lays that
+fabric's remaining pieces into lays (IE's figures) or, without them, one lay
+in the first free hour; and a note of how many work orders have no fabric on
+their bill (grouped by colour instead).
+
+### …hierarchy and scannability (Impeccable layout pass, owner: "bland, no visual hierarchy")
+
+On real data (39 work orders, 7 orders) every row weighed the same and the
+grid was a wall of boxed "–" fields. Now (PlanBoard with `groupOf`):
+- Each ORDER is a block: a header row that leads — chevron, order number ·
+  customer (14px semibold), a due chip (red "78 d late" when past), work-order
+  count, per-column totals of its work orders, and planned / left with a bar
+  — separated from the next by a band of page ground. Clicking it folds the
+  order; at first only orders with something planned, else the three most
+  urgent, are open; "Expand all / Collapse all" beside Fill.
+- Work-order rows sit indented under it: a size chip, the product, and the
+  fabric with its DOT (`fabricTone`, planBoard.mjs: one muted tone per
+  fabric key from eight, the same in the rows and in the "same fabric"
+  strip) so the same fabric is found across orders by eye.
+- Empty cells are quiet (no box, no placeholder; outlined on row hover or
+  focus); filled ones carry a green tint and weight.
+- The current shift hour, today, is a soft column.
+The single-order plan page uses the same grid without `groupOf`, unchanged
+in structure.
+
+### …as a spreadsheet (owner: "same size and same colour everywhere — make it like Excel")
+
+PlanBoard's grid is now a spreadsheet: every cell carries its own right and
+bottom gridline (`CELL` / `HEAD`), and each kind of thing is one shade apart
+(`XL` custom properties, mixed from the theme's ink and surface so dark mode
+holds): header grey, DAY band a step darker spanning its hours (two-level
+header, like merged cells), ORDER rows a cool tint with bold emerald
+subtotals, work-order rows white with a faint zebra, alternate days a faint
+band, a PLANNED cell solid emerald with emerald ink, the current hour amber
+(header a stronger amber), over the balance red, totals a darker grey under a
+2px rule. Inputs fill their cells square (no radius), with a hover line and
+a 2px emerald selection outline. Header cells are `<td role="columnheader">`
+because grav-ui.css forces every `thead th` transparent and faint with
+!important; cell inputs carry `.xl-cell`, a new grav-ui.css rule (beside
+`.frost-inline`) that keeps them transparent over the cell's shade — the
+base layer force-fills every input with --surface-raised — but, unlike
+`.frost-inline`, keeps box-shadow for the selection.
+
+### …a lay is one fabric — enforced (owner: "two different products with different fabrics in a single lay — isn't that impossible?")
+
+The plan had let REQ-0011's MT Jacket (SuitingFabric · Grey) and REQ-0012's
+F&B Apron (SuitingFabric · Beige) into one lay with only a small footer note.
+Now one rule, server and CMS alike (`layMix` in services/ppc/departmentPlan.js
+and components/ppc/plan/planBoard.mjs, both tested): a lay is spread ply on
+ply and cut by ONE marker, so two fabric QUALITIES are never one lay; one
+quality in two SHADES is a multi-shade lay of ONE product only (warning);
+one fabric and shade, several products, is fine; an hour holding k lays
+(IE's lay size) may hold k fabrics; work orders whose bill names no fabric
+are not judged. `fabricOf` now returns `quality` (the raw item).
+- Server: `departmentPlan.service.save` attaches fabrics for cutting and
+  REFUSES (409) an hour whose lays mix what no lay can, naming the hour.
+- CMS: the hour's lay tag turns red (amber for multi-shade), the clashing
+  cells get a red outline and wash, the totals row says why, the reason sits
+  above the save bar, and Save is disabled until a piece is moved.
+
+### …filters, grouping, sort (owner: "filters — if someone wants to do the same-fabric products first")
+
+The department plan's grid shows a VIEW: search (order, customer, product,
+fabric, work order), Group by Order | Fabric | Product (Fabric: one block per
+fabric across orders, headed "N orders · one lay" with its colour mark;
+work orders without a fabric grouped by colour), a fabric picker (fabrics by
+how many orders share them), toggles Shared fabric / Late orders / Not fully
+planned, and Sort (delivery first, most pieces left, shared fabric first).
+The PLAN stays every line: saving, the bottom bar and the lay checks read
+all of it (PlanBoard `allLines`), so a filter cannot hide a clash. With a
+filter on, Fill plans only the shown work orders' REMAINING pieces and ADDS
+to the plan, lays starting after those already planned (`firstFree`,
+`fillByBatches({ startAt })`, `mergeCells` — tested); Clear clears only the
+shown rows; "Plan together" also starts after the planned lays now (it used
+to start at 09:30 and could land on a lay of another fabric).
+
+## The department Plan tab is the gate; an order page only proposes (16 Oct 2026, owner)
+
+Owner: "lets make the dept pg the gate of confirmation". An order's stage
+plan page no longer sets a live target. It PROPOSES; the department's Plan
+tab takes the proposal into its grid and the department's Save makes it live.
+
+- `PpcOrderTarget.status` gained `proposed`, `accepted`, `declined`.
+- `orderTargets.setTarget` with `body.propose === true` writes a
+  `status: "proposed"`, `planSource: "order"` target, marks that order +
+  department's earlier proposal `replaced`, leaves the active target alone,
+  and answers `{proposed: true}`. Same checks as a live save.
+- `POST /api/cms/ppc/targets/:targetId/decline` (canSet) →
+  `declineProposal`: only from `proposed`, to `declined`, with the reason.
+- `orders.snapshot` keeps proposals OUT of `targets` / `targetsByMo` (so
+  the target board, calendar, reports and department panels never count
+  them) and hands them back as `proposals`. Per-department `targetHistory`
+  and `orderDetail.past` exclude them. Each department row of the order view
+  carries `proposal` (the latest waiting one, evaluated) and `lastAnswer`
+  `{status: accepted|declined, at, by, reason}`.
+- `departmentPlan.read` returns `proposals[]` (order, customer, pieces,
+  cells in the grid's own shape, dates, who, note). `save` takes
+  `acceptedProposals: [targetId]` — ONLY the ones the person took into the
+  grid. After saving the shares, each is marked `accepted`, with
+  `replacedById` set to the department plan's target for that order. A
+  proposal that was not taken stays waiting; saving never accepts one on
+  its own.
+- CMS: `StagePlanPage` sends `propose: true` ("Propose to the {Dept}
+  plan"), starts from the waiting proposal if there is one, and shows
+  "Waiting on the {Dept} plan" or the last answer, with a link to
+  `/ppc/departments/:dept?tab=plan`. `DepartmentPlan` lists "Waiting to be
+  planned" with Take into plan (replaces that order's rows in the grid;
+  the save button lights up) and Discard (declines). `targetsApi.declineProposal`.
+
+NOT gated yet: `QuickTarget` on the target calendar and any older client
+that posts a target without `propose` still set a live target directly.
+
+Note: the Cutting plan the owner saved earlier (REQ-0011 MT Jacket and
+REQ-0012 F&B Apron in Lay 1, two shades of two products) was saved before
+the lay-mix refusal existed. The next save of the Cutting plan is refused
+until that lay is split.
+
+Verified: services/ppc 56/56; CMS plan + cutting 48/48 (two source-text
+tests in `cuttingSeasons.test.mjs` re-pointed at `CuttingOverview.js`, where
+the overview body moved). Preview `/preview/ppc/department-plan?dept=cutting`:
+proposal listed → taken → Save sent `acceptedProposals: ["p1"]`; reload →
+Discard → declined and gone. `/preview/ppc/order/stage?stage=cutting`:
+Propose sent `propose: true` and answered "Proposed. It goes live when PPC
+takes it into the Cutting plan and saves there."
+
+## Cutting seasons: main's log book, started from PPC's lays (16 Oct 2026, owner)
+
+Owner, with a screenshot of cms.grav.in: "this was my cutting second step
+interface. We have removed the scanning … now that you have the PPC concept,
+make it something like this and additional." (An earlier pass the same day
+tied PPC's lays to the SCANNING season; that version is gone.)
+
+**The log book came from `main`.** The typed Daily Fabric Cutting Logbook
+(one season = one lay; report details; the Excel-like lay row; Save & close;
+24-hour edit window; Remove; date-range report) existed only on `origin/main`
+in both repos. This branch was 53 (backend) / 74 (CMS) commits behind and
+carries much unrelated uncommitted work, so `main` was NOT merged: only the
+log-book files were brought over, byte for byte from `origin/main`
+(backend: CuttingSeason model, cuttingSeasonRoutes + test, cuttingSyncRoutes,
+services/manufacturing/cuttingLogBook + test, test/cutting/cuttingLogBook.route.test.js;
+cuttingMasterRoutes three-way merged cleanly with this branch's overview
+route. CMS: LogBookGrid, logBookGrid.mjs + test, CuttingRangeReport,
+lib/cuttingLogDraft, lib/reports/cuttingLogBookWorkbook + test,
+lib/cuttingSeasons, assigned-work/[moId] page, preview/cutting/log-book). A
+later merge of `main` meets identical content there.
+
+**What PPC adds** (backend):
+- `services/manufacturing/cuttingSeasonPlan.js` (pure, 6 tests):
+  `laysFromTargets` (live cutting targets only; a target's `cutPlan` lay for
+  the same day + hour rides along), `planOf`, `headerFromPlan` (buyer, the
+  order's MO number, style = `stockItemReference`, colour, date),
+  `suggestLay` (the log book's own cell values: lay no, style, colour, fabric
+  lot, BOM cons; marker / width / eff / ratio / plies / table from PPC's cut
+  plan when there is one, else a ratio + plies from the pieces when they
+  reduce to a marker of ≤12 garments; sizes outside XS…3XL — 30, 40 — get no
+  ratio), `planCheck` (size by size, planned vs ratio × plies; notes for
+  non-column sizes and a style PPC did not plan).
+- `cuttingSeasonPlan.service.js`: `plannedLays` (each lay's work orders with
+  product, style, size, colour, photo, fabric via `departmentPlan.fabricOf`,
+  BOM = fabric `requiredQuantity` ÷ WO quantity when the unit is metres; the
+  season holding it, removed seasons ignored) and `planForSeason` (409 for a
+  lay PPC no longer plans or an OPEN season holds, with its `seasonId`).
+- `CuttingSeason.plan` (embedded, null by default; no new collection):
+  lays, lines, fabrics, pieces, `cutPlan`, `suggestion`, takenAt/By. Index
+  `{companyId, plan.lays.layKey}`.
+- Routes: `GET /seasons/ppc-lays`; `POST /seasons {layKeys}` creates the
+  season with the header from the lay and the plan; `seasonView` carries
+  `plan` and `planCheck`. Nothing is refused that was accepted before.
+
+**The page** (`components/cutting/CuttingSeasons.js`; the route is a `bare`
+shell): Marketing kit slab, PPC's lays (day switch; Start season per lay),
+open / closed seasons with "Against PPC", and in a season the step rail,
+1 · Report details (filled from the lay), PPC's ask (lines, fabric, size
+table, "Fill the lay from PPC" — confirms before replacing typed values),
+2 · This season's lay (main's LogBookGrid; size-wise pcs shows "of" PPC's
+figure). PPC's suggested row is written as the grid's own DRAFT
+(`seasonLays.ppcDraft`), so the cutting master checks it and it saves on
+the first edit or Save & close — nothing PPC says is saved unseen.
+`LogBookGrid` gained one prop, `restoredNote`, so that draft says it came
+from PPC rather than "from your last visit".
+
+Real data (read-only, 16 Oct): the one live lay (REQ-0012, 12 F&B Apron,
+size 30) fills buyer "Mayfair garden", MO-REQ-2026-0012, style
+PROD-OUT-F&BAPR-174, colour Beige, fabric lot "SuitingFabric 63/37PC Plain ·
+Beige", BOM 1 m/pc; no ratio (size 30 is not a column).
+
+Utilitarian pass (same day, owner: "operational app … utilitarian; make the
+important stuff visible on first landing", then "don't drift away from our
+ui style"): the kit's page slab stays, at `density="compact"`; the step rail
+is gone; panels use the kit's PanelHead. A season reads top to bottom as the
+work: report details (one row) → the lay (grid with Save & close) → PPC's
+ask. The slab carries pcs cut, fabric consumed, wastage, avg cons (flagged
+against BOM) and, as its lead figure, cut against PPC's ask; on the list,
+open seasons, cut today, flagged today and planned today. At 1440×900 the
+whole lay, with its computed row, is above the fold.
+
+A lay, not a report (same day, owner: "PPC details are buried below … stop
+treating this as a report — this is input … this is a lay interface, not
+enough mention of lay, all orders are mentioned"): a season is titled and
+listed by its LAY (`seasonLays.layTitle` / `laySub`: "Lay 1 · Today ·
+09:30–10:30 · Shirting · Ice White"), never by order or style. Top to
+bottom: PPC's plan for this lay (fabric, marker, ratio, plies, table, when;
+to cut / cut / difference by size; the orders it is FOR as one small line;
+"Fill the row from PPC") → "Enter the lay as it was cut" (the grid) → Order
+& date (the old report details, last). The slab shows input progress — to
+cut, plies, fabric issued, cut / to cut — not wastage or avg cons;
+Download report is secondary. The list says Lays to cut / Start lay / Lays
+in progress / Lays cut / New lay.
+
+The sheet comes first (same day, owner: "like Excel, bigger and more
+readable … don't overdo it, a sheet, not an illustrated thing … merge PPC's
+plan with the header, get the input sheet a little upper"):
+- `LogBookGrid` in `single` mode lays the one row out as three plain sheet
+  bands — Who and what · Marker, ratio and plies (ending in garments a ply
+  and pcs cut) · Fabric (ending in consumed) — 44 px cells, 14 px text, the
+  same cells, keys, drafts and saving; Enter walks to the next cell; an empty
+  cell shows PPC's value in grey (`hints`). The many-row sheet is unchanged.
+- The season header carries PPC's lay: pills for fabric (a colour chip,
+  `seasonLays.swatchOf`), marker, ratio, table; figures To cut (by size),
+  Plies, Cut / to cut.
+- Then ONE compact picture row with no heading (`LayStrip`): fabric swatch ·
+  marker strip (one block per garment in the planned ratio, or "no marker
+  from PPC") · ply stack (× plies = pcs) · the garments with photo and size.
+  The owner's "don't overdo the Excel" meant the headings: the sheet panel's
+  title/sub and the band labels are gone; "Fill again from PPC" sits in the
+  grid's toolbar (`LogBookGrid` prop `lead`, single mode only).
+- Nothing twice (owner: "are these two even needed … don't repeat data
+  already in the header"): "What this lay is for" is gone — its cut vs to
+  cut moved into the strip's "For · cut so far" column, per garment by its
+  size. The header carries only the lay (`layTitle`: PPC's label, else the
+  row's lay no, else "Lay · any time" — never "Day's cutting"), when and who
+  it is for (`layFor`: buyer · MO · style · colour), status, To cut by size,
+  and Cut. Fabric / marker / ratio / table pills and the Plies figure left
+  the header (the strip and the sheet show them). Order & date is shown
+  only for a lay not from PPC; on a PPC lay it opens from "Edit order &
+  date" in the header.
+
+The list, simplified (same day, owner: "overwhelming — simplify it and add
+the important details from PPC: the target, the deadline"): one table,
+"Lays", one row per lay for the chosen day (`seasonLays.dayBoard`: PPC's
+lays plus any open season not among them, so "Lays to cut" and "Lays in
+progress" no longer list the same lay twice). A row: lay and hour, with
+Late (its hour ended and nobody started it — `isLate`) and Urgent / High
+priority tags; fabric chip and garments with photo, size and MO; pcs; Due —
+PPC target (the target's `to`) and customer delivery
+(`customerInfo.deliveryDeadline`), in words and red when past
+(`dueWords`); and one button — Start, Continue (with Remove), or "Cut · N
+pcs". Backend: each lay line carries `targetFrom/targetTo` and the order's
+`deliveryDeadline` (IST day) and `priority`; `cuttingSeasonPlan.dueOf`
+gives the lay the earliest of each and the highest priority (tested). The
+slab: Cut today / planned, Not started, In progress. Lays cut shows the
+latest 8 (Show all), without the fabric column. Real data: today's lay
+(REQ-0012) has PPC's target today and a delivery 37 days past, high
+priority.
+
+Kit fix on the way (CMS): `MarketingPageSlab`'s tab row is `flex-nowrap` — globals.css's phone rule
+wrapped every slab's icon above its title; `kit.test.mjs` pins it.
+
+Still open: log-book lays do not feed PPC's "done" (the ledger reads
+`CuttingMasterRecord`); a lay records sizes, not work orders, so mapping it
+back needs a rule — the owner's call.
+
+Verified: backend cuttingSeasonPlan 6/6, cuttingLogBook + routes + ppc 64/64,
+jest test/cutting 7/7; CMS cutting + kit + workbook 241/241 (main's season
+tests now read the component; two overview checks re-pointed as before).
+Preview `/preview/cutting/seasons` at 1440 and 375: Start season on Lay 1 →
+details and a full lay row from PPC's cut plan → Save & close → "120 of 120
+· as asked", Lay 1 "Cut · 120 pcs" on the list.
+
+
+## PPC Departments, redone as one sheet (16 Oct 2026, owner: "redo the ui, it is shit")
+
+`/ppc/departments` was nine identical cards, mostly dashes. Now
+(`components/ppc/control/DepartmentsScreen.js`; the route is a shell):
+- The PPC header (`PpcPageSlab`, via `ControlPage`) gained an optional
+  `figures` prop — additive, every other page unchanged — and shows the
+  day's answer: "N departments behind" as its status, Done against target
+  (summed over departments with a target), Remaining today, Delayed orders
+  (and where).
+- One kit table, "Today by department", one row per WORKING department
+  (a target, a piece recorded, or an active order) in production order:
+  status, done / target with its bar and %, remaining, pace now · needed
+  (red when short), expected by close (red when under target), capacity /
+  day with efficiency, orders · delayed. Departments with nothing are one
+  line at the foot, each a link. "No IE standard" is said once, in the sub.
+- The stage pipeline below is unchanged.
+- `PpcPageSlab`'s tab row is `flex-nowrap` (the same phone wrap the
+  Marketing slab had).
+Preview: `/preview/ppc/departments` (16 Oct's real shape) and `?busy=1`.
+Four PPC source tests fail on `moduleRoles.js` / the launcher / releases —
+files not touched here; they failed before this change.

@@ -26,6 +26,7 @@ const SLUG = "mrf";
 const NAME = "Requests";
 const DESCRIPTION = "Ask for materials or services and track approvals.";
 const PATH = "/mrf";
+const SORT_ORDER = 44;
 
 (async () => {
   const write = process.argv.includes("--yes");
@@ -43,6 +44,7 @@ const PATH = "/mrf";
     if (existing.dashboardPath !== PATH) fixes.dashboardPath = PATH;
     if (existing.name !== NAME) fixes.name = NAME;
     if (existing.description !== DESCRIPTION) fixes.description = DESCRIPTION;
+    if (existing.sortOrder !== SORT_ORDER) fixes.sortOrder = SORT_ORDER;
     if (!existing.isActive) fixes.isActive = true;
 
     if (!Object.keys(fixes).length) {
@@ -64,6 +66,7 @@ const PATH = "/mrf";
     name: NAME,
     description: DESCRIPTION,
     dashboardPath: PATH,
+    sortOrder: SORT_ORDER,
     isActive: true,
     showOnOnboarding: true,
   };

@@ -81,6 +81,26 @@ const docFileSchema = new mongoose.Schema(
     trashed: { type: Boolean, default: false, index: true },
 
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "Employee", default: null },
+
+    /* Who opened it and when — each person's Recent list in Sheets, the way
+       Excel's works: a workbook appears when you OPEN it, not only when you
+       made it, and you may pin it or take it off your list. Kept on the
+       document rather than in a collection of its own because the cluster is
+       at its collection cap; one entry per person, the newest few kept.
+       `userKey` is "<session subject>:<id>" — DeptUser and Employee ids are
+       different tables and must not meet. Never edited through PATCH /:id
+       (not in EDITABLE); only the /opened and /recent routes write it. */
+    openedBy: {
+      type: [
+        {
+          _id: false,
+          userKey: { type: String, required: true },
+          at: { type: Date, default: Date.now },
+          pinned: { type: Boolean, default: false },
+        },
+      ],
+      default: undefined,
+    },
   },
   { timestamps: true, collection: "doc_files" },
 );
@@ -89,6 +109,7 @@ const docFileSchema = new mongoose.Schema(
    department filed. Both exclude trash, which is why `trashed` leads. */
 docFileSchema.index({ trashed: 1, folderPath: 1, name: 1 });
 docFileSchema.index({ trashed: 1, department: 1, updatedAt: -1 });
+docFileSchema.index({ "openedBy.userKey": 1 }, { sparse: true });
 
 /** Mime → the kind the UI draws. One place, so a .xlsx cannot be a PDF here
  *  and a sheet three screens away. */

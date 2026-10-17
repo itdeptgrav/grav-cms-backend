@@ -1,0 +1,15 @@
+livekit-agents[openai,silero]~=1.8
+fastapi~=0.118
+uvicorn[standard]~=0.37
+kokoro>=0.9.4
+soundfile~=0.13
+numpy<2
+pyarrow==21.0.0
+httpx~=0.28
+python-multipart~=0.0.20
+transformers>=4.46
+sentencepiece>=0.2
+torchaudio
+torchcodec
+accelerate>=1.1
+bitsandbytes>=0.45

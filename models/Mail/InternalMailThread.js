@@ -14,6 +14,10 @@ const participantSchema = new mongoose.Schema(
 
 const internalMailThreadSchema = new mongoose.Schema(
   {
+    // Missing means `mail` for rows created before Chat existed. Keeping both
+    // purposes in this collection avoids another Atlas collection while every
+    // read still applies an explicit purpose boundary.
+    purpose: { type: String, enum: ["mail", "chat"], default: "mail", index: true },
     subject: { type: String, required: true, trim: true, maxlength: 180 },
     participants: { type: [participantSchema], required: true },
     participantKeys: { type: [String], required: true, index: true },
@@ -27,6 +31,7 @@ const internalMailThreadSchema = new mongoose.Schema(
 );
 
 internalMailThreadSchema.index({ participantKeys: 1, lastMessageAt: -1 });
+internalMailThreadSchema.index({ purpose: 1, participantKeys: 1, lastMessageAt: -1 });
 
 module.exports = mongoose.models.InternalMailThread
   || mongoose.model("InternalMailThread", internalMailThreadSchema);

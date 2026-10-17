@@ -4,6 +4,7 @@ const crypto = require("crypto");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  configuredInboundNumber,
   dialXml,
   dialStatusUrl,
   liveKitSipEndpoint,
@@ -13,6 +14,14 @@ const {
   validPlivoRequest,
   validV3Signature,
 } = require("./plivoInboundBridge");
+
+test("the carrier fallback accepts only the configured business DID", () => {
+  const env = { PLIVO_CALLER_ID: "+91 80653 95337" };
+  assert.equal(configuredInboundNumber("8065395337", env), "+918065395337");
+  assert.equal(configuredInboundNumber("+918456894297", env), null);
+  assert.equal(configuredInboundNumber("invalid", env), null);
+  assert.equal(configuredInboundNumber("+918065395337", {}), null);
+});
 
 test("a LiveKit cloud URL becomes its regional SIP endpoint", () => {
   const env = { LIVEKIT_URL: "wss://meet-f96q3m0l.livekit.cloud" };

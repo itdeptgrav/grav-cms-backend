@@ -1725,6 +1725,20 @@ app.use("/api/cms/music", require("./routes/music/webPlayer.routes"));
 // broad /api/cms employee-auth router just like the signed Music stream route.
 app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
 
+/* MRF voice approval has both employee-browser endpoints and two
+ * worker-secret endpoints. Keep it above the broad /api/cms auth router so
+ * that router cannot interpret the worker bearer token as an employee JWT.
+ * The MRF voice router applies EmployeeAuth to its browser endpoints itself;
+ * the feature flag still controls whether new approval calls are queued. */
+app.use(
+  "/api/cms/mrf-voice-approvals",
+  require("./routes/CMS_Routes/Inventory/Operations/mrfVoiceApprovalRoutes"),
+);
+app.use(
+  "/api/cms/voice-automation",
+  require("./routes/CMS_Routes/VoiceAutomation/morningBriefRoutes"),
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1814,6 +1828,10 @@ app.use(
   "/api/cms/crm/sample-styles",
   require("./routes/CMS_Routes/Sales/sampleStyles"),
 );
+
+// Native GRAV Studio — private designer-to-CMS asset delivery. This route
+// never exposes the server-only Grav Storage credential to Studio or a browser.
+app.use("/api/studio/v1", require("./routes/Studio/studioApi"));
 
 // The Project Manager's BOM approve/reject lives at /api/public/bom-approval
 // — see its mount much earlier in this file, above the /api/cms guard.
@@ -2666,6 +2684,11 @@ app.use("/api/google", googleWorkspaceRoutes);
 // inside, the legacy Google/Cowork router so its app grant and OAuth boundary
 // cannot widen access to Cowork's employee-id endpoints.
 app.use("/api/cms/mail", mailRoutes);
+
+// Chat deliberately owns two visibly separate lanes: OpenWA WhatsApp for
+// customers and employee-only company messaging. Its pairing QR never appears
+// in Sales or in a general status endpoint.
+app.use("/api/cms/chat", require("./routes/chat/chatRoutes"));
 
 // HR Department Routes
 const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");
@@ -4056,6 +4079,19 @@ try {
   }
 } catch (err) {
   console.warn("⚠️ Pending-work reminders not started:", err.message);
+}
+
+/* Opt-in morning brief calls. The scheduler only materialises a bounded,
+   idempotent occurrence during the employee's selected ten-minute window;
+   the workflow service owns leave suppression and duplicate protection. */
+try {
+  if (!skipBackgroundJob("morning brief voice calls")) {
+    const { startScheduler } = require("./services/morningBriefVoice.service");
+    startScheduler();
+    console.log("✅ Morning brief voice scheduler initialized");
+  }
+} catch (err) {
+  console.warn("⚠️ Morning brief voice scheduler not started:", err.message);
 }
 
 // Close out CoWork sessions left online by somebody who has already punched
