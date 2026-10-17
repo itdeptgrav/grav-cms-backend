@@ -90,6 +90,24 @@ const NOTIFICATION_TYPES = [
     webTag: "acc",
     url: "/accountant/approvals",
   },
+  {
+    key: "mrf_voice_call",
+    label: "MRF approval calls",
+    description: "Ring this device when a material request needs your approval.",
+    group: "Waiting for you",
+    repeatable: false,
+    webTag: "mrf-call",
+    url: "/requests",
+  },
+  {
+    key: "morning_brief_call",
+    label: "Morning brief calls",
+    description: "Ring this device with your opted-in personal morning briefing.",
+    group: "About you",
+    repeatable: false,
+    webTag: "morning-brief-call",
+    url: "/onboarding",
+  },
 
   /* ── Outcomes ──────────────────────────────────────────────────────────
      None repeatable. They report a fact, and a fact does not become more

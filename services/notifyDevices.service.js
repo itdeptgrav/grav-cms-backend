@@ -69,18 +69,26 @@ async function deliverFcm(device, payload) {
   const m = messaging();
   if (!m) return { ok: false, dead: false, reason: "messaging_unavailable" };
   try {
+    const extra = Object.fromEntries(
+      Object.entries(payload.data || {})
+        .filter(([, value]) => value !== undefined && value !== null)
+        .map(([key, value]) => [String(key), String(value)]),
+    );
+    const ttl = Math.max(0, Math.min(86400, Number(payload.ttlSeconds) || 600));
     await m.send({
       token: device.token,
       /* Data-only, as every existing sender does: the service worker draws it,
          which is what keeps one appearance across web and Android. */
       data: {
+        ...extra,
         title: String(payload.title || ""),
         body: String(payload.body || ""),
         type: String(payload.type || ""),
         url: String(payload.url || ""),
+        tag: String(payload.tag || ""),
         timestamp: String(Date.now()),
       },
-      webpush: { headers: { Urgency: "high", TTL: "600" } },
+      webpush: { headers: { Urgency: "high", TTL: String(ttl) } },
     });
     return { ok: true, dead: false };
   } catch (err) {
@@ -106,6 +114,7 @@ async function deliverExpo(device, payload) {
         title: payload.title,
         body: payload.body,
         sound: "default",
+        ...(payload.ttlSeconds ? { expiration: Math.floor(Date.now() / 1000) + Number(payload.ttlSeconds) } : {}),
         ...(payload.channelId ? { channelId: payload.channelId } : {}),
         ...(payload.categoryId ? { categoryId: payload.categoryId } : {}),
         /* The legacy senders' data (kind, screen, id) rides through untouched
@@ -139,6 +148,9 @@ async function deliver(device, payload) {
  * @param {string} payload.title
  * @param {string} payload.body
  * @param {string} [payload.url]
+ * @param {string} [payload.tag]
+ * @param {number} [payload.ttlSeconds]
+ * @param {object} [payload.data]
  * @param {object} [opts]
  * @param {boolean} [opts.isRepeat]  only reach devices that opted INTO repeats,
  *                                   and stamp when they were last repeated

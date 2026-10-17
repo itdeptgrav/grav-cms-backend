@@ -33,6 +33,14 @@ const wrap = (fn) => async (req, res) => {
   }
 };
 
+/* Every order's open requests, for PPC's overview — "what is the floor still
+   waiting on", which the per-order read below cannot answer. Declared first so
+   the literal path is never read as an order id. */
+router.get("/material-requests", requireCompany, canRead, wrap(async (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 60));
+  res.json({ success: true, ...(await svc.listForCompany(companyOf(req), { limit })) });
+}));
+
 router.get("/material-requests/orders/:moId", requireCompany, canRead, wrap(async (req, res) => {
   res.json({ success: true, ...(await svc.listForOrder(req.params.moId, { companyId: companyOf(req) })) });
 }));

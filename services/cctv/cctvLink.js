@@ -10,9 +10,9 @@
 //                            GET /api/cctv/internal/access for that, every few
 //                            seconds, so a revoked camera goes dark at once.
 //   · isCctvService(req)     the CCTV site calling us (shared service key).
-//   · fetchCameras()         the CCTV site's camera list for the Access Control
-//                            editor. This database keeps NO camera registry —
-//                            names, order and channels live in the CCTV app.
+//   · fetchCameras()         the CCTV site's camera list for Access Control and
+//                            the factory twin. This database keeps NO camera
+//                            registry — names, order and channels live there.
 //   · notifyAccessChanged()  "forget what you know about this person" after a
 //                            grant or department change (best effort; the CCTV
 //                            site re-asks every few seconds anyway).
@@ -21,9 +21,8 @@
 //   CCTV_SSO_SECRET   signs sign-in tokens; the CCTV site verifies them.
 //   CCTV_SERVICE_KEY  server-to-server key, both directions (X-CCTV-Service-Key).
 //   CCTV_APP_URL      the CCTV site's public origin.
-// The shared key link (cctv.grav.in/?key=…) is NEVER handed out from here any
-// more: it gave everybody every camera. It is now the administrators' own link,
-// configured only on the CCTV site.
+//   CCTV_KEY          compatibility sign-in for the deployed CCTV app while it
+//                     is migrated to personal JWT SSO. Backend-only.
 "use strict";
 
 const crypto = require("crypto");
@@ -70,11 +69,24 @@ function secretFrom(name) {
  * @param {{ id, subject, tv, email, name }} who
  */
 function mintSsoUrl(who) {
-  const secret = secretFrom("CCTV_SSO_SECRET");
   const base = appUrl();
   if (!/^https?:\/\//.test(base)) {
     throw new CctvLinkError(503, "CCTV_NOT_CONFIGURED", "CCTV_APP_URL is not set on this server.");
   }
+  const configuredSsoSecret = String(process.env.CCTV_SSO_SECRET || "").trim();
+  if (!configuredSsoSecret) {
+    /* The currently deployed camera application still speaks its original
+       shared-key hand-off. Keep that key on the backend and return the URL only
+       after resolveCctvAccess has admitted the CMS user. Once grav-cctv supports
+       the JWT endpoint, setting CCTV_SSO_SECRET automatically takes this branch
+       out of service without another code change. */
+    const legacyKey = String(process.env.CCTV_KEY || "").trim();
+    if (legacyKey.length < 8) {
+      throw new CctvLinkError(503, "CCTV_NOT_CONFIGURED", "CCTV sign-in is not set up on this server (CCTV_SSO_SECRET or CCTV_KEY missing).");
+    }
+    return `${base}/?key=${encodeURIComponent(legacyKey)}`;
+  }
+  const secret = secretFrom("CCTV_SSO_SECRET");
   const token = jwt.sign(
     {
       sub: String(who.id || ""), subj: String(who.subject || ""), tv: Number(who.tv || 0),
@@ -127,12 +139,40 @@ async function callCctv(path, { method = "GET", body, timeoutMs = 4000 } = {}) {
   }
 }
 
+/**
+ * Compatibility read for the currently deployed camera application. Its
+ * browser UI appends the legacy key to /api/cameras; doing that here lets CMS
+ * consume the same authoritative registry without ever shipping the key in a
+ * frontend bundle or storing a duplicate list.
+ */
+async function callLegacyCctv(path, { timeoutMs = 4000 } = {}) {
+  const key = String(process.env.CCTV_KEY || "").trim();
+  const base = appUrl();
+  if (key.length < 8 || !/^https?:\/\//.test(base)) {
+    throw new CctvLinkError(503, "CCTV_NOT_CONFIGURED", "The CCTV camera registry is not configured on this server.");
+  }
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const join = path.includes("?") ? "&" : "?";
+    const res = await fetch(`${base}${path}${join}key=${encodeURIComponent(key)}`, { signal: ctrl.signal });
+    const data = await res.json().catch(() => null);
+    if (!res.ok) throw new CctvLinkError(502, "CCTV_REFUSED", `The CCTV site answered HTTP ${res.status}.`);
+    return data;
+  } catch (err) {
+    if (err instanceof CctvLinkError) throw err;
+    throw new CctvLinkError(502, "CCTV_UNREACHABLE", "The CCTV site could not be reached just now.");
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 let cameraCache = { at: 0, cameras: null };
 const CAMERA_CACHE_MS = 30_000;
 
 /**
- * The CCTV site's cameras: [{ key, displayName, technicalName, nvr, channel,
- * displayOrder, audio }], in display order. Cached briefly; a failure with a
+ * The CCTV site's cameras: [{ key, index, displayName, technicalName, nvr,
+ * channel, displayOrder, audio }], in display order. Cached briefly; a failure with a
  * recent copy in hand returns the copy (marked stale) rather than nothing.
  */
 async function fetchCameras({ fresh = false } = {}) {
@@ -141,14 +181,33 @@ async function fetchCameras({ fresh = false } = {}) {
     return { cameras: cameraCache.cameras, fetchedAt: new Date(cameraCache.at), stale: false };
   }
   try {
-    const data = await callCctv("/api/internal/cameras");
-    const cameras = (Array.isArray(data?.cameras) ? data.cameras : [])
-      .filter((c) => c && typeof c.key === "string")
-      .map((c) => ({
-        key: String(c.key).toLowerCase(), displayName: String(c.displayName || c.technicalName || c.key),
-        technicalName: String(c.technicalName || ""), nvr: String(c.nvr || ""), channel: Number(c.channel) || null,
-        displayOrder: Number(c.displayOrder) || null, audio: String(c.audio || ""),
-      }));
+    let data;
+    try {
+      secretFrom("CCTV_SERVICE_KEY");
+      data = await callCctv("/api/internal/cameras");
+    } catch (err) {
+      if (!(err instanceof CctvLinkError) || err.code !== "CCTV_NOT_CONFIGURED") throw err;
+      data = await callLegacyCctv("/api/cameras");
+    }
+    const list = Array.isArray(data) ? data : (Array.isArray(data?.cameras) ? data.cameras : []);
+    const cameras = list
+      .filter((c) => c && (typeof c.key === "string" || (c.nvr && Number(c.channel))))
+      .map((c, position) => {
+        const nvr = String(c.nvr || "").toLowerCase();
+        const channel = Number(c.channel) || null;
+        const key = String(c.key || `${nvr}:${channel}`).toLowerCase();
+        return {
+          key,
+          index: Number.isInteger(Number(c.index)) ? Number(c.index) : null,
+          displayName: String(c.displayName || c.technicalName || key),
+          technicalName: String(c.technicalName || ""),
+          nvr,
+          channel,
+          displayOrder: Number(c.displayOrder) || position + 1,
+          audio: String(c.audio || ""),
+        };
+      })
+      .sort((a, b) => a.displayOrder - b.displayOrder || (a.index ?? 9999) - (b.index ?? 9999));
     cameraCache = { at: now, cameras };
     return { cameras, fetchedAt: new Date(now), stale: false };
   } catch (err) {

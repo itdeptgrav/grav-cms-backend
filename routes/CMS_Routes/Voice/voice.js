@@ -8,7 +8,12 @@ const CallEvent = require("../../../models/CallEvent");
 const VoiceContact = require("../../../models/VoiceContact");
 const { scopeFor } = require("../../../services/companyContext/salesScope.service");
 const { dialFailureState } = require("../../../services/telephony/livekitBrowserCall");
-const { dialStatusUrl, dialXml, validPlivoRequest } = require("../../../services/telephony/plivoInboundBridge");
+const {
+  configuredInboundNumber,
+  dialStatusUrl,
+  dialXml,
+  validPlivoRequest,
+} = require("../../../services/telephony/plivoInboundBridge");
 const { assignedVoiceLine, voiceOwnerByNumber } = require("../../../services/telephony/voiceLineAssignment");
 
 const router = express.Router();
@@ -40,8 +45,14 @@ function cleanE164(value) {
 router.all("/plivo/inbound", async (req, res) => {
   try {
     if (!validPlivoRequest(req)) return res.status(401).type("text/plain").send("Invalid Plivo signature");
-    const assignment = await voiceOwnerByNumber(req.body?.To || req.query?.To);
-    const xml = assignment ? dialXml({ number: assignment.number, actionUrl: dialStatusUrl(req) }) : null;
+    const requestedNumber = req.body?.To || req.query?.To;
+    const assignment = await voiceOwnerByNumber(requestedNumber);
+    // Carrier ingress must remain available while the employee-assignment
+    // database is temporarily stale. The fallback is deliberately restricted
+    // to the single business DID configured in the server environment; GRAV
+    // Realtime's inbound trunk and dispatch rule still select the owner room.
+    const number = assignment?.number || configuredInboundNumber(requestedNumber);
+    const xml = number ? dialXml({ number, actionUrl: dialStatusUrl(req) }) : null;
     if (!xml) return res.status(404).type("text/plain").send("No inbound Voice route is assigned to this number.");
     return res.status(200).type("text/xml").send(xml);
   } catch (error) {

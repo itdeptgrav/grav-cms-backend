@@ -16,6 +16,7 @@ function serializeThread(row, actorKey) {
   return {
     id: String(row._id),
     channel: "internal",
+    purpose: row.purpose || "mail",
     subject: row.subject,
     participants: (row.participants || []).map(publicParticipant),
     preview: row.lastMessagePreview || "",
@@ -23,6 +24,12 @@ function serializeThread(row, actorKey) {
     unread: (row.unreadFor || []).includes(actorKey),
     archived: (row.archivedFor || []).includes(actorKey),
   };
+}
+
+function purposeClause(purpose) {
+  return purpose === "chat"
+    ? { purpose: "chat" }
+    : { $or: [{ purpose: "mail" }, { purpose: { $exists: false } }] };
 }
 
 async function recipientsFor(values) {
@@ -49,15 +56,21 @@ async function recipientsFor(values) {
   return rows.map((row) => row.person);
 }
 
-async function createMessage(sender, input) {
-  const subject = cleanText(input?.subject, 180);
+async function createMessage(sender, input, { purpose = "mail" } = {}) {
   const body = cleanText(input?.body, 100000);
-  if (!subject || !body) {
-    const err = new Error("Subject and message are required");
+  if (!body) {
+    const err = new Error(purpose === "chat" ? "Message is required" : "Subject and message are required");
     err.status = 400;
     throw err;
   }
   const recipients = await recipientsFor(input?.toEmployeeIds);
+  const subject = cleanText(input?.subject, 180)
+    || (purpose === "chat" ? `Chat with ${recipients.map((person) => person.name).join(", ")}` : "");
+  if (!subject) {
+    const err = new Error("Subject and message are required");
+    err.status = 400;
+    throw err;
+  }
   const people = new Map([[sender.actorKey, sender], ...recipients.map((p) => [p.actorKey, p])]);
   const participants = [...people.values()].map(({ actorKey, employeeId, name, email }) => ({
     actorKey, employeeId, name, email,
@@ -66,6 +79,7 @@ async function createMessage(sender, input) {
   const threadId = new mongoose.Types.ObjectId();
   const thread = await InternalMailThread.create({
     _id: threadId,
+    purpose,
     subject,
     participants,
     participantKeys: participants.map((p) => p.actorKey),
@@ -89,8 +103,9 @@ async function createMessage(sender, input) {
   return serializeThread(thread.toObject(), sender.actorKey);
 }
 
-async function listThreads(actor, { archived = false, limit = 50 } = {}) {
+async function listThreads(actor, { archived = false, limit = 50, purpose = "mail" } = {}) {
   const query = {
+    ...purposeClause(purpose),
     participantKeys: actor.actorKey,
     deletedFor: { $ne: actor.actorKey },
     archivedFor: archived ? actor.actorKey : { $ne: actor.actorKey },
@@ -102,10 +117,11 @@ async function listThreads(actor, { archived = false, limit = 50 } = {}) {
   return rows.map((row) => serializeThread(row, actor.actorKey));
 }
 
-async function threadFor(actor, id) {
+async function threadFor(actor, id, { purpose = "mail" } = {}) {
   if (!mongoose.Types.ObjectId.isValid(String(id || ""))) return null;
   const thread = await InternalMailThread.findOne({
     _id: id,
+    ...purposeClause(purpose),
     participantKeys: actor.actorKey,
     deletedFor: { $ne: actor.actorKey },
   }).lean();
@@ -127,7 +143,7 @@ async function threadFor(actor, id) {
   };
 }
 
-async function reply(actor, id, input) {
+async function reply(actor, id, input, { purpose = "mail" } = {}) {
   if (!mongoose.Types.ObjectId.isValid(String(id || ""))) {
     const err = new Error("Invalid conversation ID");
     err.status = 400;
@@ -139,7 +155,11 @@ async function reply(actor, id, input) {
     err.status = 400;
     throw err;
   }
-  const thread = await InternalMailThread.findOne({ _id: id, participantKeys: actor.actorKey });
+  const thread = await InternalMailThread.findOne({
+    _id: id,
+    participantKeys: actor.actorKey,
+    ...purposeClause(purpose),
+  });
   if (!thread) return null;
   const now = new Date();
   await InternalMailMessage.create({
@@ -159,7 +179,7 @@ async function reply(actor, id, input) {
   return serializeThread(thread.toObject(), actor.actorKey);
 }
 
-async function setThreadState(actor, id, state) {
+async function setThreadState(actor, id, state, { purpose = "mail" } = {}) {
   if (!mongoose.Types.ObjectId.isValid(String(id || ""))) {
     const err = new Error("Invalid conversation ID");
     err.status = 400;
@@ -182,10 +202,10 @@ async function setThreadState(actor, id, state) {
     throw err;
   }
   return InternalMailThread.findOneAndUpdate(
-    { _id: id, participantKeys: actor.actorKey },
+    { _id: id, participantKeys: actor.actorKey, ...purposeClause(purpose) },
     operation,
     { new: true },
   ).lean();
 }
 
-module.exports = { createMessage, listThreads, threadFor, reply, setThreadState };
+module.exports = { createMessage, listThreads, threadFor, reply, setThreadState, purposeClause };

@@ -59,12 +59,28 @@ function windowHours(t) {
   return Math.max(0, (minutesOf(t.hoursTo) - minutesOf(t.hoursFrom)) / 60);
 }
 
-/** What the target expects on ONE working day. */
-function expectedPerDay(t) {
+const cv = require("./targetCurve");
+const minutesOfClock = (hhmm) => { const [h, m] = String(hhmm || "0:0").split(":").map(Number); return (h || 0) * 60 + (m || 0); };
+
+/** The day's number when the line is up to speed — before the ramp. */
+function basePerDay(t) {
   if (t.kind === "per_day") return t.pieces;
   if (t.kind === "per_hour") return Math.round(t.pieces * windowHours(t));
   const n = targetDays(t).length || 1;
   return t.pieces / n;
+}
+
+/**
+ * What the target expects on ONE working day.
+ *
+ * With `index` — which working day of the target it is — the ramp applies, so
+ * day one of a new style asks for its share and not the steady number. Called
+ * without one (every reader written before ramps), it answers the steady
+ * number exactly as it always did.
+ */
+function expectedPerDay(t, index = null) {
+  const base = basePerDay(t);
+  return index == null ? base : cv.expectedOnDay(base, t.ramp, index);
 }
 
 /** Pieces done inside a day's clock window. */
@@ -111,7 +127,9 @@ function statusOf(pct, { started, over }) {
  * @param {object} [extra]  { doneOverall, orderQuantity, now }
  */
 function evaluateTarget(t, events, asOfDay, extra = {}) {
-  const days = targetDays(t);
+  const days = Array.isArray(t.dayPlan) && t.dayPlan.length
+    ? [...new Set(t.dayPlan.map((b) => b.date).filter(Boolean))].sort()
+    : targetDays(t);
   const perDay = expectedPerDay(t);
   const now = extra.now ? new Date(extra.now) : new Date();
   const started = asOfDay >= t.from;
@@ -131,17 +149,42 @@ function evaluateTarget(t, events, asOfDay, extra = {}) {
     return Math.max(0, Math.min(1, (now - start) / (end - start)));
   };
 
+  /* THE RAMP MOVES EVERY FIGURE BELOW (16 Oct 2026). Each working day asks
+     for its own share — half on day one of a new style — so "expected", "so
+     far", "short" and the span's total are all read off the shape rather
+     than off one repeated number. With no ramp, `expectedOnDay` IS that
+     number and every figure is what it was. */
+  const ramp = Array.isArray(t.ramp) ? t.ramp : [];
+  const dayIndex = new Map(days.map((d, i) => [d, i]));
+  /* With a cap, each day asks the shape's figure or what is still unasked,
+     whichever is smaller, so the pace stops when the quantity is reached. */
+  const cap = Number(t.cap) > 0 && t.kind !== "total" ? Number(t.cap) : null;
+  const askedByDay = new Map();
+  { let left = cap ?? Infinity; for (const d of days) { const shape = cv.expectedOnDay(perDay, ramp, dayIndex.get(d) ?? 0); const a = Math.max(0, Math.min(shape, left)); askedByDay.set(d, a); left -= a; } }
+  /* A batch plan replaces the shape: each day asks what its batches deliver. */
+  const batches = Array.isArray(t.dayPlan) ? t.dayPlan.filter((b) => b && b.date) : [];
+  if (batches.length) {
+    askedByDay.clear();
+    for (const b of batches) askedByDay.set(b.date, (askedByDay.get(b.date) || 0) + (Number(b.pieces) || 0));
+  }
+  const askedOn = (d) => askedByDay.get(d) ?? 0;
+
   const rows = [];
   let expectedToDate = 0, doneToDate = 0;
   const cutoff = over ? t.to : asOfDay;
   for (const d of days) {
     if (d > cutoff) break;
     const done = doneOn(events, t, d);
-    const expected = perDay;
-    expectedToDate += expected * soFarFraction(d); doneToDate += done;
-    rows.push({ date: d, expected: Math.round(expected), done, short: Math.max(0, Math.round(expected) - done), pct: expected ? Math.round((done / expected) * 100) : 0 });
+    const expected = askedOn(d);
+    /* Today's share of a batch plan is the batches already due, not a
+       straight fraction of the day: a lay still on the table owes nothing. */
+    const dueToday = batches.length && dayOf(now) === d
+      ? batches.filter((b) => b.date === d).reduce((nn, b) => nn + (((b.time ? minutesOfClock(b.time) : minutesOfClock(t.hoursTo || "18:30")) <= Math.round((now - instant(d, "00:00")) / 60000)) ? (Number(b.pieces) || 0) : 0), 0)
+      : null;
+    expectedToDate += dueToday != null ? dueToday : expected * soFarFraction(d); doneToDate += done;
+    rows.push({ date: d, expected: Math.round(expected), done, short: Math.max(0, Math.round(expected) - done), pct: expected ? Math.round((done / expected) * 100) : 0, ramped: ramp.length > 0 && (dayIndex.get(d) ?? 99) < ramp.length });
   }
-  const totalExpected = t.kind === "total" ? t.pieces : Math.round(perDay * days.length);
+  const totalExpected = t.kind === "total" ? t.pieces : days.reduce((nn, d) => nn + askedOn(d), 0);
   const doneWholeSpan = days.reduce((n, d) => n + doneOn(events, t, d), 0);
 
   /* Today's own figure. For an hourly target the expected-so-far grows with
@@ -149,10 +192,28 @@ function evaluateTarget(t, events, asOfDay, extra = {}) {
   let today = null;
   if (covers) {
     const done = doneOn(events, t, asOfDay);
-    const expectedSoFar = Math.round(perDay * soFarFraction(asOfDay));
+    const asked = askedOn(asOfDay);
+    /* What is due SO FAR comes from the hour plan — the hours typed by hand,
+       or today's number spread across the window — rather than from a flat
+       share of the day, so an hour that was never going to carry its ninth
+       of the day is not counted as if it had. */
+    const minuteNow = dayOf(now) === asOfDay ? Math.round((now - instant(asOfDay, "00:00")) / 60000) : 24 * 60;
+    /* A batch is due whole at its time — nothing before it, all of it after;
+       a batch with no time is due at the end of the window. A paced target
+       is due hour by hour as before. */
+    const todays = batches.filter((b) => b.date === asOfDay);
+    const windowEnd = minutesOfClock(t.hoursTo || "18:30");
+    const plan = todays.length
+      ? todays.map((b) => ({ from: b.time || t.hoursTo || "18:30", to: b.time || t.hoursTo || "18:30", pieces: Number(b.pieces) || 0, label: b.label || "" }))
+      : cv.hourPlan({ hoursFrom: t.hoursFrom || "09:30", hoursTo: t.hoursTo || "18:30", hours: t.hours }, asked);
+    const expectedSoFar = todays.length
+      ? todays.reduce((nn, b) => nn + ((b.time ? minutesOfClock(b.time) : windowEnd) <= minuteNow ? (Number(b.pieces) || 0) : 0), 0)
+      : cv.dueByMinute(plan, minuteNow);
     today = {
-      expected: Math.round(perDay), expectedSoFar, done, short: Math.max(0, Math.round(perDay) - done),
-      pct: perDay ? Math.round((done / perDay) * 100) : 0,
+      expected: Math.round(asked), expectedSoFar, done, short: Math.max(0, Math.round(asked) - done),
+      pct: asked ? Math.round((done / asked) * 100) : 0,
+      ramped: ramp.length > 0 && (dayIndex.get(asOfDay) ?? 99) < ramp.length,
+      plan,
       hours: t.kind === "per_hour" ? hoursOn(events, t, asOfDay) : null,
       window: t.hoursFrom && t.hoursTo ? `${t.hoursFrom}–${t.hoursTo}` : "whole day",
       efficiency: efficiencyOf(done, t, asOfDay, extra.standard, now),
@@ -171,19 +232,26 @@ function evaluateTarget(t, events, asOfDay, extra = {}) {
   const status = nothingDueYet ? "not_started" : statusOf(over ? (totalExpected ? Math.round((doneWholeSpan / totalExpected) * 100) : 0) : pctToDate, { started, over });
 
   /* A sentence the floor can act on. */
+  /* The standing in one formal sentence: condition, figures, required rate
+     (16 Oct 2026 — the earlier wording was conversational). */
   let advice;
-  if (!started) advice = `Starts ${dayWords(t.from)}.`;
-  else if (nothingDueYet) advice = `Nothing due yet — the ${t.hoursFrom && t.hoursTo ? `${t.hoursFrom}–${t.hoursTo}` : "09:30–18:30"} window has not opened.`;
-  else if (over) advice = doneWholeSpan >= totalExpected ? `Met: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)}.` : `Missed: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)} (${totalExpected - doneWholeSpan} short).`;
-  else if (remainingToTarget === 0) advice = `Target reached with ${daysLeft} day${daysLeft === 1 ? "" : "s"} to spare.`;
-  else if (!daysLeft) advice = `Last day: ${remainingToTarget} more needed today.`;
-  else if (neededPerDay > Math.round(perDay)) advice = `Behind by ${Math.max(0, Math.round(expectedToDate) - doneToDate)}: needs ${neededPerDay} a day for the remaining ${daysLeft} day${daysLeft === 1 ? "" : "s"} (target pace is ${Math.round(perDay)}).`;
-  else advice = `On pace: ${neededPerDay} a day for the remaining ${daysLeft} day${daysLeft === 1 ? "" : "s"} finishes it.`;
+  if (!started) advice = `Scheduled to start on ${dayWords(t.from)}.`;
+  else if (nothingDueYet) advice = `No quantity is due yet; the ${t.hoursFrom && t.hoursTo ? `${t.hoursFrom}–${t.hoursTo}` : "09:30–18:30"} window has not opened.`;
+  else if (over) advice = doneWholeSpan >= totalExpected ? `Achieved: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)}.` : `Not achieved: ${doneWholeSpan} of ${totalExpected} by ${dayWords(t.to)}; shortfall ${totalExpected - doneWholeSpan}.`;
+  else if (remainingToTarget === 0) advice = `Target achieved with ${daysLeft} working day${daysLeft === 1 ? "" : "s"} remaining.`;
+  else if (!daysLeft) advice = `Final day: ${remainingToTarget} required today.`;
+  else if (neededPerDay > Math.round(perDay)) advice = `Behind plan by ${Math.max(0, Math.round(expectedToDate) - doneToDate)}. Required rate: ${neededPerDay} per day for the remaining ${daysLeft} working day${daysLeft === 1 ? "" : "s"} (planned rate ${Math.round(perDay)}).`;
+  else advice = `On plan. Required rate: ${neededPerDay} per day for the remaining ${daysLeft} working day${daysLeft === 1 ? "" : "s"}.`;
 
   return {
     targetId: String(t._id || ""),
     department: t.department, kind: t.kind, pieces: t.pieces, from: t.from, to: t.to,
     hoursFrom: t.hoursFrom || "", hoursTo: t.hoursTo || "", note: t.note || "",
+    /* the shape, so a reader can draw the plan the way it is evaluated */
+    workingDays: Array.isArray(t.workingDays) ? t.workingDays : [], ramp: Array.isArray(t.ramp) ? t.ramp : [],
+    hours: Array.isArray(t.hours) ? t.hours : [], cap: t.cap ?? null,
+    dayPlan: Array.isArray(t.dayPlan) ? t.dayPlan.map((b) => ({ date: b.date, time: b.time || "", pieces: b.pieces, label: b.label || "", workOrderId: b.workOrderId || "", layKey: b.layKey || "" })) : [],
+    planSource: t.planSource || "",
     days: days.length, perDay: Math.round(perDay), totalExpected,
     status, started, over, covers,
     today,
@@ -290,12 +358,49 @@ const dayWords = (ymd) => { const [y, m, d] = String(ymd).split("-").map(Number)
 /** Describe a target in one sentence — used by the PPC form's live preview and every card. */
 function describeTarget(t) {
   const dept = DEPARTMENT_META[t.department]?.label || t.department;
+  if (Array.isArray(t.dayPlan) && t.dayPlan.length) {
+    const byDay = new Map();
+    for (const b of t.dayPlan) byDay.set(b.date, (byDay.get(b.date) || 0) + (Number(b.pieces) || 0));
+    const total = [...byDay.values()].reduce((nn, x) => nn + x, 0);
+    const days = [...byDay.keys()].sort();
+    const span = days.length === 1 ? `on ${dayWords(days[0])}` : `over ${days.length} days, ${dayWords(days[0])} to ${dayWords(days[days.length - 1])}`;
+    /* a plan by work order: day by day or hour by hour, with how many work
+       orders and slots it covers */
+    const wos = new Set(t.dayPlan.map((b) => b.workOrderId).filter(Boolean)).size;
+    const woWords = wos ? ` across ${wos} work order${wos === 1 ? "" : "s"}` : "";
+    /* Batches — "Lay 3", "Loads 1–2", "Run 4" — each due when it comes off;
+       and dispatch's "Shipment 2" days. */
+    const BATCH = /^(Lay|Load|Run)s? (\d+)(?:–(\d+))?/;
+    const kinds = new Set(), batchNos = new Set();
+    for (const b of t.dayPlan) { const m = BATCH.exec(b.label || ""); if (m) { kinds.add(m[1]); for (let i = Number(m[2]); i <= Number(m[3] || m[2]) && i < Number(m[2]) + 50; i++) batchNos.add(i); } }
+    if (batchNos.size && kinds.size === 1 && t.dayPlan.every((b) => BATCH.test(b.label || ""))) {
+      const word = { Lay: ["lay", "lays"], Load: ["load", "loads"], Run: ["run", "runs"] }[[...kinds][0]];
+      return `${dept}: ${total} garments${woWords} in ${batchNos.size} ${batchNos.size === 1 ? word[0] : word[1]} ${span}; each ${word[0]}'s garments are due when it comes off.`;
+    }
+    const ships = new Set(t.dayPlan.map((b) => (/^Shipment (\d+)/.exec(b.label || "") || [])[1]).filter(Boolean));
+    if (ships.size && t.dayPlan.every((b) => /^Shipment \d+/.test(b.label || ""))) {
+      return `${dept}: ${total} garments${woWords} in ${ships.size} shipment${ships.size === 1 ? "" : "s"} ${span}; each day's shipment is due by the end of its day.`;
+    }
+    const hourly = t.dayPlan.every((b) => /^\d{2}:\d{2}–\d{2}:\d{2}$/.test(b.label || ""));
+    if (hourly) {
+      const hours = new Set(t.dayPlan.map((b) => `${b.date} ${b.time}`)).size;
+      return `${dept}: ${total} garments${woWords}, hour by hour ${span}, in ${hours} planned hour${hours === 1 ? "" : "s"}; each hour's garments are due by its end.`;
+    }
+    if (wos || t.dayPlan.every((b) => !b.time && !b.label)) return `${dept}: ${total} garments${woWords}, day by day ${span}; each day's garments are due by the end of the day.`;
+    return `${dept}: ${total} garments in ${t.dayPlan.length} batch${t.dayPlan.length === 1 ? "" : "es"} ${span}, each due when its lay is cut.`;
+  }
+  /* A scoped target says so in its own sentence, or two targets on the same
+     department read as the same promise written twice (16 Oct 2026). */
+  const on = t.scope && t.scope.kind === "work_orders" && t.scope.label ? ` on ${t.scope.label}` : "";
+  const ramped = cv.describeRamp(t.ramp);
+  const ramp = ramped ? ` — ${ramped}` : "";
+  const capWords = Number(t.cap) > 0 && t.kind !== "total" ? ` until ${t.cap} are done` : "";
   const hours = t.hoursFrom && t.hoursTo ? ` between ${t.hoursFrom} and ${t.hoursTo}` : "";
   const span = t.from === t.to ? `on ${dayWords(t.from)}` : `from ${dayWords(t.from)} to ${dayWords(t.to)}`;
   const n = targetDays(t).length;
-  if (t.kind === "per_day") return `${dept}: ${t.pieces} pieces a day${hours}, ${span} (${n} working day${n === 1 ? "" : "s"} → ${t.pieces * n} in total).`;
-  if (t.kind === "per_hour") { const h = windowHours(t); return `${dept}: ${t.pieces} pieces an hour${hours}, ${span} (${Math.round(t.pieces * h)} a day → ${Math.round(t.pieces * h * n)} in total).`; }
-  return `${dept}: ${t.pieces} pieces in total by ${dayWords(t.to)}, starting ${dayWords(t.from)} (${n} working day${n === 1 ? "" : "s"} → about ${Math.round(t.pieces / (n || 1))} a day).`;
+  if (t.kind === "per_day") return `${dept}${on}: ${t.pieces} pieces a day${hours}${capWords}, ${span}${ramp} (${n} working day${n === 1 ? "" : "s"} → ${Number(t.cap) > 0 ? Math.min(t.cap, cv.expectedTotal(t.pieces, t.ramp, n)) : cv.expectedTotal(t.pieces, t.ramp, n)} in total).`;
+  if (t.kind === "per_hour") { const h = windowHours(t); const day = Math.round(t.pieces * h); const all = cv.expectedTotal(day, t.ramp, n); return `${dept}${on}: ${t.pieces} pieces an hour${hours}${capWords}, ${span}${ramp} (${day} a day → ${Number(t.cap) > 0 ? Math.min(t.cap, all) : all} in total).`; }
+  return `${dept}${on}: ${t.pieces} pieces in total by ${dayWords(t.to)}, starting ${dayWords(t.from)} (${n} working day${n === 1 ? "" : "s"} → about ${Math.round(t.pieces / (n || 1))} a day).`;
 }
 
 module.exports = { DEPARTMENT_META, KIND_META, evaluateTarget, describeTarget, assessTarget, capacityAt, efficiencyOf, targetDays, expectedPerDay, doneOn, dayOf, shiftDay, instant, windowHours };

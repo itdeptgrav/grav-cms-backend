@@ -719,6 +719,54 @@ const sampleStyleSchema = new mongoose.Schema(
       ],
     },
 
+    /* ── Studio design archive ──────────────────────────────────────────
+       Studio's editable project and exported evidence belong to this R&D
+       style. The objects themselves are private files in Grav Storage; Mongo
+       carries only a bounded, searchable revision catalogue. Keeping it here
+       avoids creating another collection while the Atlas collection cap is
+       being resolved and keeps ownership with the R&D aggregate. */
+    studio: {
+      // A CMS admin assigns a style to a Studio designer before it becomes
+      // visible through the Studio API. An empty assignment exposes nothing.
+      designer: {
+        name: { type: String, trim: true, default: "" },
+        email: { type: String, trim: true, lowercase: true, default: "", index: true },
+      },
+      designId: { type: String, trim: true, default: "" },
+      submissions: [
+        new mongoose.Schema({
+          number: { type: Number, min: 1, required: true },
+          state: { type: String, enum: ["submitted"], default: "submitted" },
+          project: {
+            storageFileId: { type: String, trim: true, required: true },
+            fileName: { type: String, trim: true, required: true },
+            mimeType: { type: String, trim: true, default: "application/octet-stream" },
+            bytes: { type: Number, min: 0, required: true },
+            sha256: { type: String, trim: true, required: true },
+          },
+          assets: [
+            new mongoose.Schema({
+              purpose: { type: String, trim: true, required: true },
+              storageFileId: { type: String, trim: true, required: true },
+              fileName: { type: String, trim: true, required: true },
+              mimeType: { type: String, trim: true, default: "application/octet-stream" },
+              bytes: { type: Number, min: 0, required: true },
+              sha256: { type: String, trim: true, required: true },
+            },
+            { _id: false },
+          )],
+          // The submitted technical JSON is kept with the immutable file
+          // references. File bytes never go in MongoDB.
+          manifest: { type: mongoose.Schema.Types.Mixed, default: {} },
+          note: { type: String, trim: true, default: "", maxlength: 4000 },
+          appVersion: { type: String, trim: true, default: "", maxlength: 100 },
+          submittedAt: { type: Date, default: Date.now },
+          submittedBy: { name: { type: String, trim: true }, email: { type: String, trim: true, lowercase: true } },
+          sourceTechnicalRevision: { type: Number, min: 0 },
+        }, { _id: false }),
+      ],
+    },
+
     // ── Sample — R&D runs sampling production; Sales approves (gate 2).
     sample: {
       status: { type: String, enum: SAMPLE_SAMPLING_STATUS_CODES, default: "not_started" },

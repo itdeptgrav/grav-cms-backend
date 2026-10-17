@@ -129,6 +129,28 @@ test("downloadMedia returns protected OpenWA bytes and their content type", asyn
   assert.equal(file.buffer.toString(), "media-bytes");
 });
 
+test("qrCode fetches the pairing credential only from OpenWA's private QR surface", async () => {
+  Object.assign(cfg, { provider: "openwa", openwaBaseUrl: "http://openwa.test", openwaApiKey: "secret", openwaSessionId: "company", requestTimeoutMs: 1000 });
+  let call;
+  global.fetch = async (url, options) => {
+    call = { url, options };
+    return new Response(JSON.stringify({ qr: "pairing-payload" }), { status: 200, headers: { "Content-Type": "application/json" } });
+  };
+
+  assert.deepEqual(await client.qrCode(), { qr: "pairing-payload" });
+  assert.equal(call.url, "http://openwa.test/qr?sessionId=company");
+  assert.equal(call.options.headers["X-API-Key"], "secret");
+  assert.equal(call.options.cache, "no-store");
+});
+
+test("qrCode accepts an image response without writing it anywhere", async () => {
+  Object.assign(cfg, { provider: "openwa", openwaBaseUrl: "http://openwa.test", openwaApiKey: "secret", requestTimeoutMs: 1000 });
+  global.fetch = async () => new Response(Buffer.from("png"), { status: 200, headers: { "Content-Type": "image/png" } });
+
+  const result = await client.qrCode();
+  assert.match(result.image, /^data:image\/png;base64,/);
+});
+
 test("parseOpenWaInbound ignores group and self-authored events", () => {
   assert.equal(parseOpenWaInbound({ event: "message.received", payload: { message: { from: "123@g.us", body: "group" } } }), null);
   assert.equal(parseOpenWaInbound({ event: "message.received", payload: { message: { from: "919876543210@c.us", body: "mine", fromMe: true } } }), null);

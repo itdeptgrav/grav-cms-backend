@@ -19,7 +19,8 @@
 // exists"): attendance today, the person's own leave applications,
 // regularisations and HR document requests, their Planner, HR interviews they
 // sit in, Cowork meetings, company holidays, who is on approved leave today,
-// and birthdays / work anniversaries / new joiners. No announcements, kudos,
+// and birthdays / work anniversaries / new joiners — and, first, unread Chat
+// and Mail (./homeMessages.js). No announcements, kudos,
 // events, training or tickets — none of those exist yet.
 //
 // ── COST ────────────────────────────────────────────────────────────────────
@@ -36,6 +37,7 @@ const {
   istToday, istDateStr, peopleMoments, covers, asDate, isTodayIst, displayName,
 } = require("./homeDates");
 const { withTimeout } = require("../actionables/actionablesSummary");
+const { messagesSection } = require("./homeMessages");
 
 const SECTION_TIMEOUT_MS = Number(process.env.HOME_SECTION_TIMEOUT_MS || 6000);
 const HOME_CACHE_MS = envMs("HOME_CACHE_MS", 30_000);
@@ -402,7 +404,7 @@ async function compute(user, now = new Date()) {
   }
   const emp = resolved.employee;
 
-  const [attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks] = await Promise.all([
+  const [attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks, messages] = await Promise.all([
     section("attendance", () => attendanceSection(emp, today)),
     section("leave", () => leaveSection(emp, today)),
     section("requests", () => requestsSection(emp)),
@@ -413,6 +415,7 @@ async function compute(user, now = new Date()) {
     section("away", () => awaySection(emp, today)),
     section("people", () => peopleSection(now)),
     section("tasks", () => tasksSection(emp, now)),
+    section("messages", () => messagesSection(user)),
   ]);
 
   return {
@@ -434,7 +437,7 @@ async function compute(user, now = new Date()) {
          for an employee login. Anyone else is pointed to their HR record. */
       selfService: Boolean(emp) && user?.subject === "employee" && String(user.id) === String(emp._id),
     },
-    sections: { attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks },
+    sections: { attendance, leave, requests, planner, interviews, meetings, holidays, away, people, tasks, messages },
   };
 }
 

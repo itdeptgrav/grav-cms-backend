@@ -86,9 +86,11 @@ class LiveKitBrowserCall {
   static fromEnv(env = process.env) {
     return new LiveKitBrowserCall({
       provider: env.GRAV_VOICE_CARRIER || "plivo",
-      url: env.LIVEKIT_URL,
-      apiKey: env.LIVEKIT_API_KEY,
-      apiSecret: env.LIVEKIT_API_SECRET,
+      // Voice can be migrated independently from the legacy shared
+      // realtime deployment used by other CMS apps such as CoWork.
+      url: env.GRAV_VOICE_LIVEKIT_URL || env.LIVEKIT_URL,
+      apiKey: env.GRAV_VOICE_LIVEKIT_API_KEY || env.LIVEKIT_API_KEY,
+      apiSecret: env.GRAV_VOICE_LIVEKIT_API_SECRET || env.LIVEKIT_API_SECRET,
       outboundTrunkId: env.GRAV_VOICE_SIP_OUTBOUND_TRUNK_ID || env.LIVEKIT_PLIVO_SIP_OUTBOUND_TRUNK_ID,
       businessNumber: env.GRAV_VOICE_CALLER_ID || env.PLIVO_CALLER_ID,
       recordingBucket: env.LIVEKIT_EGRESS_GCP_BUCKET || env.FIREBASE_STORAGE_BUCKET,

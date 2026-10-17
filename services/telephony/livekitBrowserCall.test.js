@@ -116,6 +116,25 @@ test("generic line settings remain compatible with the legacy Plivo variable nam
   assert.equal(generic.businessNumber, "+918047093656");
 });
 
+test("voice settings can move independently to the GRAV Realtime endpoint", () => {
+  const service = LiveKitBrowserCall.fromEnv({
+    LIVEKIT_URL: "wss://legacy.livekit.cloud",
+    LIVEKIT_API_KEY: "legacy-key",
+    LIVEKIT_API_SECRET: "legacy-secret",
+    GRAV_VOICE_LIVEKIT_URL: "wss://rtc.grav.in",
+    GRAV_VOICE_LIVEKIT_API_KEY: "voice-key",
+    GRAV_VOICE_LIVEKIT_API_SECRET: "voice-secret",
+    GRAV_VOICE_SIP_OUTBOUND_TRUNK_ID: "ST_grav-realtime",
+    GRAV_VOICE_CALLER_ID: "+918065395337",
+  });
+
+  assert.equal(service.url, "wss://rtc.grav.in");
+  assert.equal(service.apiKey, "voice-key");
+  assert.equal(service.apiSecret, "voice-secret");
+  assert.equal(service.outboundTrunkId, "ST_grav-realtime");
+  assert.equal(service.configured(), true);
+});
+
 test("a failed dial is classified as busy, no answer, or failed", () => {
   assert.equal(dialFailureState({ metadata: { sip_status_code: "486" } }), "CUSTOMER_BUSY");
   assert.equal(dialFailureState({ metadata: { sip_status_code: "603" } }), "CUSTOMER_BUSY");

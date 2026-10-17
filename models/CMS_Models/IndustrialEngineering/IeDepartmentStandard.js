@@ -37,6 +37,26 @@ const ieDepartmentStandardSchema = new mongoose.Schema(
     hoursPerDay: { type: Number, required: true, min: 0.5, max: 24 },
     efficiencyPct: { type: Number, required: true, min: 1, max: 150, default: 80 },
     notes: { type: String, trim: true, default: "", maxlength: 500 },
+    /* HOW THE DEPARTMENT BATCHES ITS WORK (16 Oct 2026, owner: "the
+       technicality should come from the IE"). Some departments do not work
+       at a rate: a cutting LAY comes off a table whole, a washing LOAD out
+       of a machine, an embroidery RUN off the heads — and packing counts in
+       CARTONS. IE states the machines (tables), the batch size and the
+       minutes a batch takes; PPC's plan for the department is filled from
+       these. Which fields a department needs: BATCH_FIELDS in
+       departmentStandards.service.js. null = not stated. */
+    batch: {
+      type: new mongoose.Schema({
+        machines: { type: Number, min: 1, max: 200, default: null },
+        perBatch: { type: Number, min: 1, max: 20000, default: null },
+        minutesPerBatch: { type: Number, min: 1, max: 1440, default: null },
+      }, { _id: false }),
+      default: null,
+    },
+    /* The first version of the above, cutting only, written on 16 Oct 2026
+       before it was generalised: read as cutting's batch when `batch` is
+       absent (batchOf), never written again. */
+    cutting: { type: mongoose.Schema.Types.Mixed, default: undefined },
     updatedBy: { type: actor, default: () => ({}) },
     history: {
       type: [new mongoose.Schema({

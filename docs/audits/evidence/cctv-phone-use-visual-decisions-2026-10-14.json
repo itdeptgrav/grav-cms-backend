@@ -1,0 +1,103 @@
+{
+  "schemaVersion": "phone-use-review-decisions-v1",
+  "reviewerId": "codex-visual-audit-2026-10-14",
+  "reviewedAt": "2026-10-14T18:45:00+05:30",
+  "reviewMethod": "Four chronological full-scene frames plus expanded target crops per window; development evidence only, pending independent human adjudication.",
+  "decisions": [
+    {
+      "annotationId": "cam20-2026-08-27-194758-t1-00007980-001",
+      "label": "UNCERTAIN",
+      "confidence": "MEDIUM",
+      "notes": "The red-shirt target appears to view or hold a phone in the first sample, then moves a chair and talks; sustained active use is not established for the complete window.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "gazeAtDevice": "UNCERTAIN", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t1-00012960-002",
+      "label": "NOT_ACTIVE_UNSPECIFIED",
+      "confidence": "MEDIUM",
+      "notes": "The red-shirt target is standing and talking; no sustained phone interaction is visible and the target is lost in the last sample.",
+      "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t1-00017950-003",
+      "label": "UNCERTAIN",
+      "confidence": "LOW",
+      "notes": "The target is partly occluded by the gray-shirt person and identity continuity is ambiguous; the pixels do not support an interaction decision.",
+      "reviewEvidence": {}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00009970-001",
+      "label": "PHONE_HELD",
+      "confidence": "HIGH",
+      "notes": "The gray-shirt target holds a phone while gesturing and talking, with gaze directed away from the device.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "handDeviceContact": "YES", "gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00014960-002",
+      "label": "PHONE_HELD",
+      "confidence": "HIGH",
+      "notes": "The phone remains held near waist or chest height, but gaze and behaviour do not establish active interaction.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "handDeviceContact": "YES", "gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00019940-003",
+      "label": "ACTIVE_VIEW_OR_TYPE",
+      "confidence": "MEDIUM",
+      "notes": "The gray-shirt target visibly looks down at the held phone in multiple middle samples; this supports an intermittent active-view episode within the window.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "handDeviceContact": "YES", "gazeAtDevice": "YES", "phoneAtEar": "NO", "repetitiveManipulation": "UNCERTAIN"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00024930-004",
+      "label": "PHONE_HELD",
+      "confidence": "HIGH",
+      "notes": "The phone is held, but the target looks forward or upward and no manipulation or call pose is visible.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "handDeviceContact": "YES", "gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00029910-005",
+      "label": "PHONE_HELD",
+      "confidence": "MEDIUM",
+      "notes": "The phone is held early, then the target turns and talks; active viewing or typing is not sustained.",
+      "reviewEvidence": {"phoneVisible": "YES", "ownedByTarget": "YES", "handDeviceContact": "YES", "gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}
+    },
+    {
+      "annotationId": "cam20-2026-08-27-194758-t3-00034900-006",
+      "label": "UNCERTAIN",
+      "confidence": "LOW",
+      "notes": "The target has their back to the camera and is partly lost; phone presence and interaction cannot be resolved reliably.",
+      "reviewEvidence": {}
+    },
+
+    {"annotationId": "cam09-2026-08-28-200533-t1-00002940-001", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00007840-002", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00012740-003", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00017640-004", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00022540-005", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00027440-006", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00032330-007", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00037230-008", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the seated target works at a laptop.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t1-00042130-009", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "MEDIUM", "notes": "No active phone interaction is visible in decoded frames; confidence is reduced by end-of-file decode loss.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+
+    {"annotationId": "cam09-2026-08-28-200533-t2-00002940-001", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00007840-002", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00012740-003", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00017640-004", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00022540-005", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00027440-006", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00032330-007", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00037230-008", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible; the target remains engaged with the workstation.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t2-00042130-009", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "MEDIUM", "notes": "No active phone interaction is visible in decoded frames; confidence is reduced by end-of-file decode loss.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+
+    {"annotationId": "cam09-2026-08-28-200533-t3-00002940-001", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the tracked target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t3-00007840-002", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "MEDIUM", "notes": "The short terminal window contains no visible active phone interaction, but track duration is limited.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+
+    {"annotationId": "cam09-2026-08-28-200533-t4-00008820-001", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00013720-002", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00018620-003", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00023520-004", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00028420-005", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00033310-006", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00038210-007", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "HIGH", "notes": "No active phone interaction is visible for the standing blue-shirt target.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}},
+    {"annotationId": "cam09-2026-08-28-200533-t4-00043110-008", "label": "NOT_ACTIVE_UNSPECIFIED", "confidence": "MEDIUM", "notes": "No active phone interaction is visible in decoded frames; confidence is reduced by end-of-file decode loss.", "reviewEvidence": {"gazeAtDevice": "NO", "phoneAtEar": "NO", "repetitiveManipulation": "NO"}}
+  ]
+}

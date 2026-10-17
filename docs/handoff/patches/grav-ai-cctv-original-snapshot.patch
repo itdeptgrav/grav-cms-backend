@@ -1,0 +1,169 @@
+diff --git a/README.md b/README.md
+index 0094b50..5226219 100644
+--- a/README.md
++++ b/README.md
+@@ -144,6 +144,15 @@ The header has a `[ Standard | Original ]` switch (also in the fullscreen bar; k
+   never displayed larger).
+ * The choice is remembered per browser (localStorage), not server-wide. Settings
+   page previews always stay Standard.
++* `GET /snapshot/<i>?quality=original` returns ONE live main-stream picture for an
++  occasional detail scan (e.g. an object detector every 10-30 s) instead of a
++  continuous Original stream: grid size (`CCTV_ORIGINAL_GRID_MAX_W`), JPEG 90,
++  headers `X-Frame-State: live` and `X-Frame-Size: <w>x<h>`. It waits up to
++  `CCTV_ORIGINAL_SNAPSHOT_WAIT_S` (10) for a live frame and answers `503` rather
++  than a Standard picture. It counts as a grid viewer while waiting (never pinned)
++  and the main stream is released `CCTV_ORIGINAL_SNAPSHOT_LINGER_S` after it
++  (default: `CCTV_ORIGINAL_LINGER_S`; set it above the caller's interval to keep the
++  stream warm, at the cost of keeping it open). Plain `/snapshot/<i>` is unchanged.
+ * Only cameras on screen use Original: one Original worker per camera, shared by
+   every browser, stopped when the last Original viewer leaves (never kept in the
+   background). Original streams count toward the per-NVR cap; fullscreen Original
+diff --git a/server.py b/server.py
+index bd91535..b7fc151 100644
+--- a/server.py
++++ b/server.py
+@@ -255,6 +255,17 @@ HANDOFF_MAX_S     = _envfloat("CCTV_HANDOFF_MAX_S", 60.0)
+ ORIGINAL_LINGER_S = _envfloat("CCTV_ORIGINAL_LINGER_S", 5.0)
+ # RTSP read timeout of the main stream (default: the same as CCTV_READ_TIMEOUT_MS).
+ ORIGINAL_READ_TIMEOUT_MS = _envint("CCTV_ORIGINAL_READ_TIMEOUT_MS", READ_TIMEOUT_MS)
++# GET /snapshot/<i>?quality=original: ONE live main-stream picture for an occasional
++# detail scan (e.g. the factory twin's object detector), instead of a continuous Original
++# stream. It counts as a grid viewer while it waits (never pinned, so no fullscreen
++# priority) and is encoded no wider than ORIGINAL_GRID_MAX_W like a grid tile. The main
++# stream is opened for it and released ORIGINAL_SNAPSHOT_LINGER_S after (default: the
++# normal Original linger), so callers that ask every few seconds can choose between
++# keeping it warm (linger > interval) and opening it each time. Never a Standard picture
++# in its place: if no live Original frame arrives within ORIGINAL_SNAPSHOT_WAIT_S the
++# answer is 503.
++ORIGINAL_SNAPSHOT_WAIT_S   = _envfloat("CCTV_ORIGINAL_SNAPSHOT_WAIT_S", 10.0)
++ORIGINAL_SNAPSHOT_LINGER_S = _envfloat("CCTV_ORIGINAL_SNAPSHOT_LINGER_S", ORIGINAL_LINGER_S)
+ 
+ # ── camera audio (FINAL_CCTV_AUDIO_REPORT.txt) ─────────────────────────────────────
+ # The NVR streams carry a G.711 microphone track, but OpenCV (the video path) cannot
+@@ -3422,7 +3433,7 @@ class Handler(BaseHTTPRequestHandler):
+                     info["audio"] = {"state": "denied", "available": False}
+                 self._send(200, json.dumps(info).encode(), "application/json")
+         elif path.startswith("/snapshot/"):
+-            self._snapshot(path, pr)
++            self._snapshot(path, pr, query)
+         elif path.startswith("/stream/"):
+             self._stream(path, query, pr)
+         elif path.startswith("/audio/"):
+@@ -3705,13 +3716,15 @@ class Handler(BaseHTTPRequestHandler):
+         pr = pr.recheck()
+         return pr, pr.allowed and all(pr.can(key, f) for f in features)
+ 
+-    def _snapshot(self, path, pr):
++    def _snapshot(self, path, pr, query=None):
+         i = self._index(path, "/snapshot/")
+         if i is None:
+             self._send(404, b"bad camera", "text/plain")
+             return
+         if not self._may(pr, i, "live", path):            # checked BEFORE the shared worker is touched
+             return
++        if (query or {}).get("quality", [""])[0] == "original":
++            return self._snapshot_original(i)
+         cam = STREAMS[i]
+         cam.add_viewer()
+         try:
+@@ -3727,6 +3740,55 @@ class Handler(BaseHTTPRequestHandler):
+         finally:
+             cam.remove_viewer()
+ 
++    def _snapshot_original(self, i):
++        """One LIVE picture from camera i's main stream (see ORIGINAL_SNAPSHOT_*).
++        Headers say what it is: X-Frame-State: live, X-Frame-Size: <w>x<h>."""
++        orig = ORIG_STREAMS[i]
++        remote = self._remote()
++        orig.add_viewer(full=False, fps=1, remote=remote)
++        jpg = None
++        try:
++            deadline = time.monotonic() + max(0.5, ORIGINAL_SNAPSHOT_WAIT_S)
++            while time.monotonic() < deadline:
++                orig.last_use = time.time()
++                frame, state = orig.frame_for_viewer()
++                if state == "live":
++                    jpg = frame
++                    break
++                if orig.unavailable():
++                    break
++                time.sleep(0.05)
++        finally:
++            orig.remove_viewer(full=False, fps=1, remote=remote)
++            if ORIGINAL_SNAPSHOT_LINGER_S != ORIGINAL_LINGER_S:
++                with orig._vlock:
++                    if orig.viewers == 0 and orig.bg_reason == "linger":
++                        if ORIGINAL_SNAPSHOT_LINGER_S > 0:
++                            orig.linger_until = time.monotonic() + ORIGINAL_SNAPSHOT_LINGER_S
++                        else:
++                            orig.linger_until = 0.0     # housekeeping releases it now
++        try:
++            if jpg is None:
++                body = b"original not available"
++                self.send_response(503)
++                self.send_header("Content-Type", "text/plain")
++                self.send_header("Retry-After", "10")
++                self.send_header("Content-Length", str(len(body)))
++                self.end_headers()
++                self.wfile.write(body)
++                return
++            w, h = orig.output_size or (0, 0)
++            self.send_response(200)
++            self.send_header("Content-Type", "image/jpeg")
++            self.send_header("Cache-Control", "no-store")
++            self.send_header("X-Frame-State", "live")
++            self.send_header("X-Frame-Size", f"{w}x{h}")
++            self.send_header("Content-Length", str(len(jpg)))
++            self.end_headers()
++            self.wfile.write(jpg)
++        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
++            pass
++
+     def _stream(self, path, query=None, pr=None):
+         i = self._index(path, "/stream/")
+         if i is None:
+diff --git a/test_quality.py b/test_quality.py
+index a552a5d..48880d4 100644
+--- a/test_quality.py
++++ b/test_quality.py
+@@ -601,6 +601,40 @@ def test_status_and_stream_info(port):
+     wait(lambda: not O[i]._running, 3.0)
+ 
+ 
++def _get(port, path):
++    import http.client
++    c = http.client.HTTPConnection("127.0.0.1", port, timeout=20)
++    c.request("GET", path)
++    r = c.getresponse()
++    out = (r.status, dict(r.getheaders()), r.read())
++    c.close()
++    return out
++
++
++def test_original_snapshot_is_one_live_main_stream_picture(port):
++    i = NVR1[-1]
++    key = f"key={server.TOKEN}&" if server.TOKEN else ""
++    wait(lambda: O[i].viewers == 0 and not O[i]._running, 3.0)
++    status, headers, body = _get(port, f"/snapshot/{i}?{key}quality=original")
++    check("/snapshot/<i>?quality=original -> one LIVE main-stream picture at grid size (1280 wide), JPEG 90",
++          status == 200 and body == b"jpeg-1280x720-q90" and headers.get("X-Frame-State") == "live"
++          and headers.get("X-Frame-Size") == "1280x720", (status, body[:40], headers.get("X-Frame-Size")))
++    check("... it opened the MAIN stream", OPENS.get((i, 0), 0) >= 1, OPENS.get((i, 0)))
++    check("... and held no viewer afterwards (never pinned, nothing left behind)",
++          O[i].viewers == 0 and O[i].viewers_full == 0, (O[i].viewers, O[i].viewers_full))
++    check("... the main stream is released after the linger", wait(lambda: not O[i]._running, 3.0), O[i].bg_reason)
++    status, _, body = _get(port, f"/snapshot/{i}?{key[:-1]}" if key else f"/snapshot/{i}")
++    check("plain /snapshot/<i> is still the Standard picture", status == 200 and body == b"jpeg-640x360-q70", body[:40])
++    FAIL.add((i, 0))
++    try:
++        status, headers, body = _get(port, f"/snapshot/{i}?{key}quality=original")
++        check("main stream failing -> 503, never a Standard picture passed off as Original",
++              status == 503 and not body.startswith(b"jpeg-") and headers.get("Retry-After") == "10", (status, body[:40]))
++    finally:
++        FAIL.discard((i, 0))
++    check("slot table consistent, cap respected", consistent())
++
++
+ def test_pages():
+     page, sp = server.PAGE, server.SETTINGS_PAGE
+     check("grid: quality switch [Standard | Original] in the header + fullscreen bar",

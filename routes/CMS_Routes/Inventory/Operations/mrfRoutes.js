@@ -1337,7 +1337,11 @@ router.post(
         trigger: autoReservation.TRIGGERS.AUTO_FORWARDED,
         actorName: fullName, actorId: employee?._id || actorId || null,
       });
-    } else mrfNotify.submitted(mrf).catch(() => { });
+    } else {
+      mrfNotify.submitted(mrf).catch(() => { });
+      require("../../../../services/mrfVoiceApproval.service").enqueue(mrf)
+        .catch((e) => console.error("[mrf voice approval enqueue]", e.message));
+    }
 
     const createdPayload = {
       success: true,

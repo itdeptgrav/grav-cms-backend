@@ -1,3 +1,329 @@
+# ACTIVE TASK — CCTV ACTIVE-PHONE-USE EVIDENCE CASCADE (13 Oct 2026)
+
+> **15 Oct GRAV Speech transcript-quality correction.** The supplied 34-minute
+> recording exposed micro-turn hallucination, over-context repetition and
+> presentation merging in the diarized prototype. The runner now preserves
+> immutable raw turns, uses model-safe long-form decoding, constrains automatic
+> language selection to English/Hindi/Odia, scores deterministic quality and
+> diarizer-channel evidence, and supports a private semantic classifier that
+> can only label coherent/uncertain/gibberish. It cannot rewrite transcript
+> words. The exact `Venkatagiriya O Daang Rapping` example is reproduced as an
+> uncertain four-turn review window rather than trusted prose. Durable contract:
+> `docs/decisions/central-grav-speech-service.md`.
+
+The product owner rejected a single-model activity label and requested a
+multi-level architecture in which each model contributes only the evidence it
+is demonstrably good at. The accepted shadow-pilot design separates person
+tracking, phone proposals, pose/ownership, temporal action evidence, Qwen3-VL
+semantic verification, calibrated fusion, temporal events and optional identity
+resolution.
+
+The production vision worker has a hard 12 GB VRAM ceiling. Qwen3-VL 8B BF16 is
+restricted to offline teacher/evaluation use; PU-05 must select and measure a
+smaller or quantized candidate verifier, and PU-08 must prove the complete
+scheduled cascade remains below 11.5 GB peak allocated plus reserved memory.
+
+The previous handcrafted v2 rules and Qwen-only classifier are development
+baselines, not release candidates. Implementation proceeds PU-00 through PU-10;
+production remains blocked until a frozen camera-matched holdout passes the
+event-level gates.
+
+**14 Oct CMS integration.** The protected factory-twin slice is now reachable
+from the CCTV app home rather than as an orphan route. Both `/cctv` and
+`/cctv/twin` use the same server-side CCTV access decision. The hosted live
+camera hand-off keeps its compatibility key in the backend environment only;
+the browser requests a sign-in URL after authorization and never bundles or
+stores that value. Personal JWT SSO remains the preferred upgrade path.
+
+**15 Oct twin calibration and identity state.** The Conference Room setup is
+saved as `CALIBRATED`; the measured room and camera placement render in 3D. A
+local YOLOv8m + CCTV-tuned BoT-SORT worker reads the real hosted Conference Room
+stream, publishes camera-local track IDs, common room-object classes and image
+anchors, and the backend projects accepted observations into a four-second,
+non-persistent live snapshot. A lowered CCTV threshold plus spatial duplicate
+suppression and a six-second camera-local hold recover partly occluded seated
+people without turning duplicate boxes into extra occupants. The viewer renders
+articulated seated/standing humanoids, a surveyed conference-room furniture
+approximation and separate live object geometry with interpolation. Camera
+placement and floor-point pairing can be performed in either 2D or an
+interactive isometric 3D room view. An optional read-only InsightFace layer may
+attach a name only after repeated direct matches to a READY/trusted PHONE_DETC
+gallery entry. The backend removes this field for ordinary viewers; it is shown
+only to re-verified platform administrators, expires with the live track and is
+never derived from body ReID. No image or video is sent through or persisted by
+the observation contract. See
+`docs/decisions/cctv-twin-face-identity-boundary.md`.
+A hosted-registry refresh failure preserves
+the last-known/saved twin instead of replacing all cameras and calibration with
+zero, and the UI reports the stale state instead of falsely claiming a live
+connection.
+
+The real feed repeatedly produced three distinct person tracks when three people
+were visible, and the end-to-end handoff accepted all three. The earlier one-
+person display was caused by three stale test workers overwriting the same
+authoritative camera frame; those processes were removed. Because seated feet
+are hidden by the table and the four surveyed points cover only part of the
+floor, this pilot explicitly uses a `DEGRADED` occupancy proxy for display while
+retaining strict homography as the precise path. Proxy locations are approximate
+and must not be reported as measured movement. A later physical calibration pass
+needs well-spread surveyed floor landmarks covering the chair area (temporary
+tape/ArUco markers are suitable).
+
+**13 Oct implementation evidence.** PU-00 through PU-02 now have immutable copied
+development fixtures, SHA-256 manifests and a fail-closed typed observation
+schema plus a decision-free quality/tracking layer in the isolated vision
+worker. The historical 12-clip set is explicitly
+development data because it has already been inspected. The 30-clip set cannot
+pass the strict provenance gate because its original source URLs were not
+retained; it remains development-only rather than receiving fabricated
+provenance. Fifteen schema/tracking tests pass. A repeated 15-second replay of
+the hard CCTV clip produced the same SHA-256 evidence hash both times: 485
+chronological observations across 11 track IDs, with the configured track and
+history bounds respected.
+
+The initial PU-05 memory feasibility gate also passes. Qwen2.5-VL 3B BF16 plus
+YOLO11x, YOLO11x Pose, both phone-proposal checkpoints and MViT V2 S ran
+concurrently under an enforced 11.5 GiB allocator ceiling, peaking at 8.172 GiB
+allocated and 8.426 GiB reserved. This is an A40 allocator-capped smoke test;
+PU-08 still requires representative replay on the exact 12 GB deployment GPU.
+See `docs/audits/cctv-phone-use-12gb-profile-2026-10-13.md`.
+
+**14 Oct reliability correction.** Real-CCTV and degraded replays proved the
+experimental fusion still confuses visible/held phones with active use. A
+versioned human-review boundary now precedes further proposal/geometry tuning:
+fixed four-second windows, separate model suggestions, mutually exclusive
+visible/held/active labels, reviewer attribution, source hashes and strict
+source-group split validation. Fifteen focused tests pass. A first Codex visual
+audit labelled all 37 extracted development windows: the old fusion called all
+nine Cam 20 candidates active, while review supports only one active-view
+window, four held-phone windows, one visibly non-active window and three
+uncertain windows. This closes the data contract and confirms the semantic
+failure; it is not training or release evidence. Independent human adjudication,
+more camera-matched sources and the frozen PU-10 holdout remain required.
+Round-two queues now hide both the first review and all model suggestions; a
+comparison gate refuses the same reviewer, mismatched immutable windows or
+incomplete reviews and reports active/not-active disagreements separately.
+Nineteen focused tests pass. No calibration starts until that independent pass
+is complete.
+
+Durable scope:
+
+- `docs/decisions/cctv-phone-use-evidence-cascade.md`
+- `docs/tasks/cctv-phone-use-evidence-cascade.md`
+- `docs/decisions/cctv-hybrid-event-architecture.md`
+- `docs/audits/cctv-phone-use-12gb-profile-2026-10-13.md`
+
+---
+
+# ACTIVE TASK — GRAV VOICE AUTOMATION PLATFORM (13 Oct 2026)
+
+The product owner requested that the MRF call capability become a reusable
+company-wide voice channel for leave approvals, morning briefs, reminders and
+later important workflows. The accepted architecture has three modes:
+confirmed decision calls, read-only briefings and configurable reminders. A
+shared platform owns delivery, schedules, preferences, LiveKit media and
+dialogue mechanics; narrow workflow adapters retain source-domain facts,
+authority and mutations.
+
+The first release sequence preserves MRF parity, adds idempotent occurrences
+and fatigue controls, then pilots a read-only morning brief using the existing
+employee home aggregate. Reminders follow, then separate manager-leave and HR
+final-leave adapters. Primary/secondary manager stages and `LEAVE_DECIDE_HR`
+remain distinct. Qwen may understand and phrase conversation but cannot query
+arbitrary CMS data, select recipients, confirm, schedule freely or perform a
+business mutation.
+
+The IT `/developer/voice-lab` route now presents this as one Voice Automation
+control centre. Its server-owned catalogue shows the three interaction modes,
+workflow owner, live/pilot/domain-gated state, next release gate, shared
+guardrails and recent delivery evidence. MRF remains the only live decision
+adapter and retains its real synthetic call test.
+
+The first read-only morning-brief pilot is implemented. A signed-in employee
+can opt in, choose an IST time and weekdays, save the schedule or request a
+call-now test from IT. The server builds a compact personal summary from the
+existing Employee Home aggregate and owned approval counters, generates at
+most one scheduled occurrence per employee/local date, skips an approved-leave
+day and reuses the normal CMS/LiveKit call overlay. The worker can repeat the
+brief, open Home or finish; no morning-brief code path has a commit action or
+enters MRF approval state. The focused backend suite passes 16/16. English,
+Hindi and Odia are now available. IndicF5 synthesis runs in an isolated
+pod-local speech environment so its older Transformers runtime does not
+conflict with the Qwen dialogue model.
+
+The browser call lifecycle now recovers a ringing Voice Lab test after reload,
+closes disconnected synthetic rooms, and expires stale active rows before a
+morning brief checks recipient concurrency. Call media has exclusive priority:
+Hey GRAV and the Ctrl-K microphone are dormant while any phone, workflow or
+Voice Lab call is ringing or active, then resume the saved wake preference once
+all call owners release audio. A repaired call-now run reached the global
+morning-brief overlay, and the CEO account was verified with no active lock
+after cleanup.
+
+Durable scope:
+
+- `docs/product/grav-voice-automation-platform.md`
+- `docs/decisions/grav-voice-workflow-adapter-boundary.md`
+- `docs/tasks/grav-voice-automation-platform.md`
+
+---
+
+# ACTIVE TASK — MRF LIVEKIT VOICE APPROVALS (13 Oct 2026)
+
+The product owner requested an in-CMS call to the assigned MRF approver using
+LiveKit WebRTC only, with self-hosted English/Hindi/Odia speech. The agent may
+approve all still-pending lines, reject them with a reason, or defer; it never
+bypasses the existing item-level MRF authority and it never uses Plivo/PSTN.
+
+Durable scope:
+
+- `docs/product/mrf-livekit-voice-approvals.md`
+- `docs/decisions/mrf-livekit-voice-approval-boundary.md`
+- `docs/tasks/mrf-livekit-voice-approvals.md`
+
+The backend session boundary, authenticated global call surface, IT health
+surface, RunPod worker, Kokoro English TTS and existing GRAV Speech STT are now
+implemented. English passed a local end-to-end acceptance call: LiveKit rang
+and connected the CEO browser, the agent conversed, approve/confirm crossed the
+existing authority boundary, and both the synthetic session and MRF reached
+`APPROVED`. The verified-empty obsolete `workspacemessages` collection was
+removed to create the TTL-backed session collection, and the exact synthetic
+test records were cleaned up afterward. The worker now prewarms English STT/TTS
+before registering, preventing first-call timeouts after a pod restart. Natural
+multi-word decisions require a separate natural confirmation, and barge-in is
+acknowledged once before the agent resumes the unfinished question. IT now has
+an isolated `/developer/voice-lab` interface that exercises the real media and
+model path while making it structurally impossible to mutate an actual MRF.
+Unknown natural wording may now be classified by Qwen only as a proposed
+intent; the caller must confirm that interpretation before it enters the
+deterministic approval flow. The agent rotates safe prompt wording and rejects
+Qwen drafts that repeat the preceding sentence or fail to ask a real
+clarification question. Live probes cover rejection-like and defer-like natural
+phrases, and the focused backend suite passes 13/13.
+
+The localhost voice link was restored after a silent Voice Lab call exposed an
+orphaned RunPod `sshd` listener on the narrow relay port. The relay and reverse
+SSH tunnel are live again; the tunnel now uses failure-on-bind plus keepalives.
+RunPod reached the protected callback in 0.34 seconds, and a fresh synthetic
+dispatch fetched its context and invoked Kokoro without a timeout. The failed
+and verification-only sessions did not mutate a real MRF.
+
+Input audio now uses an explicit mono speech profile with echo cancellation,
+noise suppression, automatic gain control, Chromium voice isolation, the
+LiveKit speech bitrate preset and discontinuous transmission. The deployed
+Silero VAD requires 250 ms of sustained speech at a 0.65 activation threshold,
+instead of accepting 50 ms at 0.5, and waits 700 ms for end-of-turn silence.
+This is intended to reject fans, typing and brief background voices while
+preserving normal conversational pauses.
+
+Closed-tab call delivery now uses the existing per-device Firebase registry.
+Creating a real queued voice session sends the assigned approver a unique,
+high-priority notification that expires after 120 seconds. `Answer` opens the
+exact session in Requests and the authenticated global overlay closes the
+system notification before offering the normal LiveKit answer control;
+`Later` dismisses the notification and has no authority to change the MRF.
+Registration now runs on every authenticated CMS surface rather than only in
+HR. This provides a web/PWA closed-tab wake-up, not a false guarantee of native
+WhatsApp behaviour after browser force-quit; lock-screen calling requires a
+later iOS CallKit/PushKit and Android Telecom/FCM shell.
+
+Local development now advertises English, Hindi and Odia. Hindi uses the
+owner-approved dedicated Resemble AI Chatterbox Hindi V3 voice; Odia remains on
+Indic Parler. Model assets are cached on the pod and credentials are not stored
+in repository configuration. Production-shaped probes through the private
+speech gateway returned valid mono, 24 kHz, 16-bit PCM WAV for both Hindi and
+Odia, so the CMS selectors are enabled.
+
+The Indic speech boundary now targets everyday office Hindi/Hinglish and
+conversational Odia rather than formal textbook translations. Common business
+words remain familiar but are written phonetically in the target script for
+reliable pronunciation. Dynamic English CMS copy is localized before synthesis,
+and remaining Latin prose fails closed instead of being spoken in the wrong
+language.
+
+**14 Oct pod recovery.** The voice runtime now runs on the user's selected
+24 GB RTX PRO 4000 Blackwell pod after the prior A40 became unavailable. The
+migration preserved the workspace but flattened cached Hugging Face symlinks;
+Qwen3-4B and Kokoro snapshots were reconstructed from their intact blobs, and
+the launcher now builds IndicF5 from `/tmp` to avoid object-volume package
+metadata failures. IndicF5 is isolated behind pod-local port 8892 because it
+requires Transformers 4.49 while Qwen uses the newer main runtime; the public
+worker boundary remains the private speech gateway on port 8890. English STT,
+Kokoro, IndicF5, 4-bit Qwen, the private callback tunnel and the named LiveKit
+worker all passed readiness checks.
+
+**14 Oct sub-four-second voice path.** The deployed Qwen service is now a
+one-code semantic router rather than a prose generator or translator. Warm
+Hindi routing measured 0.113-0.118 seconds (1.039 seconds for the first warmed
+request), while repeated Kokoro and IndicF5 clips returned from the persistent
+pod cache in 0.002-0.003 seconds. The router has a 1.5-second fail-safe deadline,
+likely responses pre-render while earlier audio is playing, and end-of-turn
+silence is 450 ms. Cold IndicF5 remains 2.68-5.76 seconds, so uncached dynamic
+sentences are not claimed to satisfy the interactive latency target.
+
+**15 Oct Hindi voice replacement.** The owner rejected the Qwen Hindi trial and
+approved the dedicated Resemble AI Chatterbox Hindi V3 sample using the same MRF
+script. The model now runs warm behind pod-local port 8894 and is selected only
+for Hindi; Kokoro English and Indic Parler Odia are unchanged. The production
+speech route generated a 5.040-second Hindi clip in 3.327 seconds and returned
+the identical cached clip in 0.004 seconds. The named LiveKit worker registered
+successfully after deployment. The deployment audit also repaired Qwen's
+zero-byte migrated snapshot from its intact local blobs, made the direct-file
+copy restart-safe, and verified a bounded Hindi intent turn in 0.658 seconds.
+Voice Lab now shows the exact native-script sentence sent to TTS rather than the
+controller's earlier mixed-script draft. Hindi scaffolding is preserved while
+embedded employee names and English item descriptions are localized separately,
+preventing the dedicated translator from changing the approval sentence's
+meaning or the speech model from skipping raw Latin words.
+
+**15 Oct confirmation latency pass.** The separate safety confirmation remains
+mandatory immediately before an approve or reject is committed, but it is now
+one short natural question rather than a read-back plus yes/no instructions.
+An unclear answer while already in the confirmation state no longer invokes
+Qwen or produces two sequential prompts; the deterministic controller repeats
+one short cached confirmation question. Qwen remains limited to proposing an
+interpretation for genuinely ambiguous intent before the approval state. The
+focused Python and backend suites pass 31/31, and the deployed LiveKit worker
+registered as `AW_JmB8wmg3dpRT` after the update.
+
+---
+
+# ACTIVE TASK — GRAV CHAT APPLICATION FOUNDATION (13 Oct 2026)
+
+The product owner requested a first-class Chat application with a visible,
+enforced distinction between external customer messaging and internal company
+messaging. `/chat` therefore presents two channels: **External · WhatsApp**,
+which uses the selected OpenWA session and the existing WhatsApp history, and
+**Internal · GRAV company**, which addresses verified employee identities and
+never sends through WhatsApp.
+
+The channels have separate API namespaces and persistence boundaries. Internal
+Chat shares the proven internal-message collections with Mail but every Chat
+thread is tagged `purpose: "chat"`; every Chat and Mail query applies its own
+purpose filter, with pre-Chat untagged rows treated as Mail. The OpenWA pairing
+QR is fetched only on demand from the authenticated Chat connection panel. It
+is not included in health/status, logged, or persisted by the CMS.
+
+**13 Oct local acceptance.** The installed OpenWA 4.76 runtime now exposes its
+in-memory QR only through the API-key-protected `/qr?sessionId=sales` endpoint;
+the former standalone `/pair` and `/pair.png` surfaces are removed and terminal
+QR output is suppressed. A live probe returned `200 image/png` while health
+reported `AWAITING_SCAN`. Chat polls readiness and refreshes an open QR in place,
+then closes the pairing modal and unlocks sending after the scan succeeds. The
+remaining pairing scan is an intentional human action on the company phone.
+
+Durable scope:
+
+- `docs/product/chat-app.md`
+- `docs/decisions/chat-channel-and-pairing-boundary.md`
+
+The existing Requests application is also registered by the normal additive
+access-catalogue startup path as `mrf`/“Requests”. `/mrf` remains its stable
+grant and launcher identity while `/requests` remains a friendly route alias;
+the launcher tile no longer depends on the historical one-off database script.
+
+---
+
 # ACTIVE TASK — GRAV MAIL APPLICATION FOUNDATION (12 Oct 2026)
 
 The product owner approved Mail as a separate first-class CMS application like
@@ -6144,5 +6470,64 @@ Verification: the broader assistant-navigation, Store, receiving and central
 assistant regression passes 73/73 across 11 suites; the Next.js
 compiler completed successfully before the repository's pre-existing
 `/marketing/campaigns/plans` prerender failure.
+
+---
+
+# ACTIVE TASK — FABRIC ROLL LENGTH CV PILOT (14 Oct 2026)
+
+The product owner requested a Python/computer-vision feasibility test for
+estimating metres from a fabric-roll end face without opening the roll. The
+isolated pilot uses manual roll geometry and tape calibration, excludes
+obstructed angular sectors, unwraps the end face into polar coordinates and
+compares candidate wrap detections across local sectors. It cannot write Store
+inventory or claim sub-1% accuracy.
+
+The first supplied 900 × 1600 JPEG produced weak, inconsistent evidence: local
+sectors found 11–20 candidate boundaries and candidate perimeter sums varied by
+about 45.5% IQR. The CLI therefore returned `research_inconclusive` and withheld
+`candidateLengthM`; its diagnostic-only median was 4.23 m with a 2.80–7.53 m
+sector range. This is failure evidence for the current capture, not a roll
+measurement. Six focused unit tests pass.
+
+The operational priority is now the simpler diameter/area estimator. It reports
+physical geometry from the tape-calibrated image and emits metres only when an
+explicit effective packed pitch or a known-length calibration roll is supplied.
+Wrap tracing remains an optional diagnostic rather than the primary workflow.
+
+A second, cleaner capture (`IMG_1103.DNG`) gives a provisional outer ellipse of
+193.6 × 186.6 mm, a core ellipse of 38.5 × 43.1 mm and fabric cross-sectional
+area of 27,065 mm². The supplied 147 cm fabric width is recorded as metadata and
+does not enter the diameter/pitch calculation. Because the tape is not clearly
+co-planar with the roll face, the scale remains provisional.
+
+The owner's approximate 147 m figure is retained only as a post-estimation
+sanity check. It is not an input or calibration for the dynamic estimator.
+
+The owner clarified that rolls differ and the estimator must be dynamic. The
+next pilot step therefore estimates local packed layer pitch from each roll's
+own polar-unwrapped end-face texture, across multiple angular sectors and radial
+bands. The 0.1841 mm value remains a baseline only; it must not be silently
+reused as the answer for another roll.
+
+The full-resolution 8064 x 6048 DNG was tested without using the reported
+length. Across reasonable detection settings, the roll-specific layer detector
+found inconsistent macro-boundaries rather than individual wraps. On the
+full-resolution run it found a median of 115 boundaries per angular sector,
+with a 16.5-boundary IQR and diagnostic sector lengths from 29.6 m to 45.8 m.
+The result was therefore rejected as `research_inconclusive`; no metre estimate
+was emitted. The visible pile and broad folds obscure the actual wrap
+interfaces over much of the face.
+
+The minimum data protocol is documented in
+`docs/research/fabric-roll-cv-data-collection.md`: five distinct rolls for the
+first feasibility run, several metered remaining-length checkpoints per roll,
+co-planar scale, four controlled lighting directions, direct diameter audit
+measurements and a split by physical roll rather than by photograph.
+
+Durable scope:
+
+- `docs/product/fabric-roll-photo-length-estimation.md`
+- `docs/decisions/fabric-roll-length-measurement-boundary.md`
+- `docs/tasks/fabric-roll-length-cv-pilot.md`
 
 ---

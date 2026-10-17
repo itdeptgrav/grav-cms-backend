@@ -97,6 +97,25 @@ router.post("/targets/orders/:moId/po", requireCompany, canSet, wrap(async (req,
   res.json({ success: true, message: number ? `PO ${number} recorded on ${where.on}.` : "PO number cleared.", po: poOf(mo.toObject()) });
 }));
 
+/* ── ONE DEPARTMENT, ACROSS ALL ORDERS (16 Oct 2026) ─────────────────────
+   PPC's department plan: every order's open work orders at the department
+   on one grid; saved as each order's share (services/ppc/
+   departmentPlan.service.js). Read with PLANNING_READ, save with WRITE. */
+const departmentPlan = require("../../../services/ppc/departmentPlan.service");
+router.get("/targets/department/:dept/plan", requireCompany, canRead, wrap(async (req, res) => {
+  res.json({ success: true, ...(await departmentPlan.read(companyOf(req), req.params.dept)) });
+}));
+router.post("/targets/department/:dept/plan", requireCompany, canSet, wrap(async (req, res) => {
+  const out = await departmentPlan.save(companyOf(req), req.params.dept, req.body, actor(req));
+  res.json({ success: true, message: `Plan saved — ${out.orders} order${out.orders === 1 ? "" : "s"} updated.`, ...out });
+}));
+
+/* the department plan turns an order page's proposal down */
+router.post("/targets/:targetId/decline", requireCompany, canSet, wrap(async (req, res) => {
+  const out = await svc.declineProposal(companyOf(req), req.params.targetId, actor(req), req.body?.reason);
+  res.json({ success: true, message: "Proposal declined.", ...out });
+}));
+
 router.post("/targets/:targetId/cancel", requireCompany, canSet, wrap(async (req, res) => {
   if (!svc.isId(req.params.targetId)) return res.status(400).json({ success: false, message: "Not a target id." });
   const out = await svc.cancelTarget(companyOf(req), req.params.targetId, actor(req), req.body?.reason);

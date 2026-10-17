@@ -120,4 +120,53 @@ async function health() {
   }
 }
 
-module.exports = { OpenWaError, recipientDigitsFor, chatIdFor, sendText, downloadMedia, health, request };
+// Pairing credentials are fetched only on demand by the authenticated Chat
+// connection panel. They are never logged, persisted, or returned by the
+// general status endpoint. OpenWA v5 exposes the latest QR at `/qr`; the
+// normaliser also accepts the common JSON and image responses used by v4
+// deployments with the QR surface enabled.
+async function qrCode() {
+  if (!isOpenWaActive()) {
+    throw new OpenWaError("OpenWA is not the active WhatsApp provider.", 409, "provider_dormant");
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), cfg.requestTimeoutMs);
+  try {
+    const suffix = cfg.openwaSessionId ? `?sessionId=${encodeURIComponent(cfg.openwaSessionId)}` : "";
+    const response = await fetch(`${cfg.openwaBaseUrl}/qr${suffix}`, {
+      headers: cfg.openwaApiKey ? { "X-API-Key": cfg.openwaApiKey } : {},
+      signal: controller.signal,
+      cache: "no-store",
+    });
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new OpenWaError(data?.error || data?.message || `OpenWA QR request failed (HTTP ${response.status}).`, response.status === 404 ? 409 : 502, "openwa_qr_unavailable");
+    }
+    const type = String(response.headers.get("content-type") || "").toLowerCase();
+    if (type.startsWith("image/")) {
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > 2 * 1024 * 1024) throw new OpenWaError("OpenWA returned an oversized QR image.", 502, "openwa_qr_invalid");
+      return { image: `data:${type.split(";")[0]};base64,${buffer.toString("base64")}` };
+    }
+    const raw = await response.text();
+    let data;
+    try { data = JSON.parse(raw); } catch { data = raw; }
+    const value = typeof data === "string"
+      ? data
+      : data?.qr || data?.data?.qr || data?.data || data?.image || data?.qrCode;
+    if (!value || typeof value !== "string") {
+      throw new OpenWaError("OpenWA has not generated a pairing QR yet.", 409, "openwa_qr_pending");
+    }
+    return value.startsWith("data:image/")
+      ? { image: value }
+      : { qr: value };
+  } catch (error) {
+    if (error instanceof OpenWaError) throw error;
+    if (error?.name === "AbortError") throw new OpenWaError("OpenWA QR request timed out.", 504, "openwa_timeout");
+    throw new OpenWaError(`OpenWA QR is unavailable: ${error.message}`, 503, "openwa_unavailable");
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+module.exports = { OpenWaError, recipientDigitsFor, chatIdFor, sendText, downloadMedia, health, qrCode, request };
