@@ -4395,6 +4395,119 @@ router.post("/requests/:requestId/record-payment", async (req, res) => {
 // GET /requests/:requestId/po-breakdown
 // (unchanged)
 // ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// SALES REDUCES A BULK ORDER'S QUANTITIES AFTER RELEASE (17 Oct 2026, owner)
+//
+// "The order qty the user has entered wrong, and as the order got sent to
+// production the sales person can't edit … keep a button on the purchase
+// invoice so he can reduce the order qty, product-variant wise, WO-wise …
+// he can't add more products."
+//
+//   GET  /requests/:requestId/reduce-quantities  — may it be reduced, and the
+//        lines: one per work order with its product, variant, today's figure,
+//        the lowest it may go (what the floor has already done) and why.
+//   POST /requests/:requestId/reduce-quantities  { lines:[{workOrderId,
+//        quantity}], reason } — applies every line or none: the work order
+//        (quantity, raw-material snapshot, progress totals, a change log),
+//        the request's own line, the PI's priced lines and totals, the due
+//        amount, the payment schedule, and a note on the request.
+//
+// The rules are services/sales/orderQuantityReduction.js (tested). The
+// arithmetic for raw materials and the PI is the SAME two helpers the
+// person-wise edit already uses (rescaleWorkOrderRawMaterials,
+// recalcQuotationFromRequestItems), so the two paths cannot disagree.
+// ═══════════════════════════════════════════════════════════════════════════════
+const qtyReduce = require("../../../services/sales/orderQuantityReduction");
+
+const reduceActor = (req) => ({ id: req.user?.id, name: req.user?.name || req.user?.fullName || "", email: req.user?.email || "" });
+
+router.get("/requests/:requestId/reduce-quantities", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(requestId)) return res.status(400).json({ success: false, message: "Invalid request id" });
+    const request = await CustomerRequest.findById(requestId).lean();
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    const editable = qtyReduce.requestEditable(request);
+    const workOrders = await WorkOrder.find({ customerRequestId: request._id })
+      .select("_id workOrderNumber status stockItemId stockItemName stockItemReference variantId variantAttributes quantity originalQuantity quantityChanges salesLineLink.lineRef productionCompletion.overallCompletedQuantity productionCompletion.operationCompletion.completedUnitNumbers cuttingProgress qcCompletion.completedQuantity packagedQuantity dispatchedQuantity")
+      .sort({ createdAt: 1 }).lean();
+    const lines = workOrders.map((wo) => qtyReduce.lineView(request, wo));
+    const quotation = request.quotations?.[0] || null;
+    return res.json({
+      success: true,
+      editable: editable.ok, code: editable.code, reason: editable.reason,
+      lines,
+      totals: quotation ? { grandTotal: Number(quotation.grandTotal) || 0, paid: Number(request.totalPaidAmount) || 0, due: Number(request.totalDueAmount) || 0, pieces: lines.reduce((n, l) => n + l.quantity, 0) } : null,
+    });
+  } catch (error) {
+    console.error("[reduce-quantities] read failed:", error);
+    return res.status(500).json({ success: false, message: "Server error while reading the order's quantities" });
+  }
+});
+
+router.post("/requests/:requestId/reduce-quantities", async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    if (!mongoose.Types.ObjectId.isValid(requestId)) return res.status(400).json({ success: false, message: "Invalid request id" });
+    const request = await CustomerRequest.findById(requestId);
+    if (!request) return res.status(404).json({ success: false, message: "Request not found" });
+    const editable = qtyReduce.requestEditable(request);
+    if (!editable.ok) return res.status(409).json({ success: false, code: editable.code, message: editable.reason });
+
+    const workOrders = await WorkOrder.find({ customerRequestId: request._id });
+    const plan = qtyReduce.planReduction(workOrders, req.body?.lines);
+    if (plan.errors.length) return res.status(400).json({ success: false, code: qtyReduce.CODES.VALIDATION, message: plan.errors[0], errors: plan.errors });
+
+    const reason = String(req.body?.reason || "").trim();
+    const actor = reduceActor(req);
+    const byId = new Map(workOrders.map((wo) => [String(wo._id), wo]));
+    const notOnRequest = [];
+
+    /* 1 · every work order, in memory first — nothing is saved until every
+       line has been applied without a refusal */
+    for (const change of plan.changes) {
+      const wo = byId.get(change.workOrderId);
+      const oldQty = Number(wo.quantity) || 0;
+      qtyReduce.applyToWorkOrder(wo, change, { reason, actor });
+      rescaleWorkOrderRawMaterials(wo, oldQty);
+      const onRequest = qtyReduce.applyToRequestItems(request, wo, change);
+      if (!onRequest.found) notOnRequest.push(wo.workOrderNumber || change.workOrderId);
+    }
+
+    /* 2 · the PI: priced lines, totals, due; then the schedule from its
+       percentages */
+    const priceMovement = await recalcQuotationFromRequestItems(request);
+    const overpaidSteps = qtyReduce.rebasePaymentSchedule(request.quotations?.[0]);
+
+    /* 3 · the record of it */
+    request.notes = request.notes || [];
+    request.notes.push({
+      text: qtyReduce.changeNote(plan.changes, workOrders, { reason, by: actor.name }),
+      addedBy: req.user?.id, addedByModel: "SalesDepartment", relatedTo: "request", createdAt: new Date(),
+    });
+    request.updatedAt = new Date();
+
+    /* 4 · write: the work orders, then the request */
+    for (const change of plan.changes) await byId.get(change.workOrderId).save();
+    await request.save();
+
+    return res.json({
+      success: true,
+      message: `${qtyReduce.movementText(plan.changes)} across ${plan.changes.length} work order${plan.changes.length === 1 ? "" : "s"}.`,
+      raised: plan.changes.some((c) => c.to > c.from),
+      changes: plan.changes.map((c) => { const wo = byId.get(c.workOrderId); return { ...c, reference: wo.workOrderNumber, productName: wo.stockItemName, variant: qtyReduce.variantText(wo.variantAttributes) }; }),
+      unchanged: plan.unchanged,
+      notOnRequest,
+      totals: priceMovement ? { before: priceMovement.before, after: priceMovement.after, overpaid: priceMovement.overpaid, due: request.totalDueAmount } : null,
+      overpaidSteps,
+      request,
+    });
+  } catch (error) {
+    console.error("[reduce-quantities] failed:", error);
+    return res.status(500).json({ success: false, message: error?.message || "Server error while reducing the order's quantities" });
+  }
+});
+
 router.get("/requests/:requestId/po-breakdown", async (req, res) => {
   try {
     const { requestId } = req.params;

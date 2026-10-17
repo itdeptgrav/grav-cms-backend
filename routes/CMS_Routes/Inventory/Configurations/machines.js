@@ -101,6 +101,51 @@ router.get("/locations", async (req, res) => {
   res.json({ success: true, locations: FACTORY_LOCATIONS });
 });
 
+// ✅ GET the machine's scanner setup QR (17 Oct 2026, owner)
+// The same code the Production Supervisor prints on Config Barcodes › "Set
+// which machine a device belongs to": scanning it at a scanner device puts
+// that device on this machine. Served here — a READ on the register every
+// portal already uses (Sales, Production, IE) — so the machine page can show
+// it without a Production grant. The payload rule is shared:
+// services/barcodeScanner/machineSetupQr.js.
+router.get("/:id/scanner-qr", async (req, res) => {
+  try {
+    const { machineSetupPayload, payloadWarning, drawSetupQr } = require("../../../../services/barcodeScanner/machineSetupQr");
+    if (!/^[a-f0-9]{24}$/i.test(String(req.params.id))) {
+      return res.status(400).json({ success: false, message: "Not a machine id." });
+    }
+    const machine = await Machine.findById(req.params.id)
+      .select("name type model serialNumber location status")
+      .lean();
+    if (!machine) {
+      return res.status(404).json({ success: false, message: "Machine not found" });
+    }
+    const payload = machineSetupPayload(machine);
+    if (!payload) {
+      return res.status(422).json({ success: false, message: "This machine has no name, so no scanner code can be made for it. Give it a name first." });
+    }
+    const svg = await drawSetupQr(payload, req.query.width);
+    res.json({
+      success: true,
+      machine: {
+        _id: machine._id,
+        name: machine.name,
+        type: machine.type || "",
+        model: machine.model || "",
+        serialNumber: machine.serialNumber || "",
+        location: machine.location || "",
+        status: machine.status || "",
+      },
+      payload,
+      warning: payloadWarning(machine),
+      svg,
+    });
+  } catch (error) {
+    console.error("Error drawing machine scanner QR:", error);
+    res.status(500).json({ success: false, message: "Could not draw the machine's scanner code." });
+  }
+});
+
 // ✅ GET machine by ID
 router.get("/:id", async (req, res) => {
   try {

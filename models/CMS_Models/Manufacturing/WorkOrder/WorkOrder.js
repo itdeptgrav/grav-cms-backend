@@ -332,6 +332,24 @@ const workOrderSchema = new mongoose.Schema(
     ],
     quantity: { type: Number, min: 1 },
     originalQuantity: { type: Number, min: 1 },
+    /* ── EVERY TIME THE QUANTITY WAS CHANGED AFTER RELEASE (17 Oct 2026) ──
+       Sales reduces a bulk order's quantity from the PI once it is in
+       production (services/sales/orderQuantityReduction.js). `quantity`
+       above is always the figure in force; `originalQuantity` the first one;
+       this is the account between them, so "why does this work order say
+       180 when the PO said 200" is answered on the record. */
+    quantityChanges: [new mongoose.Schema({
+      from: { type: Number, required: true },
+      to: { type: Number, required: true },
+      reason: { type: String, trim: true, default: "" },
+      source: { type: String, trim: true, default: "sales-reduce" },
+      changedAt: { type: Date, default: Date.now },
+      changedBy: {
+        userId: { type: String, trim: true, default: "" },
+        name: { type: String, trim: true, default: "" },
+        email: { type: String, trim: true, default: "" },
+      },
+    }, { _id: false })],
     customerId: { type: mongoose.Schema.Types.ObjectId, ref: "Customer" },
     customerName: { type: String, trim: true },
     priority: {
