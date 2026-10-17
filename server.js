@@ -1803,6 +1803,14 @@ app.use(
   require("./routes/CMS_Routes/Sales/sampleStyles"),
 );
 
+// GRAV Studio (14 Oct 2026). The CMS side — the designer's card, the
+// Sales review, the administrator's keys — and the desktop app's own
+// key-authenticated API. Both work on SampleStyle.studio; see the route files.
+app.use("/api/cms/studio-link", require("./routes/CMS_Routes/Sales/sampleStudio"));
+app.use("/api/studio/v1", require("./routes/Studio/studioApi"));
+// The printed tech pack (15 Oct 2026): read-time assembly + its own fields.
+app.use("/api/cms/techpack", require("./routes/CMS_Routes/Sales/sampleTechPack"));
+
 // The Project Manager's BOM approve/reject lives at /api/public/bom-approval
 // — see its mount much earlier in this file, above the /api/cms guard.
 

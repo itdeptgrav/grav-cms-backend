@@ -200,7 +200,7 @@ async function approvedShortlistFor(style) {
  * Identity only, as everywhere else on this boundary: the development BOM has
  * no consumption to leak, by construction.
  */
-async function approvedDevelopmentSelectionFor(style) {
+async function approvedDevelopmentSelectionFor(style, { fullRows = false } = {}) {
   const styleId = style?._id;
   if (!styleId) return null;
 
@@ -236,7 +236,11 @@ async function approvedDevelopmentSelectionFor(style) {
     stale,
     releasedRevisionNo: hasRelease ? released : null,
     currentRevisionNo: Number(file.currentBomRevisionNo),
-    rows: revision.rows.map((r) => ({
+    /* `fullRows`: the revision's rows as Merchandising wrote them — category,
+       colour, placement, the row's own ref — for the printed tech pack
+       (services/techpack/techPack.service.js), which reads the SAME revision
+       R&D does. Nothing on R&D's record path asks for them. */
+    rows: fullRows ? revision.rows : revision.rows.map((r) => ({
       rawItemId: r.rawItemId,
       rawItemName: r.rawItemName,
       rawItemSku: r.rawItemSku,

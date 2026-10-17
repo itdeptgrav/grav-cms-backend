@@ -88,6 +88,8 @@ const Operation = require("../../../models/CMS_Models/Inventory/Configurations/O
    and what gets frozen on submission. The rules live there rather than in
    this router so the costing can ask the same questions of the same code. */
 const technicalRecord = require("../../../services/centralCosting/technicalRecord.service");
+const { threadPerPiece } = require("../../../services/techpack/studioRoute.service");
+const { versionForPack } = require("../../../services/techpack/techPack.service");
 /* WHICH materials R&D is expected to complete — one resolver, shared by the
    GET, the save, the seeding, return-to-materials and the completeness gate,
    reading the same finished-good BOM the visible Approved BOM panel shows. */
@@ -1609,8 +1611,16 @@ router.get("/:id/technical", salesAuth, async (req, res) => {
       { file: style.techSheet?.file, approvedMaterialCount: approved.length, shortlistBlocker: shortlist.blocker },
     );
 
+    /* GRAV Studio's stitches, for the thread a piece takes: the version the
+       tech pack draws, each stitch's length times its class's factor. */
+    const studioVersion = versionForPack(style.toObject ? style.toObject() : style);
+    const studioThread = threadPerPiece(studioVersion?.manifest?.construction);
+
     return res.json({
       success: true,
+      studio: studioVersion && studioThread.metres > 0
+        ? { version: studioVersion.version || null, threadMetres: studioThread.metres }
+        : null,
       technical: {
         status: technical.status || technicalRecord.STATUS.NOT_STARTED,
         revision: technical.revision || 0,
@@ -2085,6 +2095,17 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
       revise: "tech_reopened",
     }[action];
     if (tsKind) logHistory(style, { kind: tsKind, note: req.body.note || "" }, req);
+    /* Starting the tech sheet is where the designer starts the garment
+       (owner, 14 Oct 2026): the style gets its GRAV Studio file then, so it is
+       on Studio's start screen whoever opens the app, and the page can open
+       Studio on it. Linking an already-linked style changes nothing. */
+    if (action === "start" && style.stage === "rnd") {
+      try {
+        require("../../../services/studio/sampleStudio.service").linkFile(style, actor(req));
+      } catch (e) {
+        console.warn("[sampleStyles] tech-sheet start: GRAV Studio file not linked:", e.message);
+      }
+    }
     style.updatedBy = actor(req);
     await style.save();
 

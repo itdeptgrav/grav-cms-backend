@@ -133,6 +133,13 @@ const EVENT_REGISTRY = [
     description: "R&D is notified when Sales approves or rejects a submitted sample.",
     departments: ["research-development"],
   },
+  // ── GRAV Studio (14 Oct 2026) ─────────────────────────────────────────────
+  {
+    key: "studio_review_decided",
+    label: "GRAV Studio renders approved / changes asked",
+    description: "Design (R&D) is notified when a GRAV Studio version is approved, or changes are asked.",
+    departments: ["research-development"],
+  },
   {
     key: "costing_sent_to_customer",
     label: "Cost & Invoicing sent to customer",

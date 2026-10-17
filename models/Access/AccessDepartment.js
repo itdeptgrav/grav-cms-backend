@@ -141,6 +141,42 @@ const accessDepartmentSchema = new mongoose.Schema(
     // freely, and an HR rename must never become an authorization change.
     hrDepartmentId: { type: mongoose.Schema.Types.ObjectId, ref: "Department" },
 
+    /* ── GRAV STUDIO KEYS (14 Oct 2026) ───────────────────────────────────
+     * The desktop 3D app signs in with a key an administrator issues to one
+     * designer of THIS department (services/studio/studioKeys.service.js).
+     * Only a SHA-256 of the key is kept; the key itself is shown once, at
+     * issue. `select: false`, so no read of this department — the onboarding
+     * tiles, the admin list, anything — carries them unless it asks by name.
+     * Embedded rather than a collection: the cluster is at its cap. */
+    studioKeys: {
+      type: [
+        new mongoose.Schema(
+          {
+            keyId: { type: String, required: true, trim: true },
+            hash: { type: String, required: true },
+            // The first characters, so an administrator can tell keys apart.
+            prefix: { type: String, trim: true },
+            holder: {
+              email: { type: String, trim: true, lowercase: true, required: true },
+              name: { type: String, trim: true },
+              employeeId: { type: String, trim: true },
+            },
+            // The company the key works in — what a signed-in session would scope to.
+            companyId: { type: mongoose.Schema.Types.ObjectId },
+            label: { type: String, trim: true },
+            issuedAt: { type: Date, default: Date.now },
+            issuedBy: { id: String, name: String },
+            lastUsedAt: { type: Date, default: null },
+            revokedAt: { type: Date, default: null },
+            revokedBy: { id: String, name: String },
+          },
+          { _id: false },
+        ),
+      ],
+      default: undefined,
+      select: false,
+    },
+
     createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "DeptUser" },
     updatedBy: { type: mongoose.Schema.Types.ObjectId, ref: "DeptUser" },
   },

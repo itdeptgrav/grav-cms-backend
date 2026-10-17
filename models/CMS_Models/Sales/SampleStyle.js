@@ -44,6 +44,8 @@ const actorRef = () => ({
    is a question nobody asked, and it must never read as "no". */
 const { decisionSchemaFields } = require("../../../services/styleApplicability");
 const applicabilityDecision = () => decisionSchemaFields(mongoose);
+const { sampleStudioFields } = require("./sampleStudioSchema");
+const { sampleTechPackFields } = require("./sampleTechPackSchema");
 
 /* `publicId` is not optional decoration: enquiry images have been uploaded to
    Cloudinary since 19 Aug 2026 and are stored as {publicId, name, url}, while
@@ -1259,6 +1261,14 @@ const sampleStyleSchema = new mongoose.Schema(
         ),
       ],
     },
+
+    // GRAV Studio: the designer's 3D file for this style and each version sent
+    // for review by Sales (models/CMS_Models/Sales/sampleStudioSchema.js).
+    studio: sampleStudioFields(),
+
+    // The printed tech pack's own fields — season, sample size, per-material
+    // specs (models/CMS_Models/Sales/sampleTechPackSchema.js).
+    techPack: sampleTechPackFields(),
 
     // Shared timeline of every routing hop and gate decision (newest last).
     history: [historySchema],

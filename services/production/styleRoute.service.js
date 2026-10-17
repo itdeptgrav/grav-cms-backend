@@ -35,6 +35,8 @@ const crypto = require("crypto");
 
 const { ownershipProofFor } = require("../centralCosting/technicalSource.service");
 const technicalRecord = require("../centralCosting/technicalRecord.service");
+const { proposeRoute } = require("../techpack/studioRoute.service");
+const { versionForPack } = require("../techpack/techPack.service");
 const { fail } = require("../storePurchase/errors");
 /* The three-field applicability answer, shared with Merchandising's two so one
    question does not get three subtly different validators. */
@@ -317,6 +319,28 @@ async function readRoute(ctx, { styleId } = {}) {
     editable: gate.editable,
     readOnlyReason: gate.reason,
   };
+}
+
+/**
+ * The route GRAV Studio's stitches ask for — a PROPOSAL, never saved here.
+ *
+ * Read from the version the tech pack draws (the approved one, else the newest
+ * sent), matched against the operation register by
+ * services/techpack/studioRoute.service.js. Production reviews it on the
+ * route screen and saves it through `saveRoute`, which re-reads every
+ * operation from the register like any other save.
+ */
+async function proposeFromStudio(ctx, { styleId } = {}) {
+  if (!ctx?.companyId) throw fail("COMPANY_CONTEXT_UNAVAILABLE", "Your company could not be resolved.");
+  const style = await loadOwnedStyle(ctx, styleId);
+  const version = versionForPack(style.toObject ? style.toObject() : style);
+  const construction = version?.manifest?.construction;
+  if (!Array.isArray(construction) || !construction.length) {
+    return { version: version?.version || null, operations: [], unmatched: [], series: "", stitchCount: 0 };
+  }
+  const masters = await Operation().find({}).select("name operationCode machineType totalSam").lean();
+  const out = proposeRoute(construction, masters);
+  return { version: version.version || null, stitchCount: construction.length, ...out };
 }
 
 /**
@@ -614,6 +638,6 @@ async function saveRoute(ctx, { styleId, operations, actor = null } = {}) {
 module.exports = {
   CODES, ROW_FIELDS, OUTSIDE_PROCESS_FIELDS, REFUSED_FIELDS,
   styleView, routeRow, outsideProcessRow, outsideProcessRows, editability, assertRowShape, assertOutsideProcessShape,
-  listStylesForProduct, readRoute, saveRoute, readOutsideProcesses, saveOutsideProcesses,
+  listStylesForProduct, readRoute, saveRoute, proposeFromStudio, readOutsideProcesses, saveOutsideProcesses,
   saveOutsideProcessDecision,
 };

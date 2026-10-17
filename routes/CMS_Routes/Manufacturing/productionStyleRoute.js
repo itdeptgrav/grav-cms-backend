@@ -101,6 +101,12 @@ router.get("/styles/:styleId/route", requireCompany, canRead, handle(async (req,
   return res.json({ success: true, ...out, canEdit: false });
 }));
 
+/** GET /styles/:styleId/route/from-studio — the route GRAV Studio's stitches ask for; a proposal, not saved. */
+router.get("/styles/:styleId/route/from-studio", requireCompany, canRead, handle(async (req, res) => {
+  const out = await styleRoute.proposeFromStudio(req.production, { styleId: req.params.styleId });
+  return res.json({ success: true, ...out });
+}));
+
 /** GET the outside processes that Production owns for one style. */
 router.get("/styles/:styleId/outside-processes", requireCompany, canRead, handle(async (req, res) => {
   const out = await styleRoute.readOutsideProcesses(req.production, { styleId: req.params.styleId });
