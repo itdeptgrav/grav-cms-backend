@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════════════════════
-// GRAV Remote Station Firmware v1.0.0
+// GRAV Remote Station Firmware v1.0.1
 //
 // A GRAV hand-scanner device as the REMOTE INPUT of a finishing dashboard
 // (Ironing, Trimming — any stage in services/manufacturing/finishingStages.js).
@@ -92,7 +92,7 @@
 // compared against the label on the server. BUMP THIS whenever you build
 // firmware to upload, and type the SAME string into the CMS Version field
 // (device type: Remote finishing station).
-#define FW_VERSION "1.0.0"
+#define FW_VERSION "1.0.1"
 #define FW_PRODUCT "station"
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -545,6 +545,13 @@ unsigned long scanFeedbackUntil = 0;
 // genuine double anyway.
 unsigned long lastAcceptedScanTime = 0;
 const unsigned long SCAN_DEBOUNCE_MS = 1200;
+// v1.0.1 — a scanner module set to send NO suffix (no CR/LF after the code)
+// used to leave the read sitting in `scannedData` for ever and the screen
+// never moved. Bytes of one read arrive within a few ms of each other, so a
+// read that has gone quiet for this long is complete and is dispatched as if
+// the suffix had come.
+unsigned long lastScanByteAt = 0;
+const unsigned long SCAN_IDLE_FLUSH_MS = 150;
 
 // ─── Visual feedback ──────────────────────────────────────────────────────────
 unsigned long visualFeedbackUntil = 0;
@@ -593,6 +600,7 @@ void savePairing();
 void loadPairing();
 void clearPairing(bool tellServer);
 void handlePairBarcode(const String &s);
+void dispatchScan(String scanValue, unsigned long now);
 void handleUnpairBarcode();
 String homeScreenName();
 
@@ -3457,65 +3465,87 @@ void loop()
     backendStateDirty = false;
   }
 
-  while (ScannerSerial.available())
+  bool dispatched = false;
+  while (ScannerSerial.available() && !dispatched)
   {
     char c = ScannerSerial.read();
+    lastScanByteAt = now;
     if (c == '\n' || c == '\r')
     {
       if (scannedData.length() > 0)
       {
         String scanValue = scannedData;
         scannedData = "";
-        scanValue.trim();
-        if ((now - lastAcceptedScanTime) < SCAN_DEBOUNCE_MS)
-        {
-          Serial.println("[Debounce] Ignored: " + scanValue);
-          while (ScannerSerial.available())
-            ScannerSerial.read();
-          scannedData = "";
-          break;
-        }
-        lastAcceptedScanTime = now;
-
-        if (isRotateBarcode(scanValue))
-        {
-          toggleScreenRotation();
-          lastDrawnQueue = -1;
-          if (infoModeActive) showInfoScreen(); else returnToHomeScreen();
-          break;
-        }
-        if (checkForAdminConfig(scanValue))
-        {
-          tft.fillScreen(ST77XX_BLACK);
-          drawHeader();
-          tft.setTextColor(ST77XX_RED);
-          tft.setTextSize(1);
-          tft.setCursor(5, 30);
-          tft.println("ADMIN CONFIG");
-          tft.setTextColor(ST77XX_YELLOW);
-          tft.setCursor(5, 50);
-          tft.println("Wiping memory...");
-          wipeAllMemory();
-          delay(1500);
-          tft.setTextColor(ST77XX_GREEN);
-          tft.setCursor(5, 70);
-          tft.println("Cleared");
-          tft.setTextColor(ST77XX_WHITE);
-          tft.setCursor(5, 90);
-          tft.println("Entering setup...");
-          delay(1500);
-          startConfigMode();
-          return;
-        }
-        if (isWiFiUpdateBarcode(scanValue)) { handleWiFiUpdateBarcode(scanValue); break; }
-        if (isServerUpdateBarcode(scanValue)) { handleServerUpdateBarcode(scanValue); break; }
-        if (isPairBarcode(scanValue)) { handlePairBarcode(scanValue); break; }
-        if (isUnpairBarcode(scanValue)) { handleUnpairBarcode(); break; }
-        processLocalScan(scanValue);
-        break;
+        dispatched = true;
+        dispatchScan(scanValue, now);
       }
     }
     else if (scannedData.length() < 160) // a pairing QR is ~55 chars; a URL-form badge longer
       scannedData += c;
   }
+  // No suffix from the module: the read is complete once the line has been
+  // quiet (see SCAN_IDLE_FLUSH_MS).
+  if (!dispatched && scannedData.length() > 0 && !ScannerSerial.available() && (now - lastScanByteAt) > SCAN_IDLE_FLUSH_MS)
+  {
+    String scanValue = scannedData;
+    scannedData = "";
+    Serial.println("[Scan] no suffix from the module; dispatched after idle: " + scanValue);
+    dispatchScan(scanValue, now);
+  }
+}
+
+// One read off the scanner, whole. Every code the device understands is
+// tried in order; a code it does not know ends in processLocalScan's refusal,
+// so a working scanner ALWAYS moves the screen.
+void dispatchScan(String scanValue, unsigned long now)
+{
+  scanValue.trim();
+  if (scanValue.length() == 0)
+    return;
+  Serial.println("[Scan] " + scanValue);
+  if ((now - lastAcceptedScanTime) < SCAN_DEBOUNCE_MS)
+  {
+    Serial.println("[Debounce] Ignored: " + scanValue);
+    while (ScannerSerial.available())
+      ScannerSerial.read();
+    scannedData = "";
+    return;
+  }
+  lastAcceptedScanTime = now;
+
+  if (isRotateBarcode(scanValue))
+  {
+    toggleScreenRotation();
+    lastDrawnQueue = -1;
+    if (infoModeActive) showInfoScreen(); else returnToHomeScreen();
+    return;
+  }
+  if (checkForAdminConfig(scanValue))
+  {
+    tft.fillScreen(ST77XX_BLACK);
+    drawHeader();
+    tft.setTextColor(ST77XX_RED);
+    tft.setTextSize(1);
+    tft.setCursor(5, 30);
+    tft.println("ADMIN CONFIG");
+    tft.setTextColor(ST77XX_YELLOW);
+    tft.setCursor(5, 50);
+    tft.println("Wiping memory...");
+    wipeAllMemory();
+    delay(1500);
+    tft.setTextColor(ST77XX_GREEN);
+    tft.setCursor(5, 70);
+    tft.println("Cleared");
+    tft.setTextColor(ST77XX_WHITE);
+    tft.setCursor(5, 90);
+    tft.println("Entering setup...");
+    delay(1500);
+    startConfigMode();
+    return;
+  }
+  if (isWiFiUpdateBarcode(scanValue)) { handleWiFiUpdateBarcode(scanValue); return; }
+  if (isServerUpdateBarcode(scanValue)) { handleServerUpdateBarcode(scanValue); return; }
+  if (isPairBarcode(scanValue)) { handlePairBarcode(scanValue); return; }
+  if (isUnpairBarcode(scanValue)) { handleUnpairBarcode(); return; }
+  processLocalScan(scanValue);
 }

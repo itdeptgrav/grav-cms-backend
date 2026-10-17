@@ -61,6 +61,72 @@ test("planFor: refusals", () => {
   assert.throws(() => svc.planFor({ lineId: "l", slotsPerSide: 2, stations: [1, 2, 3, 4, 5].map((i) => ({ side: "L", index: i })) }, wo), /More stations/);
 });
 
+test("flowFor: nodes from the catalogue or custom, arrows resolved into one sequence", () => {
+  const flow = svc.flowFor({
+    nodes: [
+      { key: "sewing", department: "sewing", x: 300, y: 0 },
+      { key: "Cutting", x: 0, y: 0 },
+      { key: "qc2", x: 600 },
+      { key: "sub-1", department: "custom", label: "Subcontract wash", x: 450, optional: true },
+      { key: "packaging", x: 750 },
+    ],
+    edges: [
+      { from: "cutting", to: "sewing" }, { from: "sewing", to: "sub-1" }, { from: "sub-1", to: "qc2" },
+      { from: "qc2", to: "packaging" }, { from: "qc2", to: "packaging" }, // drawn twice = one arrow
+    ],
+    notes: "n",
+  });
+  assert.deepEqual(flow.sequence, ["cutting", "sewing", "sub-1", "qc2", "packaging"]);
+  assert.equal(flow.edges.length, 4, "a duplicate arrow is one arrow");
+  assert.deepEqual(flow.nodes.map((n) => [n.key, n.department, n.label, n.optional]), [
+    ["sewing", "sewing", "Sewing", false],
+    ["cutting", "cutting", "Cutting", false],
+    ["qc2", "qc2", "QC 2 (final)", false],
+    ["sub-1", "custom", "Subcontract wash", true],
+    ["packaging", "packaging", "Packaging", false],
+  ]);
+  assert.deepEqual(flow.summary, { steps: 5, startAt: "Cutting", endAt: "Packaging" });
+  assert.equal(flow.notes, "n");
+});
+
+test("flowFor: branches order by canvas position, a lone department is a flow, refusals are named", () => {
+  /* two departments fed by Cutting with no arrow between them: the one drawn
+     further left comes first */
+  const fork = svc.flowFor({
+    nodes: [{ key: "cutting", x: 0 }, { key: "printing", x: 400 }, { key: "embroidery", x: 200 }, { key: "sewing", x: 600 }],
+    edges: [{ from: "cutting", to: "printing" }, { from: "cutting", to: "embroidery" }, { from: "printing", to: "sewing" }, { from: "embroidery", to: "sewing" }],
+  });
+  assert.deepEqual(fork.sequence, ["cutting", "embroidery", "printing", "sewing"]);
+  const lone = svc.flowFor({ nodes: [{ key: "packaging" }], edges: [] });
+  assert.deepEqual(lone.sequence, ["packaging"]);
+  assert.equal(lone.summary.startAt, "Packaging");
+
+  assert.throws(() => svc.flowFor({ nodes: [] }), /at least one department/);
+  assert.throws(() => svc.flowFor({ nodes: [{ key: "cutting" }, { key: "CUTTING" }] }), /twice/);
+  assert.throws(() => svc.flowFor({ nodes: [{ key: "x1", department: "custom" }] }), /no label/);
+  assert.throws(() => svc.flowFor({ nodes: [{ key: "cutting" }], edges: [{ from: "cutting", to: "sewing" }] }), /not on the flow/);
+  assert.throws(() => svc.flowFor({ nodes: [{ key: "cutting" }], edges: [{ from: "cutting", to: "cutting" }] }), /itself/);
+  assert.throws(() => svc.flowFor({
+    nodes: [{ key: "cutting" }, { key: "sewing" }, { key: "qc1" }],
+    edges: [{ from: "cutting", to: "sewing" }, { from: "sewing", to: "qc1" }, { from: "qc1", to: "cutting" }],
+  }), /circle/);
+  assert.throws(() => svc.flowFor({ nodes: Array.from({ length: svc.MAX_FLOW_NODES + 1 }, (_, i) => ({ key: `c${i}`, department: "custom", label: "x" })) }), /At most/);
+});
+
+test("processFlowView: an absence is null; a stored flow prints its sequence in words", () => {
+  assert.equal(svc.processFlowView({}), null);
+  assert.equal(svc.processFlowView({ processFlow: { nodes: [] } }), null);
+  const v = svc.processFlowView({ processFlow: {
+    nodes: [{ key: "cutting", department: "cutting" }, { key: "sewing", department: "sewing", label: "Sewing line 2" }],
+    edges: [{ from: "cutting", to: "sewing" }], sequence: ["cutting", "sewing", "ghost"],
+    summary: { steps: 2 }, version: 2, plannedBy: { name: "R" },
+  } });
+  assert.deepEqual(v.sequence, ["cutting", "sewing"], "a key no node has is dropped");
+  assert.deepEqual(v.sequenceLabels, ["Cutting", "Sewing line 2"]);
+  assert.equal(v.summary.startAt, "Cutting"); assert.equal(v.summary.endAt, "Sewing line 2");
+  assert.equal(v.version, 2); assert.equal(v.plannedBy, "R");
+});
+
 test("views: operationsView and linePlanView are stated absences when nothing is stored", () => {
   assert.equal(svc.linePlanView({}), null);
   assert.deepEqual(svc.operationsView({}), { count: 0, totalSeconds: 0, samMinutes: null, rows: [], plan: null });

@@ -315,6 +315,35 @@ router.post("/work-orders/line-plan/copy", requireCompany, canWrite, handle(asyn
   return res.json({ success: true, ...out });
 }));
 
+/* ── THE PROCESS FLOW (17 Oct 2026, owner: "the IE person will set the flow
+ *    … which department is first, then what next … for that order"). The
+ *    departments a work order passes through, drawn on a canvas and stored on
+ *    the work order with its resolved sequence. One drawing, one or many work
+ *    orders; copy from another; clear. All POSTs, like everything here. */
+
+/** GET /work-orders/departments — the catalogue the canvas offers. */
+router.get("/work-orders/departments", requireCompany, canRead, handle(async (req, res) => {
+  return res.json({ success: true, departments: iePlanning.DEPARTMENTS });
+}));
+
+/** POST /work-orders/process-flow { workOrderIds, flow:{ nodes, edges, notes } } */
+router.post("/work-orders/process-flow", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.saveProcessFlow(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/process-flow/copy { fromWorkOrderId, workOrderIds } */
+router.post("/work-orders/process-flow/copy", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.copyProcessFlow(req.ie, req.body || {}, actorOf(req));
+  return res.json({ success: true, ...out });
+}));
+
+/** POST /work-orders/process-flow/clear { workOrderIds } */
+router.post("/work-orders/process-flow/clear", requireCompany, canWrite, handle(async (req, res) => {
+  const out = await iePlanning.clearProcessFlow(req.ie, req.body || {});
+  return res.json({ success: true, ...out });
+}));
+
 /** GET /work-orders/:workOrderId — one work order, with route and plan. */
 router.get("/work-orders/:workOrderId", requireCompany, canRead, handle(async (req, res) => {
   const out = await iePlanning.readWorkOrder(req.ie, { workOrderId: req.params.workOrderId });

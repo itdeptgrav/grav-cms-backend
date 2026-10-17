@@ -16,7 +16,17 @@
 //                 optionally by whom). Stored ON the work order (`linePlan`) so
 //                 PPC and any later department read it beside the operations.
 //
-// Both writes take `workOrderIds[]` — the owner's shortcut: select several
+//   PROCESS FLOW — (17 Oct 2026, owner: "the IE person will do the planning /
+//                 set the flow … keep a canvas interface like Canva so the
+//                 departments come in boxes and he can connect which is first,
+//                 then what next") which production DEPARTMENTS the work
+//                 order passes through and in what order: a node per
+//                 department, an arrow per hand-over, resolved here into one
+//                 `sequence` so PPC and every department read the order
+//                 without walking the graph. Stored ON the work order
+//                 (`processFlow`).
+//
+// All three writes take `workOrderIds[]` — the owner's shortcut: select several
 // work orders of the order and plan them in one go. Each work order gets its
 // OWN copy; nothing is shared by reference.
 //
@@ -57,6 +67,30 @@ const MAX_OPERATIONS = 400;
 const MAX_WORK_ORDERS = 200;
 const SIDES = new Set(["L", "R"]);
 
+/* ── THE PRODUCTION DEPARTMENTS A FLOW IS DRAWN FROM (17 Oct 2026) ─────────
+   The owner's list, in the order a garment most often meets them. `key` is
+   what a flow stores; `label` is what every screen prints. A flow may also
+   carry a `custom` node IE names itself (a subcontractor, a special
+   process) — the catalogue is the vocabulary, not a fence. The frontend
+   mirrors this list in components/industrialEngineering/orders/processFlow.mjs;
+   keep the two the same. */
+const DEPARTMENTS = Object.freeze([
+  { key: "cutting", label: "Cutting", short: "CUT" },
+  { key: "embroidery", label: "Embroidery", short: "EMB" },
+  { key: "printing", label: "Printing", short: "PRT" },
+  { key: "sewing", label: "Sewing", short: "SEW" },
+  { key: "qc1", label: "QC 1 (inline)", short: "QC1" },
+  { key: "trimming", label: "Trimming", short: "TRM" },
+  { key: "washing", label: "Washing", short: "WSH" },
+  { key: "ironing", label: "Ironing", short: "IRN" },
+  { key: "qc2", label: "QC 2 (final)", short: "QC2" },
+  { key: "ll", label: "LL", short: "LL" },
+  { key: "packaging", label: "Packaging", short: "PKG" },
+  { key: "dispatch", label: "Dispatch", short: "DSP" },
+]);
+const DEPARTMENT_BY_KEY = new Map(DEPARTMENTS.map((d) => [d.key, d]));
+const MAX_FLOW_NODES = 40;
+
 const notFound = () => fail(CODES.NOT_FOUND, "That work order was not found.");
 const invalid = (message, details) => fail(CODES.VALIDATION, message, details);
 
@@ -64,7 +98,7 @@ const PLAN_PROJECTION = [
   "_id workOrderNumber status planningState priority quantity",
   "stockItemId stockItemName stockItemReference variantId variantAttributes",
   "customerRequestId customerName createdAt updatedAt",
-  "operations operationsPlan linePlan",
+  "operations operationsPlan linePlan processFlow",
 ].join(" ");
 
 /* ═══ READS ═══════════════════════════════════════════════════════════════ */
@@ -152,6 +186,38 @@ function linePlanView(wo) {
   };
 }
 
+/** The label a department key prints as — the catalogue's, or the node's own. */
+const departmentLabel = (node) => str(node?.label) || DEPARTMENT_BY_KEY.get(str(node?.department))?.label || str(node?.department) || str(node?.key);
+
+function processFlowView(wo) {
+  const f = wo?.processFlow;
+  if (!f || !Array.isArray(f.nodes) || !f.nodes.length) return null;
+  const nodes = f.nodes.map((n) => ({
+    key: str(n.key), department: str(n.department), label: departmentLabel(n),
+    x: Number(n.x) || 0, y: Number(n.y) || 0, notes: str(n.notes), optional: Boolean(n.optional),
+  }));
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const sequence = (f.sequence || []).map(str).filter((k) => byKey.has(k));
+  return {
+    nodes,
+    edges: (f.edges || []).map((e) => ({ from: str(e.from), to: str(e.to) })),
+    sequence,
+    /* the sequence in words — what a row chip and PPC print */
+    sequenceLabels: sequence.map((k) => byKey.get(k).label),
+    summary: {
+      steps: f.summary?.steps || nodes.length,
+      startAt: str(f.summary?.startAt) || (sequence[0] ? byKey.get(sequence[0]).label : ""),
+      endAt: str(f.summary?.endAt) || (sequence.length ? byKey.get(sequence[sequence.length - 1]).label : ""),
+    },
+    notes: str(f.notes),
+    copiedFromWorkOrderId: f.copiedFromWorkOrderId ? str(f.copiedFromWorkOrderId) : null,
+    copiedFromWorkOrderNumber: str(f.copiedFromWorkOrderNumber),
+    version: f.version || 1,
+    plannedAt: f.plannedAt || null,
+    plannedBy: f.plannedBy?.name || "",
+  };
+}
+
 /** One work order as IE's planning screens read it. */
 async function workOrderView(wo, { photo = null, variant = null } = {}) {
   return {
@@ -167,6 +233,7 @@ async function workOrderView(wo, { photo = null, variant = null } = {}) {
     closed: CLOSED.has(str(wo.status)),
     operations: operationsView(wo),
     linePlan: linePlanView(wo),
+    processFlow: processFlowView(wo),
   };
 }
 
@@ -200,8 +267,11 @@ async function readFloor() {
     .select("lines machinePositions version updatedAt").lean();
   const lines = Array.isArray(layout?.lines) ? layout.lines : [];
   const machineIds = [...new Set(lines.flatMap((l) => (l.slots || []).map((s) => s.machineId && str(s.machineId)).filter(Boolean)))];
+  /* 17 Oct 2026: the machine's own code, serial, brand and model travel too —
+     "the machine full name and all are not happening" was a station card that
+     printed a type and nothing else. */
   const machines = machineIds.length
-    ? await Machine().find({ _id: { $in: machineIds.map(oid) } }).select("_id name type machineId serialNumber").lean()
+    ? await Machine().find({ _id: { $in: machineIds.map(oid) } }).select("_id name type machineId serialNumber brand model status").lean()
     : [];
   const byId = new Map(machines.map((m) => [str(m._id), m]));
   return {
@@ -219,6 +289,10 @@ async function readFloor() {
           side: s.side, index: s.index, item: s.item || "machine",
           machineId: s.machineId ? str(s.machineId) : null,
           machineName: m ? str(m.name) : "", machineType: m ? str(m.type) : "",
+          machineCode: m ? str(m.machineId) : "",
+          serialNumber: m ? str(m.serialNumber) : "",
+          brand: m ? str(m.brand) : "", model: m ? str(m.model) : "",
+          machineStatus: m ? str(m.status) : "",
           inRegister: s.item === "table" ? null : Boolean(m),
         };
       }),
@@ -232,24 +306,30 @@ async function readFloor() {
  */
 async function planSources(ctx, { q = "", what = "line-plan", limit = 40 } = {}) {
   const bound = await boundFor(ctx);
-  const which = what === "operations" ? { "operations.0": { $exists: true } } : { "linePlan.lineId": { $exists: true, $ne: "" } };
+  const which = what === "operations" ? { "operations.0": { $exists: true } }
+    : what === "process-flow" ? { "processFlow.nodes.0": { $exists: true } }
+    : { "linePlan.lineId": { $exists: true, $ne: "" } };
   const rows = await WorkOrder().find({ $and: [bound.clause, which] })
-    .select("_id workOrderNumber status stockItemName stockItemReference variantAttributes customerRequestId customerName quantity updatedAt operations.operationType operations.operationCode operations.plannedTimeSeconds linePlan.lineName linePlan.summary linePlan.plannedAt operationsPlan.updatedAt")
+    .select("_id workOrderNumber status stockItemName stockItemReference variantAttributes customerRequestId customerName quantity updatedAt operations.operationType operations.operationCode operations.plannedTimeSeconds linePlan.lineName linePlan.summary linePlan.plannedAt operationsPlan.updatedAt processFlow.nodes processFlow.sequence processFlow.summary processFlow.plannedAt")
     .sort({ updatedAt: -1 }).limit(Math.min(200, Math.max(1, Number(limit) || 40)) * 2).lean();
   const term = str(q).toLowerCase();
-  const out = rows.map((wo) => ({
-    workOrderId: str(wo._id),
-    reference: displayWorkOrderNumber(wo),
-    status: str(wo.status),
-    product: { name: str(wo.stockItemName), reference: str(wo.stockItemReference) },
-    variant: variantText({ attributes: wo.variantAttributes || [] }),
-    customerName: str(wo.customerName),
-    moId: wo.customerRequestId ? str(wo.customerRequestId) : null,
-    quantity: wo.quantity ?? null,
-    operations: { count: (wo.operations || []).length, samMinutes: operationsView(wo).samMinutes },
-    linePlan: wo.linePlan?.lineName ? { lineName: str(wo.linePlan.lineName), stations: wo.linePlan.summary?.stations || 0, plannedAt: wo.linePlan.plannedAt || null } : null,
-    updatedAt: wo.updatedAt || null,
-  })).filter((r) => !term || [r.reference, r.product.name, r.product.reference, r.variant, r.customerName].some((v) => str(v).toLowerCase().includes(term)));
+  const out = rows.map((wo) => {
+    const flow = processFlowView(wo);
+    return {
+      workOrderId: str(wo._id),
+      reference: displayWorkOrderNumber(wo),
+      status: str(wo.status),
+      product: { name: str(wo.stockItemName), reference: str(wo.stockItemReference) },
+      variant: variantText({ attributes: wo.variantAttributes || [] }),
+      customerName: str(wo.customerName),
+      moId: wo.customerRequestId ? str(wo.customerRequestId) : null,
+      quantity: wo.quantity ?? null,
+      operations: { count: (wo.operations || []).length, samMinutes: operationsView(wo).samMinutes },
+      linePlan: wo.linePlan?.lineName ? { lineName: str(wo.linePlan.lineName), stations: wo.linePlan.summary?.stations || 0, plannedAt: wo.linePlan.plannedAt || null } : null,
+      processFlow: flow ? { steps: flow.summary.steps, sequenceLabels: flow.sequenceLabels, plannedAt: flow.plannedAt } : null,
+      updatedAt: wo.updatedAt || null,
+    };
+  }).filter((r) => !term || [r.reference, r.product.name, r.product.reference, r.variant, r.customerName].some((v) => str(v).toLowerCase().includes(term)));
   return { rows: out.slice(0, Math.min(200, Math.max(1, Number(limit) || 40))) };
 }
 
@@ -479,9 +559,144 @@ async function clearLinePlan(ctx, { workOrderId } = {}) {
   return { workOrderId: str(wo._id), reference: displayWorkOrderNumber(wo), cleared: Boolean(wo.linePlan) };
 }
 
+/* ═══ PROCESS FLOW ════════════════════════════════════════════════════════ */
+
+/**
+ * The order the departments are passed through, from the arrows: Kahn's
+ * topological sort, ties broken by the node's x position then its listed
+ * order so the sequence reads left to right as the canvas was drawn. Returns
+ * null when the arrows form a cycle (a garment cannot come back to a
+ * department it left on this drawing).
+ */
+function sequenceOf(nodes, edges) {
+  const order = new Map(nodes.map((n, i) => [n.key, i]));
+  const indeg = new Map(nodes.map((n) => [n.key, 0]));
+  const next = new Map(nodes.map((n) => [n.key, []]));
+  for (const e of edges) { indeg.set(e.to, indeg.get(e.to) + 1); next.get(e.from).push(e.to); }
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  const rank = (k) => [Number(byKey.get(k).x) || 0, order.get(k)];
+  const pick = (list) => list.sort((a, b) => { const [ax, ai] = rank(a), [bx, bi] = rank(b); return ax - bx || ai - bi; }).shift();
+  const ready = nodes.filter((n) => indeg.get(n.key) === 0).map((n) => n.key);
+  const out = [];
+  while (ready.length) {
+    const k = pick(ready);
+    out.push(k);
+    for (const t of next.get(k)) { indeg.set(t, indeg.get(t) - 1); if (indeg.get(t) === 0) ready.push(t); }
+  }
+  return out.length === nodes.length ? out : null;
+}
+
+/**
+ * The flow as it will be stored: bounded, keys unique, every arrow between
+ * nodes that exist, no self-arrow, no duplicate arrow, no cycle; the
+ * sequence resolved. A flow with one department and no arrows is allowed (a
+ * work order that only passes Packaging, say); an empty one is not.
+ */
+function flowFor(body, { copiedFrom = null } = {}) {
+  const list = Array.isArray(body?.nodes) ? body.nodes : [];
+  if (!list.length) throw invalid("Put at least one department on the flow.");
+  if (list.length > MAX_FLOW_NODES) throw invalid(`At most ${MAX_FLOW_NODES} departments on a flow.`);
+  const keyOf = (v) => str(v).toLowerCase().replace(/[^a-z0-9_-]+/g, "-").slice(0, 40);
+  const seen = new Set();
+  const nodes = list.map((n, i) => {
+    const key = keyOf(n?.key);
+    if (!key) throw invalid(`Department ${i + 1} has no key.`, { index: i });
+    if (seen.has(key)) throw invalid(`Department "${key}" is on the flow twice.`, { index: i });
+    seen.add(key);
+    const department = str(n?.department).toLowerCase().slice(0, 40) || (DEPARTMENT_BY_KEY.has(key) ? key : "custom");
+    const known = DEPARTMENT_BY_KEY.get(department);
+    const label = str(n?.label).slice(0, 60) || known?.label || "";
+    if (!known && !label) throw invalid(`Department ${i + 1} is not in the catalogue and has no label.`, { index: i });
+    return {
+      key, department: known ? department : "custom", label: label || known.label,
+      x: Math.round(Number(n?.x) || 0), y: Math.round(Number(n?.y) || 0),
+      notes: str(n?.notes).slice(0, 300), optional: Boolean(n?.optional),
+    };
+  });
+  const edgeList = Array.isArray(body?.edges) ? body.edges : [];
+  const pairs = new Set();
+  const edges = [];
+  for (const e of edgeList) {
+    const from = keyOf(e?.from); const to = keyOf(e?.to);
+    if (!seen.has(from) || !seen.has(to)) throw invalid(`An arrow points at a department that is not on the flow (${from || "?"} → ${to || "?"}).`);
+    if (from === to) throw invalid(`${from} cannot hand over to itself.`);
+    const k = `${from}>${to}`;
+    if (pairs.has(k)) continue; // the same arrow drawn twice is one arrow
+    pairs.add(k);
+    edges.push({ from, to });
+  }
+  const sequence = sequenceOf(nodes, edges);
+  if (!sequence) throw invalid("The arrows go round in a circle. A flow must run one way: remove the arrow that comes back.");
+  const byKey = new Map(nodes.map((n) => [n.key, n]));
+  return {
+    nodes, edges, sequence,
+    summary: {
+      steps: nodes.length,
+      startAt: byKey.get(sequence[0]).label,
+      endAt: byKey.get(sequence[sequence.length - 1]).label,
+    },
+    notes: str(body?.notes).slice(0, 1000),
+    copiedFromWorkOrderId: copiedFrom?.workOrderId && isId(copiedFrom.workOrderId) ? oid(copiedFrom.workOrderId) : null,
+    copiedFromWorkOrderNumber: str(copiedFrom?.reference).slice(0, 60),
+  };
+}
+
+/** POST /work-orders/process-flow { workOrderIds, flow } */
+async function saveProcessFlow(ctx, { workOrderIds, flow, copiedFrom = null } = {}, actor) {
+  const ids = idsOf(workOrderIds);
+  const next = flowFor(flow, { copiedFrom }); // once: the same drawing goes on every work order
+  const rows = await loadBound(ctx, ids, { select: "_id workOrderNumber status processFlow" });
+  const results = [];
+  for (const wo of rows) {
+    if (CLOSED.has(str(wo.status))) {
+      results.push({ workOrderId: str(wo._id), reference: displayWorkOrderNumber(wo), status: "skipped", reason: `Work order is ${wo.status}.` });
+      continue;
+    }
+    const version = (wo.processFlow?.version || 0) + 1;
+    await WorkOrder().updateOne({ _id: wo._id }, {
+      $set: {
+        processFlow: {
+          ...next, version, plannedAt: new Date(),
+          plannedBy: { userId: str(actor?.id), name: str(actor?.name), email: str(actor?.email) },
+        },
+      },
+    });
+    results.push({ workOrderId: str(wo._id), reference: displayWorkOrderNumber(wo), status: "saved", version, summary: next.summary, sequence: next.sequence });
+  }
+  return { results, saved: results.filter((r) => r.status === "saved").length, skipped: results.filter((r) => r.status === "skipped").length };
+}
+
+/** POST /work-orders/process-flow/copy { fromWorkOrderId, workOrderIds } */
+async function copyProcessFlow(ctx, { fromWorkOrderId, workOrderIds } = {}, actor) {
+  const [from] = await loadBound(ctx, idsOf([fromWorkOrderId]), { select: "_id workOrderNumber processFlow" });
+  const flow = processFlowView(from);
+  if (!flow) throw invalid(`${displayWorkOrderNumber(from)} has no process flow to copy.`);
+  const targets = idsOf(workOrderIds).filter((id) => id !== str(from._id));
+  if (!targets.length) throw invalid("Choose a work order other than the one being copied.");
+  const out = await saveProcessFlow(ctx, { workOrderIds: targets, flow, copiedFrom: { workOrderId: str(from._id), reference: displayWorkOrderNumber(from) } }, actor);
+  return { ...out, from: { workOrderId: str(from._id), reference: displayWorkOrderNumber(from), steps: flow.summary.steps } };
+}
+
+/** POST /work-orders/process-flow/clear { workOrderIds } — one or many */
+async function clearProcessFlow(ctx, { workOrderIds, workOrderId } = {}) {
+  const ids = idsOf(workOrderIds || workOrderId);
+  const rows = await loadBound(ctx, ids, { select: "_id workOrderNumber status processFlow" });
+  const results = [];
+  for (const wo of rows) {
+    if (CLOSED.has(str(wo.status))) {
+      results.push({ workOrderId: str(wo._id), reference: displayWorkOrderNumber(wo), status: "skipped", reason: `Work order is ${wo.status}; its flow is history.` });
+      continue;
+    }
+    await WorkOrder().updateOne({ _id: wo._id }, { $unset: { processFlow: 1 } });
+    results.push({ workOrderId: str(wo._id), reference: displayWorkOrderNumber(wo), status: "cleared", had: Boolean(wo.processFlow?.nodes?.length) });
+  }
+  return { results, cleared: results.filter((r) => r.status === "cleared").length, skipped: results.filter((r) => r.status === "skipped").length };
+}
+
 module.exports = {
-  CODES, CLOSED, MAX_OPERATIONS, MAX_WORK_ORDERS,
+  CODES, CLOSED, MAX_OPERATIONS, MAX_WORK_ORDERS, MAX_FLOW_NODES, DEPARTMENTS,
   readWorkOrders, readWorkOrder, readFloor, planSources, registeredOperations, operators,
   setOperations, copyOperations, saveLinePlan, copyLinePlan, clearLinePlan,
-  normaliseOperations, planFor, operationsView, linePlanView,
+  saveProcessFlow, copyProcessFlow, clearProcessFlow,
+  normaliseOperations, planFor, flowFor, sequenceOf, operationsView, linePlanView, processFlowView,
 };
