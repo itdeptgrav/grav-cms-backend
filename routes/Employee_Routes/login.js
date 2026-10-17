@@ -152,9 +152,19 @@ router.post("/login", async (req, res) => {
       const defaultPassword = generateDefaultPassword(employee.phone);
       if (defaultPassword && password === defaultPassword) {
         isMatch = true;
-        const salt = await bcrypt.genSalt(10);
-        employee.password = await bcrypt.hash(defaultPassword, salt);
-        await employee.save();
+        /* NEVER OVERWRITE A PASSWORD THAT IS SET (12 Oct 2026).
+           This used to write the default over whatever was stored, on every
+           sign-in with the default — so a password HR had just set through
+           "forgot password" was wiped the next time the app (or anybody)
+           signed in with the phone-based default, many times a day. It also
+           hashed here AND in the model's pre-save hook, storing a hash of a
+           hash that matched nothing, which sent the next sign-in down this
+           same path again. Now the default is only stored when NO password
+           exists, as plain text for the pre-save hook to hash once. */
+        if (!employee.password) {
+          employee.password = defaultPassword;
+          await employee.save();
+        }
       }
     }
     if (!isMatch)
@@ -321,8 +331,10 @@ router.post("/change-password", async (req, res) => {
         .status(401)
         .json({ success: false, message: "Current password is incorrect" });
 
-    const salt = await bcrypt.genSalt(10);
-    employee.password = await bcrypt.hash(newPassword, salt);
+    /* Plain text: the Employee pre-save hook hashes it. Hashing here as well
+       stored a hash of a hash, so the new password never worked and HR had to
+       reset it (12 Oct 2026). */
+    employee.password = String(newPassword);
     await employee.save();
 
     res

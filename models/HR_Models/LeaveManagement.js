@@ -310,6 +310,11 @@ const regularizationRequestSchema = new mongoose.Schema(
     documentFileName: { type: String, default: null },
     documentUploadedAt: { type: Date, default: null },
 
+    // CCTV proof the LAST manager attached when approving (13 Oct 2026,
+    // owner) — required before the request goes to HR. See
+    // services/approvalProof.js.
+    cctvProof: { type: require("../../services/approvalProof").cctvProofSchema, default: undefined },
+
     originalSnapshot: {
       inTime: { type: Date, default: null },
       finalOut: { type: Date, default: null },
@@ -327,6 +332,10 @@ const regularizationRequestSchema = new mongoose.Schema(
       enum: [
         "pending",
         "manager_approved",
+        /* Every manager has approved; HR decides (13 Oct 2026, owner: "HR
+           should always ask for approval"). Nothing is applied to attendance
+           until HR approves. */
+        "awaiting_hr",
         "manager_rejected",
         "hr_approved",
         "hr_rejected",

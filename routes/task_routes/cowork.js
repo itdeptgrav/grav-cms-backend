@@ -439,6 +439,31 @@ router.post("/employee/create", verifyCoworkToken, verifyCeoOrTL, async (req, re
       });
     }
 
+    // ── NOBODY HR HAS MADE INACTIVE GETS AN ACCOUNT (12 Oct 2026, owner) ─────
+    //
+    // Matched the way the admin panel matches (biometric id, then work or
+    // personal address). Refused only when every matching HR record is
+    // inactive — a re-hire's old record must not block their new account.
+    {
+      const Employee = require("../../models/Employee");
+      const { hasLeft } = require("../../services/employeeDeparture");
+      const or = [];
+      if (chosenId) or.push({ biometricId: chosenId });
+      if (email) {
+        const rx = new RegExp(`^${String(email).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+        or.push({ email: rx }, { personalEmail: rx });
+      }
+      const matches = or.length
+        ? await Employee.find({ $or: or }).select("isActive status firstName lastName").lean()
+        : [];
+      if (matches.length && matches.every(hasLeft)) {
+        return res.status(409).json({
+          code: "EMPLOYEE_INACTIVE",
+          error: `${name || "This employee"} is marked Inactive in HR, so a Cowork account cannot be created. Make them active in HR first.`,
+        });
+      }
+    }
+
     // ── VALIDATE chosen biometricId is not already taken in CoWork ────────────
     if (chosenId) {
       const existing = await db.collection("cowork_employees").doc(chosenId).get();
@@ -537,14 +562,25 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
       filter.department = req.query.department;
     }
 
+    /* ── WHO IS LISTED: ACTIVE IN HR, UNLESS ASKED (12 Oct 2026, owner) ──────
+       Somebody HR has made Inactive has no CoWork access, so they are not on
+       the list an admin provisions from. `?status=inactive` shows them (to see
+       whose access is off) and `all` shows everyone; the count of the other
+       side is always returned so the panel can offer it. The rule is HR's:
+       services/employeeDeparture.js `hasLeft`. */
+    const { hasLeft } = require("../../services/employeeDeparture");
+    const wantStatus = ["inactive", "all"].includes(String(req.query.status)) ? String(req.query.status) : "active";
+
     const [hrEmployees, coworkSnap] = await Promise.all([
       Employee.find(filter)
-        .select("firstName middleName lastName email personalEmail department biometricId designation jobTitle phone")
+        .select("firstName middleName lastName email personalEmail department biometricId designation jobTitle phone isActive status")
         .sort({ firstName: 1 })
-        .limit(500)
+        .limit(1000)
         .lean(),
       db.collection("cowork_employees").get(),
     ]);
+    const activeCount = hrEmployees.filter((e) => !hasLeft(e)).length;
+    const inactiveCount = hrEmployees.length - activeCount;
 
     // Cross-reference — a CoWork account exists when the biometricId matches the
     // Firestore doc id, OR the email matches.
@@ -561,7 +597,9 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
         .filter(([email]) => email),
     );
 
-    const employees = hrEmployees.map((e) => {
+    const employees = hrEmployees.filter((e) => (
+      wantStatus === "all" ? true : wantStatus === "inactive" ? hasLeft(e) : !hasLeft(e)
+    )).map((e) => {
       // HR records ONE address per person but under either of two fields, and
       // fills whichever it was given: `email` is the work address, and roughly
       // half the directory has none, carrying a personal one instead. Reading
@@ -600,6 +638,9 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
         biometricId: e.biometricId || "",
         phone: e.phone || "",
         hasCoworkAccount: !!coworkEmployeeId,
+        /* "inactive": HR has let them go — no CoWork access, and nothing on
+           the panel may add, mail or reset them. */
+        hrStatus: hasLeft(e) ? "inactive" : "active",
         // The `cowork_employees` document id — what every other CoWork route
         // takes as `:id`. Null for somebody who has no account yet.
         coworkEmployeeId,
@@ -619,9 +660,12 @@ router.get("/admin/hr-employees", verifyCoworkToken, verifyCeoToken, async (req,
       employees,
       departments,
       total: employees.length,
+      status: wantStatus,
+      activeCount,
+      inactiveCount,
       withAccount: employees.filter((e) => e.hasCoworkAccount).length,
       missingDetails: employees.filter(
-        (e) => !e.hasCoworkAccount && e.missingInHr.length,
+        (e) => e.hrStatus === "active" && !e.hasCoworkAccount && e.missingInHr.length,
       ).length,
     });
   } catch (e) {

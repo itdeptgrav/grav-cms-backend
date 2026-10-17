@@ -131,7 +131,7 @@ async function buildDepartmentsContext() {
 }
 
 // ── Overtime: recent OT, totals, and pending approvals ─────────────────────────
-const OT_PENDING = ["pending", "manager_approved", "withdraw_pending"];
+const OT_PENDING = ["pending", "manager_approved", "awaiting_hr", "withdraw_pending"];
 async function buildOvertimeContext({ department } = {}) {
   const deptFilter = department && department !== "all" ? { department: new RegExp(department, "i") } : {};
   const hrs = (mins) => (mins != null ? Math.round((mins / 60) * 10) / 10 : null);

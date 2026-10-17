@@ -132,14 +132,19 @@ describe("the response scrub", () => {
     expect(r.body.data.documents.resumeFile.url).toBe("https://example.test/cv.pdf");
   });
 
-  test("an editor gets identity and identifiers but not pay", async () => {
+  /* Since 13 Oct 2026 an editor reads pay too (owner request); a viewer does not. */
+  test("an editor gets identity, identifiers and pay; a viewer gets no pay", async () => {
     const token = await hrUser("editor");
     const r = await get("/api/employees/60c0000000000000000000aa", token);
 
     expect(r.body.data.documents.aadharNumber).toBe("1111 2222 3333");
     expect(r.body.data.bloodGroup).toBe("O+");
-    expect(r.body.data.salary).toBeUndefined();
-    expect(r.body.data.bankDetails).toBeUndefined();
+    expect(r.body.data.bankDetails.accountNumber).toBe("1234567890");
+    expect(r.body.data.password).toBeUndefined();
+
+    const v = await get("/api/employees/60c0000000000000000000aa", await hrUser("viewer"));
+    expect(v.body.data?.salary).toBeUndefined();
+    expect(v.body.data?.bankDetails).toBeUndefined();
   });
 
   test("an approver gets pay, and still never a credential", async () => {

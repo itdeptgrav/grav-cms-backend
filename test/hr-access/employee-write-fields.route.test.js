@@ -44,7 +44,7 @@ beforeAll(async () => {
        (pay from a non-owner, 5 Oct 2026): the department guard holds it, and
        the create handler refuses it as a backstop. Either way, nothing here
        is written. */
-    if (req.holdForOwner) return res.status(202).json({ held: true, requiredRole: "owner" });
+    if (req.holdForOwner) return res.status(202).json({ held: true, requiredRole: "owner", fields: req.holdForOwner.fields || [] });
     if (req.method !== "GET") {
       const patch = req.body?.updates || req.body || {};
       await Employee.updateOne({ _id: target._id }, { $set: patch });
@@ -165,23 +165,24 @@ describe("salary needs compensation.write, and only an owner has it", () => {
     expect((await reload()).salary.gross).not.toBe(100000);
   });
 
-  test("an editor cannot update or bulk-update a salary", async () => {
+  test("an editor's pay change is HELD for the owner; a bulk pay change is still refused", async () => {
+    /* 12 Oct 2026 (owner): pay from an editor or approver goes to the owner to
+       accept instead of being refused. Nothing is written until the owner
+       approves. A BULK pay change has no owner path and is refused as before. */
     const token = await hrUser("editor");
 
-    for (const [method, path, body] of [
-      ["PUT", `/api/employees/${target._id}`, { salary: { gross: 100000 } }],
-      ["PUT", `/api/employees/${target._id}`, { bankDetails: { accountNumber: "1" } }],
-      ["PATCH", "/api/employees/bulk-update", {
-        employeeIds: [String(target._id)],
-        updates: { "salary.gross": 100000 },
-      }],
-    ]) {
-      const r = await send(method, path, token, body);
-      expect({ path, status: r.status, code: r.body.code }).toEqual({
-        path, status: 403, code: "HR_MISSING_CAPABILITY",
+    for (const body of [{ salary: { gross: 100000 } }, { bankDetails: { accountNumber: "1" } }]) {
+      const r = await send("PUT", `/api/employees/${target._id}`, token, body);
+      expect({ status: r.status, held: r.body.held, requiredRole: r.body.requiredRole }).toEqual({
+        status: 202, held: true, requiredRole: "owner",
       });
-      expect(r.body.requiredCapability).toBe("compensation.write");
     }
+    const bulk = await send("PATCH", "/api/employees/bulk-update", token, {
+      employeeIds: [String(target._id)],
+      updates: { "salary.gross": 100000 },
+    });
+    expect({ status: bulk.status, code: bulk.body.code }).toEqual({ status: 403, code: "HR_MISSING_CAPABILITY" });
+    expect(bulk.body.requiredCapability).toBe("compensation.write");
 
     expect((await reload()).salary.gross).not.toBe(100000);
   });
@@ -238,7 +239,7 @@ describe("employment state needs employment.change", () => {
 });
 
 describe("a mixed payload writes nothing at all", () => {
-  test("one refused field refuses the whole request", async () => {
+  test("one owner-only field holds the WHOLE request for the owner — nothing is written", async () => {
     const token = await hrUser("editor");
     const before = await reload();
 
@@ -248,14 +249,14 @@ describe("a mixed payload writes nothing at all", () => {
       salary: { gross: 999999 },    // needs compensation.write
     });
 
-    expect(r.status).toBe(403);
+    expect({ status: r.status, requiredRole: r.body.requiredRole }).toEqual({ status: 202, requiredRole: "owner" });
     const after = await reload();
     expect(after.middleName).toBe(before.middleName);
     expect(after.nickName).toBe(before.nickName);
     expect(after.salary.gross).toEqual(before.salary.gross);
   });
 
-  test("the refusal names the fields that caused it, and nothing else", async () => {
+  test("the hold names the fields that caused it, and nothing else", async () => {
     const token = await hrUser("editor");
     const r = await send("PUT", `/api/employees/${target._id}`, token, {
       middleName: "Kumar",

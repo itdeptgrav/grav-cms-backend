@@ -185,14 +185,20 @@ describe("the real directory route", () => {
     );
   });
 
-  test("an approver sees compensation and an editor does not", async () => {
+  /* Since 13 Oct 2026 an editor READS pay (owner: "the salary of an employee
+     is not visible to the HR editor"); a viewer still does not. */
+  test("an editor and an approver see compensation; a viewer does not", async () => {
+    const viewer = await hrUser("viewer");
     const editor = await hrUser("editor");
     const approver = await hrUser("approver");
 
+    const asViewer = await getAll(viewer);
+    expect(asViewer.text).not.toMatch(new RegExp(SECRETS.accountNumber));
+    expect(asViewer.text).not.toMatch(/45000/);
+
     const asEditor = await getAll(editor);
-    expect(asEditor.text).not.toMatch(new RegExp(SECRETS.accountNumber));
-    expect(asEditor.text).not.toMatch(/45000/);
-    /* An editor DOES hold people.read.private, so the private class is theirs. */
+    expect(asEditor.text).toMatch(new RegExp(SECRETS.accountNumber));
+    /* An editor holds people.read.private too. */
     expect(asEditor.text).toMatch(new RegExp(SECRETS.phone));
 
     const asApprover = await getAll(approver);

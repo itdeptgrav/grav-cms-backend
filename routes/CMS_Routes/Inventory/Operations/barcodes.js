@@ -474,6 +474,91 @@ router.get("/summary", async (req, res) => {
   }
 });
 
+/* ── OVERWRITE WHAT A LABEL STANDS FOR (12 Oct 2026, owner) ────────────────
+   Inventory › Label quantity: "scan the barcode, it shows the defined
+   quantity, overwrite by reducing or increasing, reason optional, done."
+   Sets the label's `quantity` to the figure given — an absolute figure, so a
+   repeated send is harmless — and appends the change to `quantityEdits`.
+   Refused for a voided label (it stands for nothing; void is the answer) and
+   a customer-owned one (its figure belongs to the customer's lot).
+
+   STOCK (12 Oct 2026, owner): with `adjustStock` true — the screen's
+   checkbox, ticked by default; absent counts as true — the material's
+   in-hand quantity (item + variant) moves by the same delta through
+   services/inventory/labelQuantityStock.service.js, with a ledger row
+   "Label quantity corrected". The label is written FIRST and keeps its
+   corrected figure even when the stock cannot move; the answer's
+   `stockAdjustment` block says what happened, and it is written on the edit. */
+router.patch("/:id/quantity", async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid barcode id" });
+    }
+    const quantity = Number(req.body?.quantity);
+    const reason = String(req.body?.reason || "").trim().slice(0, 200);
+    if (!Number.isFinite(quantity) || quantity <= 0) {
+      return res.status(400).json({ success: false, code: "QUANTITY_INVALID", message: "A label must stand for more than zero. To retire a label, void it on Labels & QR." });
+    }
+    const label = await Barcode.findOne(scopedToCompany(req, { _id: req.params.id })).lean();
+    if (!label) return res.status(404).json({ success: false, message: "That label is not in this company's register." });
+    if (label.voidedAt || String(label.identityState || "") === "VOIDED") {
+      return res.status(409).json({ success: false, code: "LABEL_VOIDED", message: "This label was voided — it stands for nothing now." });
+    }
+    if (label.customerMaterial?.lotId) {
+      return res.status(409).json({ success: false, code: "CUSTOMER_OWNED", message: "This is a customer-owned label; its quantity belongs to the customer's lot and is not changed here." });
+    }
+    const to = Math.round(quantity * 10000) / 10000;
+    const from = Number.isFinite(Number(label.quantity)) ? Number(label.quantity) : null;
+    const adjustStock = req.body?.adjustStock === undefined ? true : req.body.adjustStock === true || req.body.adjustStock === "true";
+    const edit = {
+      from, to, unit: String(label.unit || ""), reason,
+      by: mongoose.Types.ObjectId.isValid(req.user?.id) ? new mongoose.Types.ObjectId(req.user.id) : null,
+      byName: String(req.user?.name || req.user?.email || ""),
+      at: new Date(),
+      stock: null,
+    };
+    if (from === to) {
+      return res.json({ success: true, unchanged: true, message: `The label already says ${to} ${label.unit || ""}.`.trim(), label: { _id: String(label._id), quantity: to, unit: label.unit, quantityEdits: label.quantityEdits || [] } });
+    }
+    const r = await Barcode.updateOne(
+      { _id: label._id, quantity: label.quantity, voidedAt: null },
+      { $set: { quantity: to, quantityMeasured: true }, $push: { quantityEdits: edit } },
+    );
+    if (r.modifiedCount !== 1) {
+      return res.status(409).json({ success: false, code: "LABEL_CHANGED", message: "That label changed a moment ago. Scan it again to see what it says now." });
+    }
+
+    /* the stock in hand, when asked — after the label, written on the edit */
+    let stockAdjustment = null;
+    if (adjustStock && from !== null) {
+      const { applyLabelQuantityDelta } = require("../../../../services/inventory/labelQuantityStock.service");
+      stockAdjustment = await applyLabelQuantityDelta({
+        barcode: label, from, to, reason, editAt: edit.at,
+        actor: { id: req.user?.id, name: req.user?.name, email: req.user?.email },
+      });
+      edit.stock = stockAdjustment;
+      await Barcode.updateOne({ _id: label._id, "quantityEdits.at": edit.at }, { $set: { "quantityEdits.$.stock": stockAdjustment } });
+    }
+    const stockLine = !stockAdjustment ? "Stock was not touched."
+      : stockAdjustment.applied ? `Stock moved ${stockAdjustment.baseDelta > 0 ? "+" : "−"}${Math.abs(stockAdjustment.baseDelta)} ${stockAdjustment.baseUnit || ""} (now ${stockAdjustment.newQuantity}).`.replace(/\s+\(/, " (")
+      : stockAdjustment.skipped ? `Stock not moved: ${stockAdjustment.error}`
+      : `Stock was NOT moved: ${stockAdjustment.error}`;
+
+    const after = await Barcode.findById(label._id).select("quantity unit quantityEdits rawItemName variantCombination rawItemSku").lean();
+    return res.json({
+      success: true,
+      message: `Label now says ${to} ${label.unit || ""}${from !== null ? ` (was ${from})` : ""}. ${stockLine}`.replace(/\s+/g, " ").trim(),
+      edit,
+      stockAdjustment,
+      warnings: stockAdjustment && !stockAdjustment.applied && !stockAdjustment.skipped ? [stockAdjustment.error] : [],
+      label: { _id: String(after._id), quantity: after.quantity, unit: after.unit, quantityEdits: after.quantityEdits || [], rawItemName: after.rawItemName, variantCombination: after.variantCombination, rawItemSku: after.rawItemSku },
+    });
+  } catch (error) {
+    console.error("Error changing a label's quantity:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 router.get("/:id", async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
@@ -617,9 +702,24 @@ router.get("/:id", async (req, res) => {
        `availableAsGeneralStock: false` and the reason tells them to go and
        finish the receipt instead. Do not turn this into a 404. */
     const idRefusal = identityRefusal(barcode);
+    /* ── THE RECEIPT IT ARRIVED ON (11 Oct 2026, owner) ─────────────────────
+       Printed at the receipt, or linked to it later on Receive › Link labels
+       to a GRN — either way the scan names the GRN, its source and its line,
+       and says when a link was made afterwards and by whom. Null for a label
+       printed from stock on hand that nobody has linked. A failed read is
+       null too: the label's own facts must still answer the scan. */
+    let goodsReceipt = null;
+    if (barcode.goodsReceiptId) {
+      try {
+        goodsReceipt = await require("../../../../services/storePurchase/labelGrnLink.service").receiptOfLabel(req.tenant, barcode);
+      } catch (e) {
+        console.error("Error resolving a label's goods receipt:", e);
+      }
+    }
     return res.json({
       success: true,
       barcode,
+      goodsReceipt,
       identityState: barcode.identityState || "ACTIVATED",
       ownership: {
         kind: "COMPANY_OWNED",

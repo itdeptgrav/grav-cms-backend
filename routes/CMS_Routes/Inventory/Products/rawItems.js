@@ -951,6 +951,7 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       customCategory,
       usedAs,
       productType,
+      maxDefectPoints,
       customsTariffCode,
       unit,
       customUnit,
@@ -1014,6 +1015,11 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
       rawItem.usedAs = String(usedAs).trim().toUpperCase();
     }
     if (productType !== undefined) rawItem.productType = String(productType || "").trim().slice(0, 80);
+    /* The QC ceiling (13 Oct 2026): empty / null clears it, a whole number sets it. */
+    if (maxDefectPoints !== undefined) {
+      const v = Number(maxDefectPoints);
+      rawItem.maxDefectPoints = maxDefectPoints === null || String(maxDefectPoints).trim() === "" ? null : (Number.isFinite(v) && v >= 0 ? Math.round(v) : rawItem.maxDefectPoints);
+    }
 
     /* ── THE DEFAULT OWNERSHIP, FOR FUTURE RECEIPTS ONLY ─────────────────
        Read only when the payload speaks about it (an absent key is "not part
@@ -1083,13 +1089,21 @@ router.put("/:id", ...canMaintain, payloadAuthority, async (req, res) => {
             detail: `${onRequests} material request line(s) were raised in ${currentUnit}.` });
         }
 
-        if (blockedBy.length) {
+        /* ── THE REFUSAL IS OFF UNLESS ASKED FOR (12 Oct 2026, owner: "there
+           is a restriction that we can't edit the base unit — remove it
+           immediately"). The facts above are still gathered and LOGGED, so a
+           change on an item with history is on record; the change itself goes
+           through. STORE_UNIT_CHANGE_STRICT=1 restores the 409. */
+        if (blockedBy.length && process.env.STORE_UNIT_CHANGE_STRICT === "1") {
           return res.status(409).json({
             success: false,
             code: "UNIT_CHANGE_BLOCKED",
             message: `This item's stock unit cannot be changed from "${currentUnit}" — existing quantities and records would silently mean something different.`,
             blockedBy,
           });
+        }
+        if (blockedBy.length) {
+          console.warn(`[raw-items] unit of ${rawItem.sku || rawItem._id} changed "${currentUnit}" → "${nextUnit.customUnit || nextUnit.unit}" by ${req.user?.email || req.user?.id || "?"} with history: ${blockedBy.map((b) => b.detail).join(" ")}`);
         }
       }
 

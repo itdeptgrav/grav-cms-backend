@@ -117,6 +117,27 @@ const proformaInvoiceSchema = new mongoose.Schema(
     },
 
     // Free-form metadata that prints on the PDF
+    /* ── THE ORDER THIS PROFORMA IS FOR ─────────────────────────────────
+       A proforma invoice had no link to anything the factory makes: a buyer
+       address, a party ledger and free text. So "show me what has been
+       dispatched against this PI" had nothing to join on, and accounting had
+       to find the order by reading the buyer's name.
+
+       `DispatchChallan.manufacturingOrderId` already points at the same
+       CustomerRequest, so one id here is the whole join. It is OPTIONAL — a
+       proforma raised for something with no order behind it is still a
+       proforma, and every PI that predates this has none.
+
+       `requestRef` is the human number (MO-REQ-…) kept beside the id so a
+       list can name the order without populating it. */
+    customerRequestId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "CustomerRequest",
+      default: null,
+      index: true,
+    },
+    requestRef: { type: String, trim: true, default: "" },
+
     buyersReference: { type: String, trim: true }, // their RFQ no.
     dispatchedThrough: { type: String, trim: true }, // courier / transporter
     destination: { type: String, trim: true },

@@ -50,7 +50,7 @@ test("a machine in two slots is refused, naming both", () => {
     { id: "1", name: "Line 1", slots: [{ side: "L", index: 1, machineId: A }] },
     { id: "2", name: "Line 2", slots: [{ side: "R", index: 4, machineId: A }] },
   ]);
-  assert.deepEqual(problemsOf(lines, known), ["One machine is in two slots: Line 1 L01 and Line 2 R04."]);
+  assert.deepEqual(problemsOf(lines, known), ["One machine is in two places: Line 1 L01 and Line 2 R04."]);
 });
 
 test("a slot given two machines is refused", () => {
@@ -87,4 +87,63 @@ test("a slot may hold a work table: no machine, no register lookup, as many as w
   assert.equal(lines[0].slots[1].machineId, undefined);
   assert.deepEqual(problemsOf(lines, known), []);
   assert.deepEqual(machineIdsOf(lines), [B], "only the machine is looked up");
+});
+
+test("a line's QC table is a register machine standing nowhere else", () => {
+  const ok = normaliseLines([{ id: "1", name: "Line 1", qcMachineId: A, slots: [{ side: "L", index: 1, machineId: B }] }]);
+  assert.equal(ok[0].qcMachineId, A);
+  assert.deepEqual(problemsOf(ok, known), []);
+  assert.deepEqual(machineIdsOf(ok).sort(), [A, B], "the QC machine is looked up too");
+
+  const inSlot = normaliseLines([{ id: "1", name: "Line 1", qcMachineId: A, slots: [{ side: "L", index: 1, machineId: A }] }]);
+  assert.deepEqual(problemsOf(inSlot, known), ["One machine is in two places: Line 1 QC table and Line 1 L01."]);
+
+  const twoLines = normaliseLines([{ id: "1", name: "Line 1", qcMachineId: A }, { id: "2", name: "Line 2", qcMachineId: A }]);
+  assert.deepEqual(problemsOf(twoLines, known), ["One machine is at two stations: Line 1 QC table and Line 2 QC table."]);
+
+  const gone = normaliseLines([{ id: "1", name: "Line 1", qcMachineId: GONE }]);
+  assert.deepEqual(problemsOf(gone, known), ["Line 1 QC table names a machine that is not in the machine register."]);
+});
+
+test("a cell has an embroidery station; a row has one side, no table and no QC", () => {
+  const [cell, row] = normaliseLines([
+    { id: "c", name: "Finishing cell", kind: "cell", slotsPerSide: 3, headMachineId: A, qcMachineId: "" },
+    { id: "r", name: "Iron tables", kind: "row", slotsPerSide: 3, tableWidth: 120, qcMachineId: B,
+      slots: [{ side: "L", index: 1, machineId: B }, { side: "R", index: 1, machineId: A }] },
+  ]);
+  assert.equal(cell.kind, "cell");
+  assert.equal(cell.headMachineId, A);
+  assert.equal(row.tableWidth, 0, "a row has no table");
+  assert.equal(row.qcMachineId, null, "nor a QC table (null, never \"\", which no ObjectId accepts)");
+  assert.deepEqual(row.slots.map((s) => s.side), ["L"], "only its one side");
+  assert.deepEqual(problemsOf([cell, row], known), []);
+  const both = normaliseLines([{ id: "c", name: "Cell", kind: "cell", headMachineId: A, qcMachineId: A }]);
+  assert.deepEqual(problemsOf(both, known), ["One machine is at two stations: Cell final QC table and Cell embroidery station."]);
+  assert.deepEqual(machineIdsOf([cell]), [A], "the head machine is looked up");
+});
+
+test("an empty station id is null, so the database can store it", () => {
+  const [l] = normaliseLines([{ id: "1", name: "Line 1", qcMachineId: "", headMachineId: "" }]);
+  assert.equal(l.qcMachineId, null);
+  assert.equal(l.headMachineId, null);
+});
+
+test("a side can stack its slots in rows: cols along the line, bounded by the slots a side", () => {
+  const [cell, plain, silly] = normaliseLines([
+    { id: "c", name: "Cell", kind: "cell", slotsPerSide: 4, cols: 2, qcDepth: 180, tableWidth: 0 },
+    { id: "l", name: "Line", slotsPerSide: 13 },
+    { id: "s", name: "Silly", slotsPerSide: 3, cols: 9, qcDepth: 9999 },
+  ]);
+  assert.deepEqual([cell.cols, cell.qcDepth, cell.tableWidth], [2, 180, 0], "a cell may have no table");
+  assert.deepEqual([plain.cols, plain.qcDepth], [13, 90], "one row, the usual QC table");
+  assert.deepEqual([silly.cols, silly.qcDepth], [3, LIMITS.qcDepth.max]);
+});
+
+test("a line may set how deep its slots are; 0 keeps its kind's own", () => {
+  const [fusing, plain, deep] = normaliseLines([
+    { id: "f", name: "Fusing machines", kind: "row", slotsPerSide: 2, slotDepth: 220 },
+    { id: "l", name: "Line" },
+    { id: "d", name: "Deep", slotDepth: 9999 },
+  ]);
+  assert.deepEqual([fusing.slotDepth, plain.slotDepth, deep.slotDepth], [220, 0, LIMITS.slotDepth.max]);
 });

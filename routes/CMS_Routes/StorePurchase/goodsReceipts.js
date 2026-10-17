@@ -120,6 +120,49 @@ function resolveChosenLocation(warehouse, locationId, expectedType) {
   return loc;
 }
 
+// ── LABELS PRINTED ELSEWHERE, LINKED TO A RECORDED RECEIPT (11 Oct 2026) ─────
+// Receive › Link labels to a GRN. Step 1 scans the labels and step 2 picks the
+// receipt; both read POST /label-links/check, so the plan the screen shows is
+// the plan the write follows. Linking moves no stock — the receipt already
+// did — and the rules are in services/storePurchase/labelGrnLink.service.js.
+// Declared above the `/:grnId` routes so the literal paths can never be read
+// as a receipt id.
+const labelLinks = require("../../../services/storePurchase/labelGrnLink.service");
+const labelLinkError = (res, err, what) => {
+  if (err?.name === "StorePurchaseError") return sendError(res, err);
+  console.error(`[goods-receipts] label ${what} error:`, err);
+  return res.status(500).json({ success: false, message: "Something went wrong. Nothing was changed." });
+};
+
+router.post("/label-links/check", requireCapability(CAPABILITIES.READ), async (req, res) => {
+  try {
+    const out = await labelLinks.check(req.tenant, { barcodeIds: req.body?.barcodeIds, goodsReceiptId: req.body?.goodsReceiptId || null });
+    return res.json({ success: true, ...out });
+  } catch (err) { return labelLinkError(res, err, "check"); }
+});
+
+router.post("/label-links", requireCapability(CAPABILITIES.RECEIPT_RECORD), refuseLegacyWrite, async (req, res) => {
+  try {
+    const out = await labelLinks.link(req.tenant,
+      { goodsReceiptId: req.body?.goodsReceiptId, barcodeIds: req.body?.barcodeIds },
+      { id: req.user?.id || req.user?._id || null, name: req.user?.name || req.user?.email || "" });
+    return res.json({
+      success: true, ...out,
+      message: out.linked
+        ? `${out.linked} label${out.linked === 1 ? "" : "s"} linked to ${out.receipt.receiptNumber}.`
+        : `No label was linked to ${out.receipt.receiptNumber}.`,
+    });
+  } catch (err) { return labelLinkError(res, err, "link"); }
+});
+
+router.post("/label-links/unlink", requireCapability(CAPABILITIES.RECEIPT_RECORD), refuseLegacyWrite, async (req, res) => {
+  try {
+    const out = await labelLinks.unlink(req.tenant, { barcodeId: req.body?.barcodeId },
+      { id: req.user?.id || req.user?._id || null, name: req.user?.name || req.user?.email || "" });
+    return res.json({ success: true, ...out, message: `Label taken off ${out.unlinkedFrom.receiptNumber}.` });
+  } catch (err) { return labelLinkError(res, err, "unlink"); }
+});
+
 // ── GET / — register with operational status filters + concise counts ────────
 router.get("/", requireCapability(CAPABILITIES.READ), async (req, res) => {
   try {

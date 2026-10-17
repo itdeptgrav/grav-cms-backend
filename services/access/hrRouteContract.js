@@ -139,6 +139,11 @@ const DECLARATIONS = [
   D("PUT", "/api/employees/:id", [C.HR_ACCESS, C.PEOPLE_WRITE], {
     persona: "HR editor",
     writePolicy: "employee",
+    /* Pay changed by an approver or editor goes to the OWNER to accept
+       instead of being refused (12 Oct 2026, owner: approvals are for what
+       is connected to pay). This is also how a new employee's pay — split
+       off the create — is applied once the owner approves it. */
+    holdForOwnerOn: [C.COMPENSATION_WRITE],
     ...P,
   }),
   D("PATCH", "/api/employees/bulk-update", [C.HR_ACCESS, C.PEOPLE_WRITE], {
@@ -264,6 +269,22 @@ const DECLARATIONS = [
     persona: "attendance approver",
     note: "The undo of remove-from-month, and declared to match it: same month-shaped effect on the roster, so the same CLOSE capability. It shipped undeclared, which meant the contract refused it for everybody — the door out of an accidental removal was the one door that did not open.",
   }),
+  D("POST", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Counts a time-office code that is not the employee's biometricId as theirs (a ghost that is really them), then re-syncs the ghost's days. It moves punches onto a person, so it takes the correction capability, like a punch correction.",
+  }),
+  D("DELETE", "/hr/attendance/link-device-code", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "The undo of link-device-code, declared to match it.",
+  }),
+  D("GET", "/hr/attendance/rekey-preview", [C.HR_ACCESS, C.ATTENDANCE_READ], {
+    persona: "time office",
+    note: "What moving an employee's rows from an old biometric ID to their current one would do. A read.",
+  }),
+  D("POST", "/hr/attendance/rekey", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], {
+    persona: "time office",
+    note: "Moves an employee's attendance rows from an old biometric ID to their current one and re-syncs the days; may lift a hold on the new ID that HR ticked. Moves punches onto a person, so the correction capability.",
+  }),
   D("GET", "/hr/attendance/roster-exclusions", [C.HR_ACCESS, C.ATTENDANCE_READ], {
     persona: "time office",
     note: "Who is held off which month. A read of the same roster the two routes above write, so it takes the READ capability. Also shipped undeclared.",
@@ -301,6 +322,10 @@ const DECLARATIONS = [
 
   /* Shift Management (routes/HrRoutes/ShiftMaster_section.js) — named shift
      definitions. The page shipped calling these and they did not exist. */
+  /* Overtime: HR decides after the manager (13 Oct 2026). Deciding writes the next day's attendance (the grace), so it is the correction capability, and an editor's decision is held for an approver. */
+  D("GET", "/api/hr/overtime", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
+  D("PATCH", "/api/hr/overtime/:id/hr-approve", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
+  D("PATCH", "/api/hr/overtime/:id/hr-reject", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("GET", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_READ], { persona: "time office" }),
   D("POST", "/api/hr/attendance/shifts", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
   D("PUT", "/api/hr/attendance/shifts/:id", [C.HR_ACCESS, C.ATTENDANCE_CORRECT], { persona: "time office" }),
@@ -401,6 +426,9 @@ const DECLARATIONS = [
   /* Prototype only: advisory output is never persisted and cannot move a
      candidate or make a hiring decision. Running inference is a manage action. */
   D("GET", "/api/hr/ai-interview-lab/health", [C.HR_ACCESS, C.RECRUITMENT_READ], { persona: "recruiter" }),
+  /* The interview's opening question. It shipped undeclared, so the contract
+     refused it for everybody and the lab could not start (found 13 Oct 2026). */
+  D("POST", "/api/hr/ai-interview-lab/opening", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/follow-up", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/score", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),
   D("POST", "/api/hr/ai-interview-lab/turn", [C.HR_ACCESS, C.RECRUITMENT_MANAGE], { persona: "recruiter", ...P }),

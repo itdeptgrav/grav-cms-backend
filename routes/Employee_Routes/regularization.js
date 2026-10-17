@@ -43,8 +43,14 @@
  *   manager_approved ──secondary approves───────► hr_approved + applied
  *                    ──secondary rejects────────► manager_rejected
  *
- * The secondary manager's approval is FINAL — it reaches hr_approved and
- * writes attendance. There is no separate HR step for app-filed requests.
+ * Since 13 Oct 2026 the last manager's approval is NOT final: it reaches
+ * awaiting_hr and HR approves (which writes attendance) or rejects it on
+ * HR › Attendance › Regularizations. The owner: "HR should always ask for
+ * approval". Before that the secondary manager's approval was final.
+ *
+ *   pending / manager_approved ──last manager approves──► awaiting_hr
+ *   awaiting_hr ──HR approves──► hr_approved + applied
+ *               ──HR rejects───► hr_rejected
  * This mirrors leave exactly (see leaveRoutes.js PATCH /manager/:id/approve),
  * and the stored status values are byte-identical to LeaveApplication's so the
  * app's one StatusTag map and the CMS filters keep working unchanged.
@@ -77,8 +83,14 @@ const ALLOWED_STATUS = ["P", "P*", "P~", "HD", "WFH", "CO"];
 
 const HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
-const OPEN_STATUSES = ["pending", "manager_approved"];
+/* Still open — no new request for the same day while one is in any of these.
+   "awaiting_hr" (13 Oct 2026): every manager approved, HR has not decided. */
+const OPEN_STATUSES = ["pending", "manager_approved", "awaiting_hr"];
+/* What a MANAGER may still act on. Once every manager has approved, the
+   request is HR's; a manager cannot reject it after approving. */
+const MANAGER_OPEN_STATUSES = ["pending", "manager_approved"];
 const DECIDED_STATUSES = [
+  "awaiting_hr",
   "hr_approved",
   "manager_rejected",
   "hr_rejected",
@@ -189,7 +201,15 @@ router.get("/manager/pending", AllEmployeeAppMiddleware, async (req, res) => {
       .sort({ dateStr: -1, createdAt: -1 })
       .lean();
 
-    return res.json({ success: true, data: rows });
+    /* Whether THIS manager is the last one — the one who must attach the CCTV
+       proof (13 Oct 2026): the secondary, or the primary when there is none. */
+    const me = String(req.user.id);
+    const data = rows.map((r) => {
+      const mine = (r.managersNotified || []).find((m) => String(m.managerId) === me);
+      const hasSecondary = (r.managersNotified || []).some((m) => m.type === "secondary");
+      return { ...r, needsCctvProof: mine?.type === "secondary" || !hasSecondary };
+    });
+    return res.json({ success: true, data });
   } catch (err) {
     console.error("[employee/regularizations manager/pending]", err);
     return res
@@ -245,6 +265,7 @@ const regLabel = (r) =>
 router.patch(
   "/manager/:id/approve",
   AllEmployeeAppMiddleware,
+  require("../../services/approvalProof").cctvProofUpload,
   async (req, res) => {
     try {
       const { remarks } = req.body || {};
@@ -298,6 +319,22 @@ router.patch(
         (m) => m.type === "secondary",
       );
 
+      /* The LAST manager attaches the CCTV proof (13 Oct 2026, owner). A refusal
+         returns before anything is saved. */
+      const isLastManager = !isRetry && (mt === "secondary" || !hasSecondary);
+      if (isLastManager) {
+        const { storeCctvProof, CCTV_REQUIRED } = require("../../services/approvalProof");
+        if (!req.file && !r.cctvProof?.url) return res.status(400).json(CCTV_REQUIRED);
+        if (req.file)
+          r.cctvProof = await storeCctvProof(req.file, {
+            prefix: "REG",
+            who: r.employeeName,
+            dateStr: r.dateStr,
+            approverId: myId,
+            approverName: mgr?.managerName || "",
+          });
+      }
+
       // ── Primary hands over to secondary ──────────────────────────────
       /* A retry goes straight to the apply — the approvals already happened
          and re-running them would re-notify everybody about a decision nobody
@@ -338,7 +375,45 @@ router.patch(
         });
       }
 
-      // ── FINAL APPROVAL ───────────────────────────────────────────────
+      // ── EVERY MANAGER HAS APPROVED → HR DECIDES (13 Oct 2026) ─────────
+      /* The owner: "HR should always ask for approval". The last manager's
+         approval no longer writes attendance; the request waits for HR, who
+         approves it on HR › Attendance › Regularizations
+         (PATCH /hr/attendance/regularizations/:id/hr-approve), and THAT is what
+         applies it. A retry of an old approved-but-unapplied request still
+         goes straight to the apply below. */
+      if (!isRetry) {
+        const before = r.status;
+        r.status = "awaiting_hr";
+        r.finalApprovedBy = myId;
+        r.finalApprovedByName = mgr?.managerName || "";
+        r.hrRemarks = remarks || r.hrRemarks || "";
+        await r.save();
+        await auditReg(req, {
+          entityId: String(r._id),
+          entityLabel: regLabel(r),
+          action: "approve",
+          summary:
+            `${mgr?.managerName || "The manager"} approved ${r.employeeName}'s correction for ${r.dateStr} and attached the CCTV proof. ` +
+            `It is with HR now — nothing is applied to attendance until HR approves.`,
+          before: { status: before },
+          after: { status: "awaiting_hr" },
+        });
+        notify(r.employeeId, {
+          title: "Approved by your manager",
+          body: `Your correction for ${r.dateStr} was approved by your manager and is waiting for the final approval.`,
+          data: pushData(r),
+          channelId: "general",
+          categoryId: "general",
+        });
+        return res.json({
+          success: true,
+          data: r,
+          message: "Approved. It now waits for the final approval.",
+        });
+      }
+
+      // ── RETRY OF AN APPROVED REQUEST THAT NEVER REACHED ATTENDANCE ─────
       // hrApprovedBy is a ref to HRDepartment — a manager's Employee _id must
       // never go in it, which is what finalApprovedBy exists for.
       const beforeStatus = r.status;
@@ -460,11 +535,14 @@ router.patch(
       if (!r)
         return res.status(404).json({ success: false, message: "Not found" });
 
-      if (!OPEN_STATUSES.includes(r.status))
+      if (!MANAGER_OPEN_STATUSES.includes(r.status))
         return res.status(400).json({
           success: false,
           code: "INVALID_TRANSITION",
-          message: `Cannot reject — ${r.status}`,
+          message:
+            r.status === "awaiting_hr"
+              ? "Every manager has approved this — it is waiting for the final approval."
+              : `Cannot reject — ${r.status}`,
         });
 
       const mgr = r.managersNotified.find(

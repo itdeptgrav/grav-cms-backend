@@ -155,6 +155,45 @@ const tallyCompanySchema = new mongoose.Schema(
     financialYearStart: { type: Date }, // current FY start (e.g. 2025-04-01)
     currentFinancialYear: { type: String }, // "2025-26"
 
+    /* Frozen financial years (13 Oct 2026, owner). While a year's `locked`
+       is true no voucher, journal entry or opening balance in it may be
+       written — services/accounting/fyLock.js, attached to the models.
+       Kept ON the company, not in a collection of its own: the cluster is at
+       its collection limit. A reason is required to freeze and to unfreeze,
+       and every change stays in `history`. */
+    financialYearLocks: {
+      type: [
+        new mongoose.Schema(
+          {
+            fyStartYear: { type: Number, required: true }, // 2025 = FY 2025-26
+            from: { type: Date, required: true },
+            to: { type: Date, required: true },
+            locked: { type: Boolean, default: false },
+            lockedAt: { type: Date, default: null },
+            lockedByName: { type: String, default: "" },
+            lockReason: { type: String, default: "" },
+            history: {
+              type: [
+                new mongoose.Schema(
+                  {
+                    action: { type: String, enum: ["lock", "unlock"], required: true },
+                    reason: { type: String, required: true, trim: true },
+                    by: { type: mongoose.Schema.Types.ObjectId, default: null },
+                    byName: { type: String, default: "" },
+                    at: { type: Date, default: Date.now },
+                  },
+                  { _id: false },
+                ),
+              ],
+              default: [],
+            },
+          },
+          { _id: false },
+        ),
+      ],
+      default: [],
+    },
+
     baseCurrency: { type: String, default: "INR" },
     currencySymbol: { type: String, default: "₹" },
 
@@ -977,6 +1016,9 @@ tallyStockItemSchema.index({ aliases: 1 });
 // ─────────────────────────────────────────────────────────────────────────────
 const Acc_Company = mongoose.model("Acc_Company", tallyCompanySchema);
 const Acc_Group = mongoose.model("Acc_Group", tallyGroupSchema);
+/* A ledger is a master and is always open; its OPENING BALANCE is a figure
+   of the year the books begin in, frozen with that year (13 Oct 2026). */
+tallyLedgerSchema.plugin(require("../../services/accounting/fyLock").openingBalanceGuard);
 const Acc_Ledger = mongoose.model("Acc_Ledger", tallyLedgerSchema);
 const Acc_CostCentre = mongoose.model("Acc_CostCentre", tallyCostCentreSchema);
 const Acc_Unit = mongoose.model("Acc_Unit", tallyUnitSchema);

@@ -133,8 +133,8 @@ describe("the specific hole this closes", () => {
     expect(await routeAllowed(user, "GET", "/api/hr/overview/dashboard")).toBe(true);
   });
 
-  test("an HR editor cannot ask the assistant for a salary either", async () => {
-    const user = await hrUser("editor");
+  test("an HR viewer cannot ask the assistant for a salary either", async () => {
+    const user = await hrUser("viewer");
     const { names } = await toolsFor(user);
     expect(names).not.toContain("hr_salary");
     expect(names).not.toContain("hr_payroll");

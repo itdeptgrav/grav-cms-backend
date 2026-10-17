@@ -1733,6 +1733,10 @@ const Acc_BankTransaction = mongoose.model(
   bankTransactionSchema,
 );
 const Acc_Budget = mongoose.model("Acc_Budget", budgetSchema);
+journalEntrySchema.plugin(require("../../services/accounting/fyLock").fyLockPlugin, {
+  dateField: "entryDate",
+  label: "A journal entry",
+});
 const Acc_JournalEntry = mongoose.model("Acc_JournalEntry", journalEntrySchema);
 const Acc_TaxFiling = mongoose.model("Acc_TaxFiling", taxFilingSchema);
 const Acc_ChartOfAccounts = mongoose.model(

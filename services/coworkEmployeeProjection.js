@@ -38,6 +38,9 @@ function toDirectoryEmployee(doc) {
   if (typeof doc.passwordChanged === "boolean") out.passwordChanged = doc.passwordChanged;
   if (typeof doc.isActive === "boolean") out.isActive = doc.isActive;
   if (typeof doc.status === "string") out.status = doc.status;
+  /* When HR made them inactive (services/coworkHrAccess.service.js) — an ISO
+     string, so the app can say since when. Never who or why. */
+  if (typeof doc.deactivatedAt === "string") out.deactivatedAt = doc.deactivatedAt;
   return out;
 }
 
@@ -50,5 +53,5 @@ function directoryEntryFromSnapshot(snapDoc) {
 module.exports = {
   toDirectoryEmployee,
   directoryEntryFromSnapshot,
-  DIRECTORY_FIELDS: Object.freeze(["id", ...STRING_FIELDS, "passwordChanged", "isActive", "status"]),
+  DIRECTORY_FIELDS: Object.freeze(["id", ...STRING_FIELDS, "passwordChanged", "isActive", "status", "deactivatedAt"]),
 };

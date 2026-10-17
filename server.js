@@ -1341,6 +1341,26 @@ app.use("/api/hr", hrWrites);
 app.use("/hr", hrWrites);
 app.use("/api/employees", hrWrites);
 
+/* BACKSTOP for `holdForApprover` (Middlewear/hrContract.js). The contract lets
+   an editor's approver-level write through ONLY so the queue above can hold it.
+   A held write is answered 202 there and never arrives here; an approved
+   replay arrives carrying its signed claim. Anything else still marked — a
+   path the queue exempts (sync, backfill, imports…) — would otherwise run
+   with an editor's rights, so it is refused exactly as it was before. */
+const { isApprovalReplay: _isHrReplay } = require("./services/changeRequests");
+const hrApproverBackstop = (req, res, next) => {
+  if (!req.holdForApprover || _isHrReplay(req)) return next();
+  return res.status(403).json({
+    success: false,
+    code: "HR_MISSING_CAPABILITY",
+    message: "You do not have permission to perform this action.",
+    requiredCapability: req.holdForApprover.capability || undefined,
+  });
+};
+app.use("/api/hr", hrApproverBackstop);
+app.use("/hr", hrApproverBackstop);
+app.use("/api/employees", hrApproverBackstop);
+
 /* Two employee-app prefixes, named individually rather than mounting the trail
    on all of /api/employee. Overtime and regularisations are HR facts raised
    from the phone — both change what a day of attendance says, and the person
@@ -1364,6 +1384,8 @@ app.use("/api/hr/overview", hrOverviewRoutes);
 
 // HR › Attendance › Shift Management — named shift definitions.
 app.use("/api/hr/attendance/shifts", require("./routes/HrRoutes/ShiftMaster_section"));
+/* HR's decision on overtime reports — the manager's approval hands them to HR (13 Oct 2026). */
+app.use("/api/hr/overtime", require("./routes/HrRoutes/Overtime_HR"));
 
 // The page-scoped HR AI panels (/api/hr/ai/overview-assistant and
 // /api/hr/ai/daily-attendance-assistant) were removed — there is now ONE central
@@ -1920,6 +1942,11 @@ app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/ppm
    Merchandising grant of any level opens nothing here — which is the whole
    point: Merchandising hands off, and the receiving decision stays PPC's. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
+
+/* ── FOLLOW-UPS BETWEEN THE PRODUCTION MANAGER, MERCHANDISING AND R&D ─────
+   (9 Oct 2026). One thing one department waits on another for, owned by a
+   named person with a date; raised by hand or at a style hand-off. */
+app.use("/api/cms/follow-ups", require("./routes/CMS_Routes/FollowUps/followUpsRoute"));
 
 /* ── AND THE SECOND INBOUND QUEUE: ISSUED IE RELEASES ────────────────────
    Same mount, same live `ppc` grant, PPC's own receipt collection. Industrial
@@ -2508,6 +2535,13 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", ieOrDepartmentWrites(productionSupervisorWrites("machine layout")), productionMachineLayout);
 
+// The Order simulation's history (3 Oct 2026): every finished run, to open
+// again or compare. A record of a what-if, not a production write — the
+// router authenticates and lets only whoever ran a run (or an admin) rename
+// or delete it; no department approval queue in front.
+const orderSimulationRoutes = require("./routes/CMS_Routes/Production/Dashboard/orderSimulationRoutes");
+app.use("/api/cms/production/order-simulations", orderSimulationRoutes);
+
 /* ---------------------------------------------------------------------
  * The scanner floor's READ routers (restored 25 Sep 2026).
  *
@@ -2903,6 +2937,10 @@ app.use(
 );
 const bankReconRoutes = require("./routes/Accountant_Routes/Acc_bankRecon");
 app.use("/api/accountant/bank-recon", bankReconRoutes);
+/* Freeze / unfreeze financial years (13 Oct 2026). */
+app.use("/api/accountant/fy-locks", require("./routes/Accountant_Routes/Acc_fyLocks"));
+/* The inventory's stock by day / month / year end, for accounts (13 Oct 2026). */
+app.use("/api/accountant/stock-summary", require("./routes/Accountant_Routes/Acc_stockSummary"));
 
 app.use(
   "/api/accountant/voucher-files",
@@ -4057,6 +4095,15 @@ try {
   }
 } catch (e) {
   console.warn("⚠️ Cowork punch-out offline sync not available:", e.message);
+}
+
+// The follow-ups' morning reminder: overdue and due-today, one email a person.
+try {
+  if (!skipBackgroundJob("follow-up reminders (09:30 IST)")) {
+    require("./services/followUps/followUps.service").startFollowUpReminders();
+  }
+} catch (e) {
+  console.warn("⚠️ Follow-up reminders not available:", e.message);
 }
 
 // Start persistent OT reminder notifications (random 5-20 min intervals)

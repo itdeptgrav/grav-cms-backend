@@ -50,6 +50,7 @@ beforeAll(async () => {
       capabilities: [...(req.hrAuth?.capabilities || [])],
       scope: req.hrAuth?.declaration?.scope,
       exclude: req.hrAuth?.exclude || "",
+      holdForApprover: req.holdForApprover || null,
     }),
   );
 
@@ -195,18 +196,23 @@ describe("4/5 — editor, approver, owner", () => {
       expect({ path, status: r.status }).toEqual({ path, status: 200 });
     }
 
+    /* An approver-level WRITE is no longer refused: it is marked to be HELD
+       for an approver (12 Oct 2026, owner: "editor needed approval but the
+       approval isn't sending"). The queue holds it; it is never applied with
+       the editor's rights — see the backstop in server.js. */
     for (const [method, path] of [
       ["PATCH", "/api/hr/payroll/mark-paid"],
       ["PATCH", "/api/hr/documents/60c0000000000000000000aa/release"],
       ["DELETE", "/hr/attendance/remove-from-month"],
       ["PUT", "/api/hr/leaves/config"],
-      ["GET", "/api/hr/password-management/users"],
     ]) {
       const r = await call(method, path, { token, body: {} });
-      expect({ path, status: r.status, code: r.body.code }).toEqual({
-        path, status: 403, code: "HR_MISSING_CAPABILITY",
-      });
+      expect({ path, status: r.status, held: Boolean(r.body.holdForApprover) }).toEqual({ path, status: 200, held: true });
     }
+    /* A READ above the editor's level, and an owner-only capability, are
+       still refused — nothing to hold. */
+    const pw = await call("GET", "/api/hr/password-management/users", { token });
+    expect({ status: pw.status, code: pw.body.code }).toEqual({ status: 403, code: "HR_MISSING_CAPABILITY" });
   });
 
   test("an approver approves payroll but cannot reopen it", async () => {
@@ -305,7 +311,8 @@ describe("9 — employee self-service is record-scoped", () => {
 
 describe("12-16 — the capability separations, end to end", () => {
   test("compensation endpoints require the compensation capability", async () => {
-    const editor = await hrUser("editor");     // has people.read.private, not compensation
+    /* Since 13 Oct 2026 an editor holds compensation.read; a viewer does not. */
+    const editor = await hrUser("viewer");     // no compensation
     const approver = await hrUser("approver"); // has compensation.read
 
     for (const path of [
@@ -330,7 +337,8 @@ describe("12-16 — the capability separations, end to end", () => {
     const approver = await hrUser("approver");
 
     expect((await call("PUT", "/hr/attendance/day-override", { token: editor, body: {} })).status).toBe(200);
-    expect((await call("DELETE", "/hr/attendance/remove-from-month", { token: editor, body: {} })).status).toBe(403);
+    /* The editor's attempt is held for an approver, never applied. */
+    expect((await call("DELETE", "/hr/attendance/remove-from-month", { token: editor, body: {} })).body.holdForApprover).toBeTruthy();
     expect((await call("DELETE", "/hr/attendance/remove-from-month", { token: approver, body: {} })).status).toBe(200);
   });
 
@@ -347,7 +355,7 @@ describe("12-16 — the capability separations, end to end", () => {
     const id = "60c0000000000000000000aa";
 
     expect((await call("POST", "/api/hr/documents", { token: editor, body: {} })).status).toBe(200);
-    expect((await call("PATCH", `/api/hr/documents/${id}/release`, { token: editor, body: {} })).status).toBe(403);
+    expect((await call("PATCH", `/api/hr/documents/${id}/release`, { token: editor, body: {} })).body.holdForApprover).toBeTruthy();
     expect((await call("PATCH", `/api/hr/documents/${id}/release`, { token: approver, body: {} })).status).toBe(200);
   });
 

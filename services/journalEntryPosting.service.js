@@ -217,6 +217,23 @@ async function postJournalEntry(entry, user) {
 
   await voucher.save();
 
+  /* A held voucher needs its approval request, or it waits for an approval
+     nobody can see (13 Oct 2026, JV/2627/00143). Same request the voucher
+     route files; never fatal — the Approvals page also fills any that are
+     missing (services/accounting/voucherApprovalRequests.js). */
+  if (!direct) {
+    try {
+      await require("./accounting/voucherApprovalRequests").ensureVoucherApprovalRequest({
+        voucher,
+        organizationId: user?.organizationId,
+        requestedBy: user?.id,
+        requestedByName: user?.name || "",
+      });
+    } catch (e) {
+      console.error("[journal-entry] approval request not filed:", e.message);
+    }
+  }
+
   entry.voucherId = voucher._id;
   entry.voucherNumber = voucher.voucherNumber;
   entry.status = direct ? "posted" : "draft";

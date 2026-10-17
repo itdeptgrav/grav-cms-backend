@@ -185,6 +185,13 @@ function orgFilter(req) {
 // Without this fallback, approving an older draft silently fails to apply
 // the balance update — voucher posts but ledger balances don't move.
 async function applyLedgerBalances(voucher, direction, session) {
+  /* A frozen year's balances never move (13 Oct 2026): approving, voiding or
+     cancelling a voucher dated in one is refused before anything changes. */
+  await require("../../services/accounting/fyLock").assertYearsOpen(
+    voucher.companyId,
+    [voucher.voucherDate],
+    "A voucher",
+  );
   const ops = [];
   for (const entry of voucher.ledgerEntries) {
     const lid = entry.ledgerId || entry.ledger;
@@ -255,6 +262,19 @@ async function applyApprovedAction(reqDoc, approver, { budgetOverrideReason, bud
          executor this is what replaces the old release distribution with one
          matching the voucher's new lines. */
       await reconcileAfterCommit(voucher._id, approver);
+      /* A journal entry's voucher: the entry now reads posted too — it said
+         "draft" while its voucher waited (13 Oct 2026). Never fatal. */
+      if (voucher.sourceSystem === "journal_entry" && voucher.sourceId) {
+        try {
+          const { Acc_JournalEntry } = require("../../models/Accountant_model/Acc_OperationalModels");
+          await Acc_JournalEntry.updateOne(
+            { _id: voucher.sourceId, voucherId: voucher._id },
+            { $set: { status: "posted", postedBy: approver.id, postedAt: new Date() } },
+          );
+        } catch (e) {
+          console.error("[approvals] journal entry not marked posted:", e.message);
+        }
+      }
       return { entityId: voucher._id };
     } catch (e) {
       await session.abortTransaction();
@@ -782,6 +802,18 @@ router.get("/", async (req, res) => {
       limit = 50,
       page = 1,
     } = req.query;
+    /* A voucher held for approval with no request behind it (a journal
+       entry's, before 13 Oct 2026) gets its request now, so it is listed
+       here and can be approved without anyone posting it again. */
+    if (req.user?.organizationId) {
+      try {
+        await require("../../services/accounting/voucherApprovalRequests").backfillOrganization(
+          req.user.organizationId,
+        );
+      } catch (e) {
+        console.error("[approvals] backfill of held vouchers failed:", e.message);
+      }
+    }
     const filter = { ...orgFilter(req) };
     if (status && status !== "all") filter.status = status;
     if (kind) filter.kind = kind;
