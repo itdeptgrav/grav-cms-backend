@@ -42,6 +42,20 @@ function outboundNumber(value) {
   return clean;
 }
 
+// livekit-server-sdk 2.15 camel-cases the keys of participant attributes, so
+// "sip.callStatus" arrives as "sipCallStatus"; newer SDK versions keep the
+// dotted names. Read either, so the SDK version cannot silently blank them.
+const LEGACY_SIP_KEYS = Object.freeze({
+  "sip.callStatus": "sipCallStatus",
+  "sip.callID": "sipCallId",
+  "sip.phoneNumber": "sipPhoneNumber",
+  "sip.trunkPhoneNumber": "sipTrunkPhoneNumber",
+});
+function sipAttribute(attributes, name) {
+  const source = attributes || {};
+  return source[name] ?? source[LEGACY_SIP_KEYS[name]] ?? null;
+}
+
 function participantAlreadyGone(error) {
   const code = String(error?.code || error?.status || error?.metadata?.code || "").toLowerCase();
   const text = `${error?.message || ""} ${error?.details || ""}`.toLowerCase();
@@ -86,9 +100,11 @@ class LiveKitBrowserCall {
   static fromEnv(env = process.env) {
     return new LiveKitBrowserCall({
       provider: env.GRAV_VOICE_CARRIER || "plivo",
-      url: env.LIVEKIT_URL,
-      apiKey: env.LIVEKIT_API_KEY,
-      apiSecret: env.LIVEKIT_API_SECRET,
+      // Voice can be migrated independently from the legacy shared
+      // realtime deployment used by other CMS apps such as CoWork.
+      url: env.GRAV_VOICE_LIVEKIT_URL || env.LIVEKIT_URL,
+      apiKey: env.GRAV_VOICE_LIVEKIT_API_KEY || env.LIVEKIT_API_KEY,
+      apiSecret: env.GRAV_VOICE_LIVEKIT_API_SECRET || env.LIVEKIT_API_SECRET,
       outboundTrunkId: env.GRAV_VOICE_SIP_OUTBOUND_TRUNK_ID || env.LIVEKIT_PLIVO_SIP_OUTBOUND_TRUNK_ID,
       businessNumber: env.GRAV_VOICE_CALLER_ID || env.PLIVO_CALLER_ID,
       recordingBucket: env.LIVEKIT_EGRESS_GCP_BUCKET || env.FIREBASE_STORAGE_BUCKET,
@@ -236,8 +252,8 @@ class LiveKitBrowserCall {
     const attributes = participant.attributes || {};
     return {
       present: true,
-      status: sipState(attributes["sip.callStatus"]) || "CUSTOMER_RINGING",
-      sipCallId: attributes["sip.callID"] || null,
+      status: sipState(sipAttribute(attributes, "sip.callStatus")) || "CUSTOMER_RINGING",
+      sipCallId: sipAttribute(attributes, "sip.callID") || null,
     };
   }
 
@@ -253,8 +269,8 @@ class LiveKitBrowserCall {
       .map((participant) => ({
         participantIdentity: participant.identity,
         present: true,
-        status: sipState(participant.attributes?.["sip.callStatus"]) || "CUSTOMER_RINGING",
-        sipCallId: participant.attributes?.["sip.callID"] || null,
+        status: sipState(sipAttribute(participant.attributes, "sip.callStatus")) || "CUSTOMER_RINGING",
+        sipCallId: sipAttribute(participant.attributes, "sip.callID") || null,
       }));
   }
 
@@ -277,21 +293,21 @@ class LiveKitBrowserCall {
       // attributes therefore misses the exact interval in which the browser
       // needs to start ringing.
       return item.kind === ParticipantInfo_Kind.SIP
-        || Boolean(attributes["sip.callID"] || attributes["sip.phoneNumber"] || attributes["sip.trunkPhoneNumber"]);
+        || Boolean(sipAttribute(attributes, "sip.callID") || sipAttribute(attributes, "sip.phoneNumber") || sipAttribute(attributes, "sip.trunkPhoneNumber"));
     });
     if (!participant) return null;
     const attributes = participant.attributes || {};
     // Participant identity is stable for the whole room visit. sip.callID is
     // populated asynchronously, so using it as the database key could change
     // a ringing call's identity halfway through polling and create a duplicate.
-    const callId = String(participant.identity || attributes["sip.callID"] || "").trim();
+    const callId = String(participant.identity || sipAttribute(attributes, "sip.callID") || "").trim();
     if (!callId) return null;
     return {
       callId,
       participantIdentity: participant.identity,
-      callerPhone: outboundNumber(attributes["sip.phoneNumber"] || participant.name || ""),
-      calledNumber: outboundNumber(attributes["sip.trunkPhoneNumber"] || this.businessNumber),
-      status: sipState(attributes["sip.callStatus"]) || "AGENT_RINGING",
+      callerPhone: outboundNumber(sipAttribute(attributes, "sip.phoneNumber") || participant.name || ""),
+      calledNumber: outboundNumber(sipAttribute(attributes, "sip.trunkPhoneNumber") || this.businessNumber),
+      status: sipState(sipAttribute(attributes, "sip.callStatus")) || "AGENT_RINGING",
     };
   }
 
@@ -317,4 +333,4 @@ class LiveKitBrowserCall {
   }
 }
 
-module.exports = { LiveKitBrowserCall, dialFailureState, outboundNumber, participantAlreadyGone, sipState };
+module.exports = { LiveKitBrowserCall, dialFailureState, outboundNumber, participantAlreadyGone, sipAttribute, sipState };

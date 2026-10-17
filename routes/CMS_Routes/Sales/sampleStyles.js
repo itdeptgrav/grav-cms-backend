@@ -71,6 +71,8 @@ const { processVariantRawItems, updateStockItemAggregates, recomputeVariantCosts
 const { nextRequestId } = require("../../../services/requestId");
 const { sendCustomerEmail } = require("../../../utils/salesEmailService");
 const { notifyEvent, APP_URL: DEPT_NOTIFY_APP_URL } = require("../../../services/departmentNotify.service");
+// Follow-ups opened and closed at each hand-off (9 Oct 2026) — see the service.
+const styleFollowUps = require("../../../services/followUps/styleFollowUps");
 const { styleEmailContext, imageGalleryHtml, bomTableHtml, stockItemBom, devBomTableHtml, technicalTableHtml } = require("../../../services/sampleStyleEmail.service");
 const { resolveRequirements } = require("../../../services/sales/sampleRequirements.service");
 /* Merchandising's approved selection joined to R&D's consumption — one
@@ -913,6 +915,46 @@ router.get("/:id", salesAuth, async (req, res) => {
   }
 });
 
+/*
+ * PATCH /api/cms/crm/sample-styles/:id/studio-assignment
+ *
+ * Makes one R&D style visible to exactly one GRAV Studio designer.  Studio
+ * itself cannot make this assignment: its bearer key is intentionally only
+ * allowed to read its own assigned styles and append immutable submissions.
+ * A manager may assign any designer; an R&D user may assign their own CMS
+ * identity only.  The future CMS UI uses this endpoint before it asks Studio
+ * to link a local .grav file to the style.
+ */
+router.patch("/:id/studio-assignment", salesAuth, async (req, res) => {
+  try {
+    const style = await resolveStyle(req.params.id);
+    if (!style) return res.status(404).json({ success: false, message: "Style not found." });
+
+    const designer = req.body?.designer && typeof req.body.designer === "object" ? req.body.designer : {};
+    const email = String(designer.email || "").trim().toLowerCase();
+    const name = String(designer.name || "").trim().slice(0, 200);
+    const designId = String(req.body?.designId || "").trim().slice(0, 200);
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ success: false, message: "A valid Studio designer email is required." });
+    }
+
+    const manager = await canApprove(req.user);
+    const rndSelfAssignment = RND_ROLES.includes(req.user?.role) && email === String(req.user?.email || "").trim().toLowerCase();
+    if (!manager && !rndSelfAssignment) {
+      return res.status(403).json({ success: false, message: "Only a Sales manager may assign another Studio designer." });
+    }
+
+    style.studio = style.studio || {};
+    style.studio.designer = { name, email };
+    if (designId) style.studio.designId = designId;
+    await style.save();
+    return res.json({ success: true, sampleStyle: await withJourney(style, req) });
+  } catch (err) {
+    console.error("[sampleStyles] PATCH /:id/studio-assignment", err);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 // A client-supplied materials.rawItems array, cleaned to what the schema
 // accepts. quantity is genuinely optional here — the Merchandiser is often
 // picking WHAT'S needed before anyone has measured HOW MUCH — so unlike
@@ -1302,6 +1344,7 @@ router.patch("/:id/stage", salesAuth, async (req, res) => {
     logHistory(style, { kind: backward ? "send_back" : "route", from, to: stage, note: reason }, req);
     style.updatedBy = actor(req);
     await style.save();
+    styleFollowUps.onStage(style, from, stage, { backward, reason });
 
     // "Sending to R&D is what makes it appear in the R&D app" (see this
     // route's own header comment) — R&D otherwise has no way to know a style
@@ -1549,7 +1592,7 @@ ${bomTableHtml(c.bom, c.variantTotal)}
       style.bomApproval.token = undefined;
       await style.save();
       const why = result?.skipped === "no-recipients"
-        ? "Nobody has Project Manager as their primary department in Access Control, so there's no one to ask."
+        ? "Nobody has Project Manager or PPC as their primary department in Access Control, so there's no one to ask."
         : result?.skipped === "disabled" || result?.skipped === "template-disabled"
           ? "BOM approval emails are switched off in Sales Settings → Sampling Messages."
           : "The approval email could not be sent.";
@@ -1559,6 +1602,7 @@ ${bomTableHtml(c.bom, c.variantTotal)}
     logHistory(style, { kind: "bom_approval_requested", from: "materials", to: "materials", note: `Round ${style.bomApproval.round}` }, req);
     style.updatedBy = actor(req);
     await style.save();
+    styleFollowUps.onBomRequested(style);
 
     return res.json({ success: true, sentTo: result.sent, sampleStyle: await withJourney(style, req) });
   } catch (err) {
@@ -1841,6 +1885,7 @@ router.post("/:id/technical/materials/return", salesAuth, async (req, res) => {
     }, req);
     style.updatedBy = actor(req);
     await style.save();
+    styleFollowUps.onMaterialReturned(style, row, reason, actor(req));
 
     return res.json({
       success: true,
@@ -2087,6 +2132,7 @@ router.post("/:id/tech-sheet", salesAuth, async (req, res) => {
     if (tsKind) logHistory(style, { kind: tsKind, note: req.body.note || "" }, req);
     style.updatedBy = actor(req);
     await style.save();
+    styleFollowUps.onTechSheet(style, action, req.body.note || "");
 
     if (action === "submit") {
       (async () => {
@@ -2504,6 +2550,7 @@ router.post("/:id/sample", salesAuth, async (req, res) => {
     if (smKind) logHistory(style, { kind: smKind, note: action === "round" ? req.body.type : (req.body.note || "") }, req);
     style.updatedBy = actor(req);
     await style.save();
+    styleFollowUps.onSample(style, action, req.body?.note || "");
 
     if (action === "submit") {
       // The sample's OWN photo, not the enquiry reference image — this is

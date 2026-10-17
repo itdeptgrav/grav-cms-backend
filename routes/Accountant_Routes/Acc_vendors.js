@@ -1,6 +1,8 @@
 // routes/Accountant_Routes/Acc_vendors.js
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
+const { openingSigned } = require("../../services/accounting/ledgerBalance");
 const router = express.Router();
 const mongoose = require("mongoose");
 const Vendor = require("../../models/CMS_Models/Inventory/Vendor-Buyer/Vendor");
@@ -104,7 +106,7 @@ async function importedVendorRows(companyId) {
 
   const ledgerIds = filteredLedgers.map((l) => l._id);
   const agg = await Acc_Voucher.aggregate([
-    { $match: { companyId: cId, status: "posted" } },
+    { $match: { companyId: cId, status: "posted", isOptional: { $ne: true }, "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     { $unwind: "$ledgerEntries" },
     { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     {
@@ -317,6 +319,9 @@ router.get("/", companyScopeOptional, async (req, res) => {
                 "i",
               ),
               isActive: { $ne: false },
+              /* only a supplier's ledger: a same-named customer or expense
+                 ledger is not this vendor's account (16 Oct 2026 audit) */
+              groupName: /creditor/i,
             };
             if (cId) nameQuery.companyId = cId;
             vendorLedger = await Acc_Ledger.findOne(nameQuery).lean();
@@ -360,12 +365,13 @@ router.get("/", companyScopeOptional, async (req, res) => {
               const a = ledgerAgg[0];
               voucherCount = a.voucherIds ? a.voucherIds.length : 0;
               ledgerLastDate = a.lastDate || null;
-              const openSigned =
-                (vendorLedger.openingBalanceType === "Cr" ? -1 : 1) *
-                Math.abs(vendorLedger.openingBalance || 0);
+              const openSigned = openingSigned(vendorLedger);
               // Sundry Creditor: negative closing = we still owe them
               const closingSigned = openSigned + (a.dr || 0) - (a.cr || 0);
-              ledgerPayables = Math.abs(closingSigned);
+              /* What we OWE — a supplier we have paid ahead (a debit) is an
+                 advance, not a payable. Taking the absolute value added
+                 advances into "Ledger Payables" (16 Oct 2026 audit). */
+              ledgerPayables = closingSigned < 0 ? Math.abs(closingSigned) : 0;
               ledgerOutstanding =
                 closingSigned < 0 ? Math.abs(closingSigned) : 0;
               ledgerAdvance = closingSigned > 0 ? closingSigned : 0;
@@ -734,8 +740,8 @@ router.get("/:id/purchase-orders", async (req, res) => {
     if (status && status !== "all") filter.status = status;
     if (startDate || endDate) {
       filter.orderDate = {};
-      if (startDate) filter.orderDate.$gte = new Date(startDate);
-      if (endDate) filter.orderDate.$lte = new Date(endDate);
+      if (startDate) filter.orderDate.$gte = istStart(startDate);
+      if (endDate) filter.orderDate.$lte = istEnd(endDate);
     }
     const purchaseOrders = await PurchaseOrder.find(filter)
       .select(
@@ -834,12 +840,11 @@ router.get("/:id/transactions", async (req, res) => {
     if (type && type !== "all")
       transactions = transactions.filter((t) => t.type === type);
     if (startDate) {
-      const s = new Date(startDate);
+      const s = istStart(startDate);
       transactions = transactions.filter((t) => new Date(t.date) >= s);
     }
     if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
+      const e = istEnd(endDate);
       transactions = transactions.filter((t) => new Date(t.date) <= e);
     }
     transactions.sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -909,7 +914,7 @@ router.post("/:id/payment", async (req, res) => {
     const totalPaid =
       purchaseOrder.payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0;
     const remainingAmount = purchaseOrder.totalAmount - totalPaid;
-    if (amount > remainingAmount) {
+    if (parseFloat(amount) > remainingAmount) {
       return res.status(400).json({
         success: false,
         message: `Payment amount (₹${amount}) exceeds remaining amount (₹${remainingAmount})`,
@@ -925,7 +930,8 @@ router.post("/:id/payment", async (req, res) => {
       notes: notes || "",
       recordedBy: req.user.id,
     });
-    const newTotalPaid = totalPaid + amount;
+    /* a number, whatever the client sent: "500" + 1000 was "1000500" */
+    const newTotalPaid = totalPaid + parseFloat(amount);
     /* An exact >= against the PO total could never be satisfied: 24 of the
        101 POs here store a sub-paisa total (₹12,006.323 — quantity × rate,
        never rounded), and no payment can be made for a third of a paisa. So a
@@ -1038,12 +1044,11 @@ router.get("/:id/payments", async (req, res) => {
       });
     });
     if (startDate) {
-      const s = new Date(startDate);
+      const s = istStart(startDate);
       allPayments = allPayments.filter((p) => new Date(p.date) >= s);
     }
     if (endDate) {
-      const e = new Date(endDate);
-      e.setHours(23, 59, 59, 999);
+      const e = istEnd(endDate);
       allPayments = allPayments.filter((p) => new Date(p.date) <= e);
     }
     allPayments.sort((a, b) => new Date(b.date) - new Date(a.date));

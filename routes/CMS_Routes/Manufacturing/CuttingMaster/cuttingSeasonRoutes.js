@@ -6,7 +6,10 @@
 //
 //   GET    /seasons?status=            the list (closed ones carry their summary)
 //   GET    /seasons/open               every draft/active season — what to resume
-//   POST   /seasons                    create a draft (no name: it is made from what is typed)
+//   GET    /seasons/ppc-lays?from=&days=   PPC's live Cutting lays, and which season holds each
+//   POST   /seasons                    create a draft (no name: it is made from what is typed);
+//                                      { layKeys } starts it FOR PPC's lay — report details filled,
+//                                      a lay row suggested, the cut compared with PPC's ask
 //   GET    /seasons/:id                one season, with the live product tally
 //   GET    /seasons/:id/sticker?code=  what a sticker holds, before "use all or a cut piece?"
 //   POST   /seasons/:id/raw-items      scan a fabric sticker in (draft only) { code, take? }
@@ -38,6 +41,8 @@ const { displayWorkOrderNumber } = require("../../../../services/manufacturing/w
 const { resolvePhotos, variantText } = require("../../../../services/manufacturing/workOrderPhoto");
 const { STAGES, STAGE_KEYS } = require("../../../../services/manufacturing/finishingStages");
 const cutting = require("./cuttingAccess");
+const seasonPlan = require("../../../../services/manufacturing/cuttingSeasonPlan");
+const seasonPlanSvc = require("../../../../services/manufacturing/cuttingSeasonPlan.service");
 const logBook = require("../../../../services/manufacturing/cuttingLogBook");
 
 const isId = (v) => mongoose.Types.ObjectId.isValid(String(v || ""));
@@ -126,6 +131,9 @@ const seasonView = (s, products) => ({
   header: { buyerName: s.header?.buyerName || "", poNo: s.header?.poNo || "", styleNo: s.header?.styleNo || "", colour: s.header?.colour || "", date: s.header?.date || null },
   lays: (s.lays || []).map(layView),
   log: logBook.summarize(s.lays || []),
+  /* PPC's lay it was started for (16 Oct 2026) and the cut against it */
+  plan: s.plan || null,
+  planCheck: seasonPlan.planCheck(s.plan, s.lays || []),
 });
 function layView(l) {
   const { _id, createdBy, updatedBy, createdAt, updatedAt, ...typed } = l;
@@ -271,8 +279,25 @@ router.get("/seasons/report-range", ...canRead, async (req, res) => {
     });
   } catch (err) { console.error("[cutting-seasons] report-range:", err); return fail(res, 500, err.message); }
 });
+/* PPC's live Cutting lays — what the floor can start a season for (16 Oct 2026) */
+router.get("/seasons/ppc-lays", ...canRead, async (req, res) => {
+  try {
+    return res.json({ success: true, ...(await seasonPlanSvc.plannedLays(companyOf(req), { from: req.query.from, days: req.query.days })) });
+  } catch (err) { console.error("[cutting-seasons] ppc-lays:", err); return fail(res, 500, err.message); }
+});
 router.post("/seasons", ...canWrite, async (req, res) => {
   try {
+    /* Started FOR PPC's lay: the report details come from the lay, the lay
+       row it suggests is kept for the screen to start from. */
+    const keys = Array.isArray(req.body?.layKeys) ? req.body.layKeys : req.body?.layKey ? [req.body.layKey] : [];
+    if (keys.length) {
+      let linked;
+      try { linked = await seasonPlanSvc.planForSeason(companyOf(req), keys, actorOf(req)); }
+      catch (e) { if (e.status) return fail(res, e.status, e.message, e.seasonId ? { seasonId: e.seasonId } : {}); throw e; }
+      const header = logBook.normaliseHeader(linked.header);
+      const s = await CuttingSeason.create({ companyId: companyOf(req), name: "New season", nameAuto: true, createdBy: actorOf(req), header, plan: { ...linked.plan, suggestion: linked.suggestion } });
+      return res.status(201).json({ success: true, season: seasonView(s.toObject()) });
+    }
     /* No name is asked (14 Oct 2026, owner): the season is named from its
        report details and lay, on every save (CuttingSeason's nameAuto hook). */
     const name = str(req.body?.name);

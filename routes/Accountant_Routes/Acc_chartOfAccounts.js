@@ -1,6 +1,7 @@
 const express = require("express");
 const router = express.Router();
 const mongoose = require("mongoose");
+const { liveBalances, liveBalanceOf, openingSigned } = require("../../services/accounting/ledgerBalance");
 const accAuth = require("../../Middlewear/AccountantAuthMiddleware");
 const { accountantAuth } = accAuth;
 
@@ -54,6 +55,34 @@ const companyScope = (req, res, next) =>
   accOrgAuth.requireCompanyScope(req, res, next);
 const companyScopeOptional = (req, res, next) =>
   accOrgAuth.scopeCompanyIfPresent(req, res, next);
+/* A route that names a LEDGER by id is checked against the ledger's OWN
+   company (16 Oct 2026 audit): these routes loaded the ledger by id alone, so
+   anyone signed in could read, edit or delete another organisation's ledger
+   by its id. The ledger's company is put where the shared guard looks; a
+   request that names a different company is refused. */
+const ledgerCompanyScope = async (req, res, next) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(String(req.params.id))) {
+      return res.status(404).json({ success: false, message: "Ledger not found" });
+    }
+    const l = await Acc_Ledger.findById(req.params.id).select("companyId").lean();
+    if (!l) return res.status(404).json({ success: false, message: "Ledger not found" });
+    if (!l.companyId) return companyScopeOptional(req, res, next);
+    const named = (req.query && req.query.companyId) || (req.body && req.body.companyId);
+    if (named && String(named) !== String(l.companyId)) {
+      return res.status(403).json({ success: false, message: "This ledger belongs to another company." });
+    }
+    Object.defineProperty(req, "query", {
+      value: { ...(req.query || {}), companyId: String(l.companyId) },
+      writable: true,
+      configurable: true,
+      enumerable: true,
+    });
+    return companyScope(req, res, next);
+  } catch (e) {
+    return res.status(500).json({ success: false, message: e.message });
+  }
+};
 // Payroll models live in the HR module. We require them lazily inside the
 // payroll endpoints below so this route file still loads on systems that don't
 // have the HR module installed yet.
@@ -362,7 +391,7 @@ router.get("/tree", companyScope, async (req, res) => {
          Display only: `groups` and `ledgers` are `.lean()`, so this computes a
          figure to render and never writes back over the stored field. */
       const mov = movementByLedger.get(String(l._id));
-      const opening = l.openingBalance || 0;
+      const opening = openingSigned(l);
       l.currentBalance = opening + (mov ? mov.net : 0);
 
       // Add vendor code and customer code for search
@@ -1031,6 +1060,8 @@ router.get("/by-department", companyScope, async (req, res) => {
     ]);
     const ledgerOf = new Map(ledgers.map((l) => [String(l.linkedEmployeeId), l]));
     const signed = (amt, type) => (type === "Cr" ? -Math.abs(amt || 0) : Math.abs(amt || 0));
+    /* each employee ledger's real balance (opening + posted vouchers) */
+    const live = await liveBalances(companyId, ledgers);
 
     const groups = new Map();
     for (const e of employees) {
@@ -1039,13 +1070,13 @@ router.get("/by-department", companyScope, async (req, res) => {
       const g = groups.get(dept);
       const l = ledgerOf.get(String(e._id));
       const name = [e.firstName, e.lastName].filter(Boolean).join(" ");
-      const current = l ? signed(l.currentBalance, l.currentBalanceType) : 0;
+      const current = l ? (live.get(String(l._id)) || { balance: 0 }).balance : 0;
       g.employees.push({
         _id: l ? l._id : null,
         name: l ? l.name : name,
-        openingBalance: l ? signed(l.openingBalance, l.openingBalanceType) : 0,
+        openingBalance: l ? openingSigned(l) : 0,
         currentBalance: current,
-        currentBalanceType: l ? l.currentBalanceType : "Dr",
+        currentBalanceType: current < 0 ? "Cr" : "Dr",
         employee: { _id: e._id, name, employeeId: e.biometricId || "", identityId: e.identityId || "", status: e.status || "active" },
       });
       g.employeeCount++;
@@ -1205,7 +1236,7 @@ router.get("/ledgers", companyScopeOptional, async (req, res) => {
       const movMap = new Map(movements.map((m) => [String(m._id), m.net]));
       for (const l of ledgersRaw) {
         const mov = movMap.get(String(l._id)) || 0;
-        const opening = l.openingBalance || 0;
+        const opening = openingSigned(l);
         l.currentBalance = opening + mov;
       }
     } catch (_) {}
@@ -1380,7 +1411,7 @@ router.get("/ledgers/search-by-voucher", companyScopeOptional, async (req, res) 
   }
 });
 
-router.get("/ledgers/:id", async (req, res) => {
+router.get("/ledgers/:id", ledgerCompanyScope, async (req, res) => {
   try {
     const ledger = await Acc_Ledger.findById(req.params.id);
     if (!ledger)
@@ -2015,7 +2046,7 @@ router.post("/service-budget-heads/resolve", companyScope, async (req, res) => {
   }
 });
 
-router.put("/ledgers/:id", async (req, res) => {
+router.put("/ledgers/:id", ledgerCompanyScope, async (req, res) => {
   try {
     const updates = { ...req.body };
     /* ── BUDGET CLASSIFICATION IS NOT AN ORDINARY LEDGER EDIT ──────────────
@@ -2066,7 +2097,7 @@ router.put("/ledgers/:id", async (req, res) => {
  * If alternativeLedgerId is provided in query, reassigns all txns
  * to the alternative ledger first, then deletes.
  */
-router.delete("/ledgers/:id", async (req, res) => {
+router.delete("/ledgers/:id", ledgerCompanyScope, async (req, res) => {
   try {
     const ledger = await Acc_Ledger.findById(req.params.id);
     if (!ledger)
@@ -2076,11 +2107,15 @@ router.delete("/ledgers/:id", async (req, res) => {
 
     const alternativeId = req.query.alternativeLedgerId;
 
-    // Check dependencies
+    // Check dependencies — EVERY status (16 Oct 2026 audit): a ledger used
+    // only in drafts could be deleted, and those drafts later posted to a
+    // ledger every report leaves out.
     const txnCount = await Acc_Voucher.countDocuments({
       "ledgerEntries.ledgerId": ledger._id,
-      status: "posted",
     });
+    // An opening balance is a use too: deactivating the ledger took it out
+    // of the trial balance and the balance sheet, which then disagreed by it.
+    const opening = openingSigned(ledger);
 
     // Check if used as party ledger in vouchers
     const partyCount = await Acc_Voucher.countDocuments({
@@ -2093,16 +2128,27 @@ router.delete("/ledgers/:id", async (req, res) => {
     if (ledger.linkedCustomerId) linkedTo.push("Customer");
     if (ledger.linkedEmployeeId) linkedTo.push("Employee");
 
-    const totalUsage = txnCount + partyCount;
+    const totalUsage = txnCount + partyCount + (opening ? 1 : 0);
 
     if (totalUsage > 0 && !alternativeId) {
       // Return dependency details — frontend shows a dialog
       return res.status(409).json({
         success: false,
-        message: `This ledger is used in ${totalUsage} place(s). Choose an alternative ledger to reassign transactions before deleting.`,
+        /* say WHAT holds it: the screens show this sentence as it is */
+        message:
+          `This ledger cannot be removed while it holds ` +
+          [
+            txnCount ? `${txnCount} voucher${txnCount === 1 ? "" : "s"} (drafts included)` : null,
+            partyCount && partyCount !== txnCount ? `${partyCount} voucher${partyCount === 1 ? "" : "s"} as the party` : null,
+            opening ? `an opening balance of ₹${Math.abs(opening).toFixed(2)} ${opening < 0 ? "Cr" : "Dr"}` : null,
+          ]
+            .filter(Boolean)
+            .join(" and ") +
+          `. Merge it into another ledger instead (open the ledger › Merge), which moves all of it.`,
         dependencies: {
           voucherEntries: txnCount,
           partyVouchers: partyCount,
+          openingBalance: opening,
           linkedEntities: linkedTo,
           totalUsage,
         },
@@ -2118,6 +2164,14 @@ router.delete("/ledgers/:id", async (req, res) => {
           success: false,
           message: "Alternative ledger not found",
         });
+      /* the replacement is a live ledger of the SAME company, and not the
+         ledger being removed */
+      if (String(alt._id) === String(ledger._id) || alt.isActive === false || String(alt.companyId) !== String(ledger.companyId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Choose another active ledger of this company to move its entries to.",
+        });
+      }
 
       /* refused before any re-pointing when a voucher of this ledger is locked */
       await require("../../services/accounting/fyLock").assertLedgersOpen([ledger._id], "A voucher of the ledger being removed in it");
@@ -2134,6 +2188,15 @@ router.delete("/ledgers/:id", async (req, res) => {
           },
           { arrayFilters: [{ "elem.ledgerId": ledger._id }] },
         );
+      }
+
+      // Carry the opening balance across, signed, as the merge does
+      if (opening) {
+        const carried = openingSigned(alt) + opening;
+        alt.openingBalance = carried;
+        alt.openingBalanceType = carried < 0 ? "Cr" : "Dr";
+        await alt.save();
+        ledger.openingBalance = 0;
       }
 
       // Reassign party ledger references
@@ -2249,7 +2312,7 @@ router.post("/ledgers/:id/set-primary-bank", companyScope, async (req, res) => {
 // Removes the primary-bank flag from this ledger. Useful when an
 // accountant wants no bank printed on invoices, or before switching to
 // a fresh one without an in-between state.
-router.post("/ledgers/:id/clear-primary-bank", async (req, res) => {
+router.post("/ledgers/:id/clear-primary-bank", ledgerCompanyScope, async (req, res) => {
   try {
     const ledger = await Acc_Ledger.findById(req.params.id);
     if (!ledger) {
@@ -2279,7 +2342,7 @@ router.post("/ledgers/:id/clear-primary-bank", async (req, res) => {
 //   period.closing   = monthlySummary.last.closing
 //                    = opening + totals.debit − totals.credit
 // ─────────────────────────────────────────────────────────────────────────────
-router.get("/ledgers/:id/statement", companyScopeOptional, async (req, res) => {
+router.get("/ledgers/:id/statement", ledgerCompanyScope, async (req, res) => {
   try {
     const { startDate, endDate } = req.query;
     const ledger = await Acc_Ledger.findById(req.params.id).lean();
@@ -2312,7 +2375,7 @@ router.get("/ledgers/:id/statement", companyScopeOptional, async (req, res) => {
 
     // Opening balance — sum all entries strictly before startDate, plus the
     // ledger's stored openingBalance figure
-    let opening = ledger.openingBalance || 0;
+    let opening = openingSigned(ledger);
     if (startDate) {
       const priorAgg = await Acc_Voucher.aggregate([
         {
@@ -2701,6 +2764,7 @@ router.get("/ledgers/:id/statement", companyScopeOptional, async (req, res) => {
       runningBalanceType: opening >= 0 ? "Dr" : "Cr",
     };
 
+    const liveBal = await liveBalanceOf(ledger);
     res.json({
       success: true,
       ledger: {
@@ -2711,8 +2775,9 @@ router.get("/ledgers/:id/statement", companyScopeOptional, async (req, res) => {
         nature: ledger.nature,
         gstin: ledger.gstin,
         panNumber: ledger.panNumber,
-        currentBalance: ledger.currentBalance,
-        currentBalanceType: ledger.currentBalanceType,
+        /* opening + posted vouchers, never the drifting cache */
+        currentBalance: liveBal,
+        currentBalanceType: liveBal < 0 ? "Cr" : "Dr",
         openingBalance: ledger.openingBalance,
         openingBalanceType: ledger.openingBalanceType,
         billWiseEnabled: ledger.billWiseEnabled,
@@ -2984,7 +3049,7 @@ router.get("/trial-balance", companyScope, async (req, res) => {
         txCount: 0,
       };
       const priorTxn = openingMap.get(String(l._id)) || 0;
-      const opening = (l.openingBalance || 0) + priorTxn;
+      const opening = openingSigned(l) + priorTxn;
       const closing = opening + period.debit - period.credit;
       const row = {
         ledgerId: l._id,
@@ -6308,10 +6373,11 @@ router.post("/ledgers/:id/transfer-balance", companyScope, async (req, res) => {
         message: "Source and destination cannot be the same ledger.",
       });
 
-    // Resolve transfer amount.
-    // currentBalance is signed: +ve = Dr, -ve = Cr.
-    // We always transfer the absolute value.
-    const sourceBal = source.currentBalance || 0;
+    // Resolve transfer amount from the ledger's REAL balance — opening plus
+    // posted vouchers (services/accounting/ledgerBalance.js). The stored
+    // `currentBalance` is a cache that has drifted on 186 ledgers; posting a
+    // journal for the cache's figure moved money that was not there.
+    const sourceBal = await liveBalanceOf(source);
     const fullAbs = Math.abs(sourceBal);
     const amt =
       explicitAmount != null ? Math.abs(parseFloat(explicitAmount)) : fullAbs;

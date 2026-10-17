@@ -13,6 +13,7 @@
 const express = require("express");
 const { accountantAuth, requireCompanyScope } = require("../../Middlewear/AccountantAuthMiddleware");
 const { rawItemRow, productRow, istDay, summarise } = require("../../services/accounting/stockSummary");
+const { loadRawInputs } = require("../../services/accounting/stockSummaryData");
 
 const router = express.Router();
 router.use(accountantAuth);
@@ -30,39 +31,26 @@ router.get("/", (req, res, next) => requireCompanyScope(req, res, next), async (
     const now = new Date();
     const kind = ["raw", "product"].includes(req.query.kind) ? req.query.kind : "all";
 
-    const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
-    const PurchaseOrder = require("../../models/CMS_Models/Inventory/Operations/PurchaseOrder");
     let StockItem = null;
     try {
       StockItem = require("../../models/CMS_Models/Inventory/Products/StockItem");
     } catch { /* no product catalogue */ }
 
-    const [raws, orders, products] = await Promise.all([
-      kind === "product"
-        ? []
-        : RawItem.find({})
-            .select("name sku category customCategory unit customUnit quantity stockTransactions.createdAt stockTransactions.updatedAt stockTransactions.previousQuantity stockTransactions.newQuantity stockTransactions.unitPrice variants.vendorNicknames.price")
-            .lean(),
-      kind === "product"
-        ? []
-        : PurchaseOrder.find({ status: { $nin: ["CANCELLED", "Cancelled", "DRAFT", "Draft"] }, createdAt: { $lte: to } })
-            .sort({ orderDate: -1, createdAt: -1 })
-            .select("items.rawItem items.unitPrice")
-            .limit(1000)
-            .lean(),
+    /* raw materials through the loader the purchase voucher's item list
+       uses too (services/accounting/stockSummaryData.js) */
+    const empty = { raws: [], factorByMovement: new Map(), poPriceOf: () => null };
+    const [raw, products] = await Promise.all([
+      kind === "product" ? empty : loadRawInputs({ ordersUpTo: to }),
       kind === "raw" || !StockItem
         ? []
         : StockItem.find({ deletedAt: null, isActive: { $ne: false } })
             .select("name reference category genderCategory unit totalQuantityOnHand averageCost baseCost variants.quantityOnHand variants.cost variants.status")
             .lean(),
     ]);
-    const lastPo = new Map();
-    for (const o of orders)
-      for (const l of o.items || [])
-        if (l.rawItem && Number(l.unitPrice) > 0 && !lastPo.has(String(l.rawItem))) lastPo.set(String(l.rawItem), Number(l.unitPrice));
+    const { raws, factorByMovement, poPriceOf } = raw;
 
     let rows = [
-      ...raws.map((r) => rawItemRow(r, { from, to, now, lastPoPrice: lastPo.get(String(r._id)) })),
+      ...raws.map((r) => rawItemRow(r, { from, to, now, factorByMovement, poPrice: (variantId) => poPriceOf(r._id, variantId) })),
       ...products.map(productRow),
     ];
     if (q) {

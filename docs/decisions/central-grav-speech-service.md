@@ -22,7 +22,9 @@ authorised GRAV application
   -> durable job queue
   -> warm GPU worker
        -> optional NVIDIA Sortformer speaker diarization
-       -> bodhan-ai/indic-transcribe-flex Romanized ASR
+       -> overlapping-context bodhan-ai/indic-transcribe-flex Romanized ASR
+       -> optional speaker-activity layer
+       -> evidence-preserving transcript quality gate
   -> versioned machine result
   -> source application stores result/reference under its own permissions
 ```
@@ -35,11 +37,25 @@ The accepted transcription model is
 `bodhan-ai/indic-transcribe-flex`, producing raw Romanized multilingual text for
 English, Hindi and Odia without a language router or LLM rewrite.
 
+Recorded meetings and calls use **overlapping-context ASR first**: Flex decodes
+bounded 34-second windows with a two-second overlap, then the service removes
+only exact word-boundary overlap. This is the approved readable-transcript
+path because it preserves acoustic context for code-switched business names,
+phrases and quantities. A language model never rewrites this text.
+
 Recorded meetings and calls may additionally request
-`nvidia/diar_sortformer_4spk-v1`. The diarizer identifies speaker turns first;
-Flex transcribes each turn, and the service merges them only by timestamp. The
-speaker labels are anonymous (`Speaker 1`, `Speaker 2`, and so on); diarization
-does not identify a person.
+`nvidia/diar_sortformer_4spk-v1`. Diarization is a second, independent layer
+for anonymous speaker activity (`Speaker 1`, `Speaker 2`, and so on); it must
+not cut audio before ASR or determine the words displayed in the readable
+transcript. Until word-level alignment is separately validated, a context
+window that spans speakers displays each active speaker rather than falsely
+assigning individual words to one speaker.
+
+Long recordings are processed in bounded three-minute batches for memory and
+delivery progress. Every batch contains overlapping ASR windows whose original
+timestamps are preserved. Diarization may use matching bounded windows;
+speaker labels remain local evidence, so a label is not presented as a stable
+identity across batch boundaries.
 
 Model artifacts are immutable deployment inputs identified by model ID,
 revision and checksum. The current verified local copies are:
@@ -118,13 +134,114 @@ The API does not accept an expected speaker count. Sortformer must infer the
 speaker count from the recording; applications cannot use a UI field as a
 correction knob.
 
+## Transcript evidence and quality gate
+
+ASR output is evidence, not automatically trustworthy prose. The service must
+preserve every raw turn and its exact timestamps, then evaluate a separate
+utterance view before a consumer may render it as a normal paragraph.
+
+The first gate is deterministic and checks audio duration, isolated
+micro-utterances, implausible word rate, collapsed lexical diversity, decoder
+repetition and weakly supported diarizer channels. A diarizer channel is an
+anonymous acoustic hypothesis, not proof of another person. Long turns must use
+the model's pause-aware safe chunker; a decoder pass may not exceed the model's
+trained context window.
+
+Numbers, dates, quantities, amounts and dimensions are additionally treated as
+high-risk evidence. A fragment such as `point five` must never be silently
+expanded to `one point five`. Competing ASR candidates are retained and compared
+as exact values; disagreement or a structurally incomplete number blocks that
+utterance from structured facts until contextual re-decode or authorised review
+resolves it.
+
+An optional private text reasoner may classify an utterance plus its immediate
+neighbours as `coherent`, `uncertain` or `gibberish`. Its authority stops there:
+it cannot rewrite, translate, complete or replace ASR words. A failed span is
+first re-cut and decoded as one contextual audio window instead of isolated
+micro-turns, then may use a versioned specialist fallback. The reasoner may
+select one verbatim ASR candidate, but cannot combine them. If the candidates
+still disagree, the readable view says `[unclear audio]` and exposes the
+preserved raw candidates for authorised review.
+
+The semantic check must also catch phrases that are syntactically plausible but
+illogical in the local business conversation. It receives a bounded meeting
+context (the target utterance, surrounding transcript window and an inferred
+meeting/topic profile), not just one sentence on either side. This lets it
+recognise an incoherent phrase in any kind of discussion without the product
+having to supply vocabulary in advance. The complete recording is
+not repeatedly placed in a prompt: batch/topic context plus a roughly
+two-to-four-minute local transcript window is the bounded context horizon.
+
+The baseline recovery loop is domain-neutral and does not accept product,
+industry, acronym or tenant keywords. First, the reasoner identifies a span as
+incoherent *without proposing a replacement*. The service then re-decodes the
+same source audio with several context paddings and, where necessary, a
+different ASR architecture. The reasoner receives those recorded candidates
+plus bounded context and may choose exactly one candidate ID. It must return
+`uncertain` if no candidate is adequately supported. Thus context can decide
+that a phrase such as an impossible inventory expression needs recovery, but
+the replacement still has to have been spoken and emitted by ASR.
+
+A tenant-controlled domain term may be an optional, customer-configured extra
+signal after the domain-neutral loop has run. It is never a prerequisite for
+quality or a hidden product-specific rule, and it cannot silently alter ASR
+evidence. There is one narrow exception for the *derived readable view*:
+`contextualTermNormalization`. It can display a canonical catalog term such as
+`polyester` for a raw span such as `Police star` only when all of these are
+true:
+
+1. the term comes from a versioned, source-domain-owned glossary and is not
+   generated by Qwen;
+2. Qwen selects only that glossary ID after receiving the bounded meeting
+   context and target raw span; it never returns a replacement sentence;
+3. a deterministic guard verifies the exact source span, a configured alias or
+   phonetic similarity threshold, confidence, and a permitted term type; and
+4. the change is not a number, amount, date, dimension, identifier, person or
+   other structured business fact.
+
+Every accepted normalisation records its raw phrase, canonical term ID,
+glossary version, phonetic evidence, model decision and contextual window.
+`rawRomanText`, ASR candidates and structured facts remain untouched. Consumers
+must be able to reveal the original reading next to the enhanced display.
+
+When a longer context window contains both a correct catalog term and a
+phonetic variant, terminology review must additionally receive a focused packet
+for each literal non-canonical alias. It may not nominate the already-correct
+occurrence elsewhere in the same window. The focused proposal still passes the
+same source-span, glossary and phonetic checks. Multiple independently
+validated occurrences are applied in source order to the derived display text;
+they never alter the underlying raw ASR value.
+The resulting `semanticIssues` and `recoveryRequired` fields retain the reason
+for any second acoustic decode.
+
+The permanent implementation is the private `/v1/transcript-review` endpoint
+in the existing bounded Qwen worker. The central speech service sends raw
+utterance evidence, bounded meeting context, recorded candidate decodes and
+tenant vocabulary hints to that endpoint. It validates the returned utterance
+ids and issue enum, re-cuts only requested spans with padded source audio, and
+accepts a readable candidate only if the selected candidate id was actually
+produced by ASR. A separate `/v1/transcript-term-normalize` route can return
+only a closed glossary ID plus a raw span; it cannot submit replacement prose.
+
+This distinction is mandatory:
+
+- `rawRomanText` is immutable model evidence;
+- `qualityState`, `qualityFlags` and `semanticReview` are derived annotations;
+- `selectedCandidate` is allowed only after a recorded, reproducible selection
+  rule; and
+- `contextualNormalizations` are optional, auditable display annotations that
+  replace only a validated glossary span in `contextualNormalizedRomanText`;
+  they never alter raw evidence or structured facts; and
+- no derived sentence may be merged across a flagged micro-turn as though it
+  were confidently spoken.
+
 ## Result contract
 
 Every result is versioned and preserves raw machine output:
 
 ```json
 {
-  "schemaVersion": "1",
+  "schemaVersion": "2",
   "jobId": "stt_...",
   "status": "succeeded",
   "model": {
@@ -140,7 +257,40 @@ Every result is versioned and preserves raw machine output:
       "speaker": "Speaker 1",
       "startSeconds": 0.0,
       "endSeconds": 1.5,
-      "romanText": "raw model output"
+      "rawRomanText": "raw model output",
+      "qualityState": "unverified | coherent | uncertain | gibberish",
+      "qualityFlags": []
+    }
+  ],
+  "utteranceReviews": [
+    {
+      "id": "utterance-0001",
+      "turnIndexes": [0],
+      "rawRomanText": "raw model output",
+      "candidateTranscripts": [
+        {"id": "raw_turn_concat", "romanText": "raw model output"},
+        {"id": "contextual_redecode", "romanText": "second raw ASR output"}
+      ],
+      "selectedCandidateId": "contextual_redecode",
+      "numericEvidence": {
+        "flags": ["numeric_candidate_conflict"],
+        "safeForStructuredFacts": false
+      },
+      "qualityState": "uncertain",
+      "semanticReview": {
+        "state": "uncertain",
+        "reason": "short evidence-based reason; never replacement text"
+      },
+      "contextualNormalizations": [
+        {
+          "rawPhrase": "Police star",
+          "canonicalTermId": "material.polyester",
+          "canonicalText": "polyester",
+          "glossaryVersion": "garment-v1",
+          "phoneticScore": 0.82
+        }
+      ],
+      "contextualNormalizedRomanText": "... polyester ..."
     }
   ],
   "romanTranscript": "raw timestamp-ordered transcript"
@@ -193,9 +343,11 @@ RunPod. A pod is compute, not the system of record.
 - **A shared transcript database as the first step:** weakens source-domain
   permissions. Central inference does not require centralising all transcript
   ownership.
-- **LLM cleanup inside the service:** changes evidence and makes output
-  non-reproducible. Any later interpretation is a separate, visibly derived
-  artifact.
+- **Free-form LLM cleanup inside the service:** changes evidence and makes
+  output non-reproducible. A reasoner may classify quality but cannot supply
+  transcript prose. The only permitted enhancement is a visibly derived,
+  glossary-ID-only contextual normalisation with the source span and evidence
+  retained.
 
 ## Acceptance
 
@@ -212,3 +364,14 @@ The central service is accepted when:
    three-speaker results without manual or LLM editing;
 7. source applications expose results only through their existing permission
    boundaries.
+8. micro-turn hallucinations, repetition loops, over-context decoder calls and
+   weak diarizer channels cannot silently become trusted readable prose;
+9. semantic verification never changes `rawRomanText`, even when it classifies
+   a span as gibberish; a contextual normalisation is permitted only as a
+   separately-audited glossary display annotation.
+10. flagged micro-turn collections are re-decoded as bounded contextual audio,
+    and any selected text exactly matches one recorded ASR candidate.
+11. conflicting or incomplete numeric evidence cannot populate a business fact,
+    quantity, amount, date or dimension.
+12. the baseline quality path uses no tenant, product or industry vocabulary;
+    such vocabulary is an explicit optional configuration layer only.

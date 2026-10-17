@@ -21,6 +21,7 @@ const CustomerRequest = require("../../models/Customer_Models/CustomerRequest");
 const WorkOrder = require("../../models/CMS_Models/Manufacturing/WorkOrder/WorkOrder");
 const RawItem = require("../../models/CMS_Models/Inventory/Products/RawItem");
 const StockIssuance = require("../../models/CMS_Models/Inventory/Operations/StockIssuance");
+const packagingAccess = require("../../routes/CMS_Routes/Manufacturing/Packaging/packagingAccess");
 
 const str = (v) => (v == null ? "" : String(v).trim());
 const isId = (v) => mongoose.Types.ObjectId.isValid(str(v)) && /^[0-9a-f]{24}$/i.test(str(v));
@@ -145,6 +146,85 @@ async function listForOrder(moId, { companyId = null } = {}) {
   return viewOf(order);
 }
 
+/* ── every order's requests, for one company ─────────────────────────────
+ *
+ * The per-order read above answers "what did we ask for on THIS order". PPC's
+ * overview asks the other question — "what is the Store still holding up,
+ * anywhere" — and had no way to ask it: a controller had to open each order in
+ * turn to find the one request nobody had issued against.
+ *
+ * Same company proof as every other PPC read (a WorkOrder of this company
+ * carries the order), same status derivation as the order page, so a request
+ * cannot read "awaiting" here and "part issued" there. Cancelled requests and
+ * Merchandising's inbound requests are left out: neither is work the Store
+ * owes the floor.
+ */
+async function listForCompany(companyId, { limit = 60 } = {}) {
+  /* The SAME scope every other PPC and Packaging read uses, not a stricter one
+     of its own: while the legacy window is open it also admits a work order
+     carrying no Sales-line link. Nearly every work order in this database is
+     one, and a strict filter here answered "the Store owes nothing" on a floor
+     with requests outstanding — the exact confusion between "nothing" and
+     "could not be proved" this panel exists to avoid.
+     `STORE_PURCHASE_STRICT_TENANCY=1` closes the window here with everything
+     else. */
+  const rows0 = await packagingAccess.findWorkOrders(companyId, {}, "customerRequestId").lean();
+  const mine = [...new Set(rows0.map((r) => String(r.customerRequestId || "")).filter(Boolean))].map(oid);
+  if (!mine.length) return { rows: [], totals: emptyTotals(), orders: 0 };
+
+  const orders = await CustomerRequest.find({ _id: { $in: mine }, "materialRequests.0": { $exists: true } })
+    .select(ORDER_SELECT).lean();
+  if (!orders.length) return { rows: [], totals: emptyTotals(), orders: 0 };
+
+  /* One read of the issues for every order that has a request, rather than
+     one read per order. */
+  const issuances = await StockIssuance.find({ manufacturingOrder: { $in: orders.map((o) => o._id) } })
+    .sort({ createdAt: 1 }).lean();
+  const issuesByOrder = new Map();
+  for (const iss of issuances) {
+    const key = String(iss.manufacturingOrder);
+    if (!issuesByOrder.has(key)) issuesByOrder.set(key, []);
+    issuesByOrder.get(key).push(iss);
+  }
+
+  const rows = [];
+  for (const order of orders) {
+    const issueRows = issueRowsOf(issuesByOrder.get(String(order._id)) || []);
+    for (const r of order.materialRequests || []) {
+      if (str(r.source || "ppc") === "merchandising") continue;
+      const view = requestView(r, issueRows);
+      if (view.status === "cancelled" || view.status === "issued") continue;
+      rows.push({
+        ...view,
+        /* The order it is for, so the overview can name it and link to it
+           without a second read. */
+        moId: String(order._id),
+        moNumber: order.requestId ? `MO-${order.requestId}` : "",
+        customerName: str(order.customerInfo?.name),
+        /* What is still owed, in the request's own units — the figure the
+           Store acts on. A request spanning two units says so rather than
+           adding them up. */
+        remainingLines: view.lines.filter((l) => l.remaining > 0).length,
+      });
+    }
+  }
+
+  /* Oldest first: the request nobody has issued against for three days is the
+     one the floor is waiting on. */
+  rows.sort((a, b) => new Date(a.createdAt || 0) - new Date(b.createdAt || 0));
+
+  const totals = {
+    awaiting: rows.filter((r) => r.status === "open").length,
+    partlyIssued: rows.filter((r) => r.status === "partially_issued").length,
+    orders: new Set(rows.map((r) => r.moId)).size,
+    lines: rows.reduce((n, r) => n + r.remainingLines, 0),
+    oldestAt: rows[0]?.createdAt || null,
+  };
+  return { rows: rows.slice(0, limit), totals, orders: orders.length, truncated: rows.length > limit };
+}
+
+const emptyTotals = () => ({ awaiting: 0, partlyIssued: 0, orders: 0, lines: 0, oldestAt: null });
+
 /* ── raise ──────────────────────────────────────────────────────────────── */
 
 /** The lines of a request, checked against the register. Shared by create and update. */
@@ -246,4 +326,4 @@ async function reportForOrder(moId, { companyId = null } = {}) {
   return { ...view, generatedAt: new Date() };
 }
 
-module.exports = { listForOrder, create, update, cancel, reportForOrder, isId };
+module.exports = { listForOrder, listForCompany, create, cancel, reportForOrder, isId };

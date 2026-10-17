@@ -26,6 +26,7 @@
 // irreversible — the accountant reviews before confirming.
 
 const express = require("express");
+const { openingSigned } = require("../../services/accounting/ledgerBalance");
 const mongoose = require("mongoose");
 const {
   Acc_Voucher,
@@ -387,19 +388,17 @@ router.post("/ledgers", auth, companyScope, async (req, res) => {
     const aliasSet = new Set(
       [...(survivor.aliases || [])].map((a) => a.trim()),
     );
-    let signedOpening =
-      (survivor.openingBalanceType === "Cr" ? -1 : 1) *
-      Math.abs(survivor.openingBalance || 0);
+    let signedOpening = openingSigned(survivor);
     for (const g of ghosts) {
       if (g.name && g.name !== survivor.name) aliasSet.add(g.name.trim());
       for (const al of g.aliases || []) aliasSet.add(al.trim());
       if (!survivor.gstin && g.gstin) survivor.gstin = g.gstin;
-      signedOpening +=
-        (g.openingBalanceType === "Cr" ? -1 : 1) *
-        Math.abs(g.openingBalance || 0);
+      signedOpening += openingSigned(g);
     }
     survivor.aliases = [...aliasSet].filter(Boolean);
-    survivor.openingBalance = Math.abs(signedOpening);
+    /* signed, as the schema documents and every report reads it; the side
+       is kept beside it for the screens that show "Dr" / "Cr" */
+    survivor.openingBalance = signedOpening;
     survivor.openingBalanceType = signedOpening < 0 ? "Cr" : "Dr";
     await survivor.save();
 

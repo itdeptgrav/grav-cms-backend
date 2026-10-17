@@ -1141,6 +1141,183 @@ router.get("/jobs", async (req, res) => {
   }
 });
 
+/* MRF voice approval operations belong to IT as health and delivery evidence,
+ * never as approval authority. IT can see whether the worker is ready and
+ * where attempts stopped; it cannot manufacture an APPROVED/REJECTED state. */
+router.get("/mrf-voice-approvals", async (req, res) => {
+  try {
+    const VoiceApproval = require("../../models/MrfVoiceApprovalSession");
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 30));
+    const rows = await VoiceApproval.find({})
+      .select("companyId mrf mrfNumber approverName requestedForName language status failureCode failureMessage ringingAt answeredAt completedAt expiresAt createdAt")
+      .sort({ createdAt: -1 }).limit(limit).lean();
+    res.json({ success: true, health: voice.readiness(), attempts: rows });
+  } catch (err) {
+    console.error("[dev] mrf voice approvals:", err.message);
+    res.status(500).json({ success: false, message: "Could not load MRF voice approval health." });
+  }
+});
+
+/* The reusable Voice Automation control-centre contract. This endpoint is
+ * deliberately honest about rollout state: only the existing MRF adapter may
+ * report live. Planned workflows expose their source boundary and next release
+ * gate; displaying them in IT does not enable a scheduler or grant authority. */
+router.get("/voice-automation", async (req, res) => {
+  try {
+    const VoiceApproval = require("../../models/MrfVoiceApprovalSession");
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const { snapshot } = require("../../services/voiceAutomationCatalogue.service");
+    const attempts = await VoiceApproval.find({})
+      .select("mrfNumber approverName requestedForName language status failureCode failureMessage ringingAt answeredAt completedAt createdAt")
+      .sort({ createdAt: -1 })
+      .limit(8)
+      .lean();
+    res.json({
+      success: true,
+      ...snapshot({
+        voiceHealth: voice.readiness(),
+        recentAttempts: attempts.map((row) => ({
+          id: String(row._id),
+          workflowKey: "mrf_approval",
+          subject: row.mrfNumber,
+          recipient: row.approverName || "Assigned approver",
+          requestedFor: row.requestedForName || "",
+          language: row.language,
+          status: row.status,
+          failureCode: row.failureCode || "",
+          failureMessage: row.failureMessage || "",
+          createdAt: row.createdAt,
+          ringingAt: row.ringingAt,
+          answeredAt: row.answeredAt,
+          completedAt: row.completedAt,
+        })),
+      }),
+    });
+  } catch (err) {
+    console.error("[dev] voice automation:", err.message);
+    res.status(500).json({ success: false, message: "Could not load Voice Automation." });
+  }
+});
+
+/* A real LiveKit/STT/TTS/dialog test with a synthetic session only. Creation,
+ * ringing and answer are deliberately separate so Voice Lab exercises the
+ * same user journey as a normal MRF call. The fake MRF id is never loaded and
+ * these routes never invoke an MRF approval command. */
+async function voiceLabActor(req) {
+  const Employee = require("../../models/Employee");
+  const { resolveCompanyForActor } = require("../../services/companyContext/companyMembership.service");
+  const [{ companyId }, employee] = await Promise.all([
+    resolveCompanyForActor(req.user, { domainLabel: "MRF voice lab" }),
+    Employee.findOne({ email: req.user.email })
+      .select("biometricId firstName middleName lastName")
+      .lean(),
+  ]);
+  if (!employee?.biometricId) {
+    const error = new Error("Your employee record needs a biometric ID before the voice lab can call you.");
+    error.code = "MRF_VOICE_TEST_IDENTITY_MISSING";
+    throw error;
+  }
+  const employeeName = [employee.firstName, employee.middleName, employee.lastName].filter(Boolean).join(" ");
+  return { companyId, biometricId: employee.biometricId, actorName: employeeName || req.user.name || "IT voice tester" };
+}
+
+router.post("/mrf-voice-approvals/test", requireEditor, async (req, res) => {
+  const voice = require("../../services/mrfVoiceApproval.service");
+  try {
+    const actor = await voiceLabActor(req);
+    const row = await voice.createTest({
+      ...actor,
+      language: req.body?.language,
+      requestedForName: req.body?.scenario?.requestedForName,
+      requestedForDept: req.body?.scenario?.requestedForDept,
+      itemSummary: req.body?.scenario?.itemSummary,
+      qwenLabInstruction: req.body?.qwenLabInstruction,
+    });
+    res.json({ success: true, call: voice.publicView(row) });
+  } catch (err) {
+    const status = err.code === "MRF_VOICE_NOT_READY" ? 503 : 400;
+    res.status(status).json({ success: false, code: err.code, message: err.message });
+  }
+});
+
+router.get("/mrf-voice-approvals/test/active", async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const call = await voice.activeTest(actor);
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
+router.post("/mrf-voice-approvals/test/:id/accept", requireEditor, async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const assigned = await voice.assigned({ id: req.params.id, ...actor });
+    if (!assigned?.isTest) return res.status(404).json({ success: false, message: "Voice-lab call not found." });
+    const accepted = await voice.accept({ id: req.params.id, ...actor });
+    res.json({ success: true, ...accepted });
+  } catch (err) {
+    const status = err.code === "MRF_VOICE_NOT_READY" ? 503 : 400;
+    res.status(status).json({ success: false, code: err.code, message: err.message });
+  }
+});
+
+router.post("/mrf-voice-approvals/test/:id/language", requireEditor, async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const assigned = await voice.assigned({ id: req.params.id, ...actor });
+    if (!assigned?.isTest) return res.status(404).json({ success: false, message: "Voice-lab call not found." });
+    const call = await voice.setLanguage({ id: req.params.id, language: req.body?.language, ...actor });
+    if (!call) return res.status(409).json({ success: false, message: "That test language is unavailable." });
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
+router.post("/mrf-voice-approvals/test/:id/defer", requireEditor, async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const assigned = await voice.assigned({ id: req.params.id, ...actor });
+    if (!assigned?.isTest) return res.status(404).json({ success: false, message: "Voice-lab call not found." });
+    const call = await voice.defer({ id: req.params.id, ...actor });
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
+router.get("/mrf-voice-approvals/test/:id", async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const call = await voice.assigned({ id: req.params.id, ...actor });
+    if (!call?.isTest) return res.status(404).json({ success: false, message: "Voice-lab call not found." });
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
+router.post("/mrf-voice-approvals/test/:id/complete", requireEditor, async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const assigned = await voice.assigned({ id: req.params.id, ...actor });
+    if (!assigned?.isTest) return res.status(404).json({ success: false, message: "Voice-lab call not found." });
+    const call = await voice.complete({ id: req.params.id, outcome: req.body?.outcome, ...actor });
+    if (!call) return res.status(409).json({ success: false, message: "The test decision is not ready to complete." });
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
+router.post("/mrf-voice-approvals/test/:id/end", requireEditor, async (req, res) => {
+  try {
+    const voice = require("../../services/mrfVoiceApproval.service");
+    const actor = await voiceLabActor(req);
+    const call = await voice.cancelTest({ id: req.params.id, ...actor });
+    res.json({ success: true, call });
+  } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+});
+
 router.post("/scan", requireEditor, async (req, res) => {
   try {
     const summary = await scanChangeLogs();

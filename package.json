@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "dev": "nodemon server.js",
+    "cctv:twin:person-worker": "/Users/risheeray/phone_detc_venv/bin/python scripts/cctv-twin-person-worker.py --enable-face-identity",
+    "openwa:start": "npm --prefix .local-tools/openwa start",
     "test": "node --test \"services/**/*.test.js\"",
     "//test:openjev": "The Accounts pilot suite is a node:test file under test/, which neither `npm test` (services only) nor Jest covers — Jest would see zero tests in it, because requiring node:test shadows Jest's own globals. The HR pilot suite next to it IS a Jest file and runs with `npx jest`.",
     "test:openjev": "node --test test/hr-ai/openJevAccountsPilot.test.js",

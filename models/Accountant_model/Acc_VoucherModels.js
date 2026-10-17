@@ -721,6 +721,48 @@ tallyVoucherSchema.pre("save", function (next) {
   // cancelled/void voucher is NOT live, so its number is freed for reuse.
   this.isLive = !["cancelled", "void"].includes(this.status);
 
+  /* ── THE HEADER IS READ OFF THE LINES (16 Oct 2026 audit) ──────────────
+     The forms sent `gstBreakup` and `grandTotal` from their own arithmetic
+     (unrounded, and blind to a hand-typed amount), while the ledger lines
+     carried the rounded / edited figures. The invoice PDF, the e-way bill
+     and the GST summary read the header; the books read the lines. For a
+     sales / purchase / credit / debit note the header is now taken from the
+     lines on every save: each GST component is the net of its ledgers on the
+     side the tax sits on, and the grand total is the party's line. Reverse-
+     charge ledgers are not the invoice's tax and are left out. */
+  const TAX_SIDE = { sales: "Cr", credit_note: "Dr", purchase: "Dr", debit_note: "Cr" };
+  const taxSide = TAX_SIDE[this.voucherType];
+  if (taxSide && Array.isArray(this.ledgerEntries) && this.ledgerEntries.length) {
+    const r2 = (n) => Math.round((n + Number.EPSILON) * 100) / 100;
+    const compOf = (name) => {
+      const n = String(name || "").toLowerCase();
+      if (!/gst|cess/.test(n) || /rcm|reverse/.test(n)) return null;
+      if (/cess/.test(n)) return "cess";
+      if (/igst/.test(n)) return "igst";
+      if (/cgst/.test(n)) return "cgst";
+      if (/sgst|utgst/.test(n)) return "sgst";
+      return null;
+    };
+    const comp = { cgst: 0, sgst: 0, igst: 0, cess: 0 };
+    let anyTax = false;
+    for (const l of this.ledgerEntries) {
+      const c = compOf(l.ledgerName);
+      if (!c) continue;
+      anyTax = true;
+      comp[c] += l.type === taxSide ? l.amount || 0 : -(l.amount || 0);
+    }
+    if (anyTax) {
+      if (!this.gstBreakup) this.gstBreakup = {};
+      for (const k of Object.keys(comp)) this.gstBreakup[k] = r2(comp[k]);
+    }
+    if (this.partyLedgerId) {
+      const partySide = taxSide === "Cr" ? "Dr" : "Cr";
+      const partyLines = this.ledgerEntries.filter((l) => l.ledgerId && String(l.ledgerId) === String(this.partyLedgerId));
+      const partyAmt = partyLines.reduce((s, l) => s + (l.type === partySide ? l.amount || 0 : -(l.amount || 0)), 0);
+      if (partyLines.length && partyAmt > 0) this.grandTotal = r2(partyAmt);
+    }
+  }
+
   // GST aggregate
   if (this.gstBreakup) {
     this.gstBreakup.total =
@@ -733,8 +775,10 @@ tallyVoucherSchema.pre("save", function (next) {
 
   // Financial year string ("2025-26") from voucherDate
   if (this.voucherDate && !this.financialYear) {
-    const d = new Date(this.voucherDate);
-    const y = d.getMonth() >= 3 ? d.getFullYear() : d.getFullYear() - 1;
+    /* India's calendar, whatever the server's time zone: a voucher stored at
+       India's midnight on 1 April is 31 March in UTC (16 Oct 2026 audit) */
+    const d = new Date(new Date(this.voucherDate).getTime() + 330 * 60000);
+    const y = d.getUTCMonth() >= 3 ? d.getUTCFullYear() : d.getUTCFullYear() - 1;
     this.financialYear = `${y}-${(y + 1).toString().slice(2)}`;
   }
 

@@ -1,0 +1,11 @@
+{
+  "version": "garment-v1",
+  "terms": [
+    {
+      "id": "material.polyester",
+      "canonicalText": "polyester",
+      "type": "material",
+      "aliases": ["polyster", "poly star", "police star", "poly ester"]
+    }
+  ]
+}

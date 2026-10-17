@@ -1139,6 +1139,8 @@ async function createMrfRequest(req, res) {
       })
     } else {
       mrfNotify.submitted(mrf).catch(e => console.error("[mrf submitted notify]", e.message))
+      require("../../../../services/mrfVoiceApproval.service").enqueue(mrf)
+        .catch(e => console.error("[mrf voice approval enqueue]", e.message))
     }
 
     const obj = itemApproval.annotate(mrf.toObject())

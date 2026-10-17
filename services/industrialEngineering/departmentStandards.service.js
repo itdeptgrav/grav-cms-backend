@@ -36,6 +36,27 @@ function timeFor(pieces, std) {
   };
 }
 
+/* Which batch figures each department's standard carries (the CMS's
+   lib/production/stageProfiles.mjs names the same, with its words). */
+const BATCH_FIELDS = Object.freeze({
+  cutting: ["machines", "perBatch", "minutesPerBatch"],
+  washing: ["machines", "perBatch", "minutesPerBatch"],
+  embroidery: ["machines", "perBatch", "minutesPerBatch"],
+  packaging: ["perBatch"],
+});
+const FIELD_WORDS = { machines: "Machines (tables)", perBatch: "Pieces per batch", minutesPerBatch: "Minutes per batch" };
+
+/* A department's batch figures, complete or null — PPC fills its plan only
+   from a complete set. Cutting's first-version field is read as its batch. */
+function batchOf(doc, department = doc?.department) {
+  const need = BATCH_FIELDS[department];
+  if (!need || !doc) return null;
+  let b = doc.batch;
+  if (!b && department === "cutting" && doc.cutting) b = { machines: doc.cutting.tables, perBatch: doc.cutting.garmentsPerLay, minutesPerBatch: doc.cutting.minutesPerLay };
+  if (!b || !need.every((k) => b[k] > 0)) return null;
+  return Object.fromEntries(need.map((k) => [k, b[k]]));
+}
+
 const publicRow = (department, doc) => ({
   department,
   ...DEPARTMENT_META[department],
@@ -45,6 +66,7 @@ const publicRow = (department, doc) => ({
   hoursPerDay: doc?.hoursPerDay ?? null,
   efficiencyPct: doc?.efficiencyPct ?? null,
   notes: doc?.notes || "",
+  batch: batchOf(doc, department),
   capacity: doc ? capacityOf(doc) : null,
   updatedBy: doc?.updatedBy?.name || "",
   updatedAt: doc?.updatedAt || null,
@@ -69,7 +91,7 @@ async function standardsFor(companyId) {
   return new Map(docs.map((d) => [d.department, { ...d, capacity: capacityOf(d) }]));
 }
 
-function validate(body) {
+function validate(body, department) {
   const b = body || {};
   const num = (k, label, min, max, integer = false) => {
     const v = Number(b[k]);
@@ -84,12 +106,30 @@ function validate(body) {
     hoursPerDay: num("hoursPerDay", "Hours per day", 0.5, 24),
     efficiencyPct: num("efficiencyPct", "Efficiency %", 1, 150),
     notes: String(b.notes || "").trim().slice(0, 500),
+    ...(BATCH_FIELDS[department] ? { batch: validateBatch(b.batch, BATCH_FIELDS[department]) } : {}),
   };
+}
+
+/* All of a department's batch figures or none: half of them cannot be
+   planned from. */
+function validateBatch(c, need) {
+  if (c == null) return null;
+  const limits = { machines: [1, 200], perBatch: [1, 20000], minutesPerBatch: [1, 1440] };
+  const given = need.filter((k) => c[k] !== "" && c[k] != null);
+  if (!given.length) return null;
+  if (given.length < need.length) throw new StandardError(400, `${need.map((k) => FIELD_WORDS[k]).join(", ")} are set together. Enter all of them, or leave them all blank.`);
+  const out = {};
+  for (const k of need) {
+    const v = Number(c[k]); const [min, max] = limits[k];
+    if (!Number.isFinite(v) || v < min || v > max || v !== Math.floor(v)) throw new StandardError(400, `${FIELD_WORDS[k]} must be a whole number between ${min} and ${max}.`);
+    out[k] = v;
+  }
+  return out;
 }
 
 async function upsert(companyId, department, body, actor) {
   if (!DEPARTMENTS.includes(department)) throw new StandardError(404, "No such department.");
-  const values = validate(body);
+  const values = validate(body, department);
   const now = new Date();
   const existing = await IeDepartmentStandard.findOne({ companyId, department });
   if (existing) {
@@ -103,4 +143,4 @@ async function upsert(companyId, department, body, actor) {
   return publicRow(department, doc.toObject());
 }
 
-module.exports = { list, standardFor, standardsFor, upsert, capacityOf, timeFor, StandardError };
+module.exports = { list, standardFor, standardsFor, upsert, capacityOf, batchOf, BATCH_FIELDS, timeFor, StandardError, _validate: validate };

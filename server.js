@@ -1725,6 +1725,20 @@ app.use("/api/cms/music", require("./routes/music/webPlayer.routes"));
 // broad /api/cms employee-auth router just like the signed Music stream route.
 app.use("/api/cms/voice", require("./routes/CMS_Routes/Voice/voice"));
 
+/* MRF voice approval has both employee-browser endpoints and two
+ * worker-secret endpoints. Keep it above the broad /api/cms auth router so
+ * that router cannot interpret the worker bearer token as an employee JWT.
+ * The MRF voice router applies EmployeeAuth to its browser endpoints itself;
+ * the feature flag still controls whether new approval calls are queued. */
+app.use(
+  "/api/cms/mrf-voice-approvals",
+  require("./routes/CMS_Routes/Inventory/Operations/mrfVoiceApprovalRoutes"),
+);
+app.use(
+  "/api/cms/voice-automation",
+  require("./routes/CMS_Routes/VoiceAutomation/morningBriefRoutes"),
+);
+
 const productOperations = require("./routes/CMS_Routes/Inventory/Configurations/operations.js");
 app.use("/api/cms", productOperations);
 
@@ -1814,6 +1828,10 @@ app.use(
   "/api/cms/crm/sample-styles",
   require("./routes/CMS_Routes/Sales/sampleStyles"),
 );
+
+// Native GRAV Studio — private designer-to-CMS asset delivery. This route
+// never exposes the server-only Grav Storage credential to Studio or a browser.
+app.use("/api/studio/v1", require("./routes/Studio/studioApi"));
 
 // The Project Manager's BOM approve/reject lives at /api/public/bom-approval
 // — see its mount much earlier in this file, above the /api/cms guard.
@@ -1936,6 +1954,11 @@ app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/ppm
    Merchandising grant of any level opens nothing here — which is the whole
    point: Merchandising hands off, and the receiving decision stays PPC's. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
+
+/* ── FOLLOW-UPS BETWEEN THE PRODUCTION MANAGER, MERCHANDISING AND R&D ─────
+   (9 Oct 2026). One thing one department waits on another for, owned by a
+   named person with a date; raised by hand or at a style hand-off. */
+app.use("/api/cms/follow-ups", require("./routes/CMS_Routes/FollowUps/followUpsRoute"));
 
 /* ── AND THE SECOND INBOUND QUEUE: ISSUED IE RELEASES ────────────────────
    Same mount, same live `ppc` grant, PPC's own receipt collection. Industrial
@@ -2524,6 +2547,13 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", ieOrDepartmentWrites(productionSupervisorWrites("machine layout")), productionMachineLayout);
 
+// The Order simulation's history (3 Oct 2026): every finished run, to open
+// again or compare. A record of a what-if, not a production write — the
+// router authenticates and lets only whoever ran a run (or an admin) rename
+// or delete it; no department approval queue in front.
+const orderSimulationRoutes = require("./routes/CMS_Routes/Production/Dashboard/orderSimulationRoutes");
+app.use("/api/cms/production/order-simulations", orderSimulationRoutes);
+
 /* ---------------------------------------------------------------------
  * The scanner floor's READ routers (restored 25 Sep 2026).
  *
@@ -2654,6 +2684,11 @@ app.use("/api/google", googleWorkspaceRoutes);
 // inside, the legacy Google/Cowork router so its app grant and OAuth boundary
 // cannot widen access to Cowork's employee-id endpoints.
 app.use("/api/cms/mail", mailRoutes);
+
+// Chat deliberately owns two visibly separate lanes: OpenWA WhatsApp for
+// customers and employee-only company messaging. Its pairing QR never appears
+// in Sales or in a general status endpoint.
+app.use("/api/cms/chat", require("./routes/chat/chatRoutes"));
 
 // HR Department Routes
 const appVersionRoutes = require("./routes/HrRoutes/Appversionroutes");
@@ -4046,6 +4081,19 @@ try {
   console.warn("⚠️ Pending-work reminders not started:", err.message);
 }
 
+/* Opt-in morning brief calls. The scheduler only materialises a bounded,
+   idempotent occurrence during the employee's selected ten-minute window;
+   the workflow service owns leave suppression and duplicate protection. */
+try {
+  if (!skipBackgroundJob("morning brief voice calls")) {
+    const { startScheduler } = require("./services/morningBriefVoice.service");
+    startScheduler();
+    console.log("✅ Morning brief voice scheduler initialized");
+  }
+} catch (err) {
+  console.warn("⚠️ Morning brief voice scheduler not started:", err.message);
+}
+
 // Close out CoWork sessions left online by somebody who has already punched
 // out on the biometric device. Runs at 23:30 IST, after the hourly attendance
 // sync above has brought the evening's punches in — it reads that data rather
@@ -4059,6 +4107,15 @@ try {
   }
 } catch (e) {
   console.warn("⚠️ Cowork punch-out offline sync not available:", e.message);
+}
+
+// The follow-ups' morning reminder: overdue and due-today, one email a person.
+try {
+  if (!skipBackgroundJob("follow-up reminders (09:30 IST)")) {
+    require("./services/followUps/followUps.service").startFollowUpReminders();
+  }
+} catch (e) {
+  console.warn("⚠️ Follow-up reminders not available:", e.message);
 }
 
 // Start persistent OT reminder notifications (random 5-20 min intervals)

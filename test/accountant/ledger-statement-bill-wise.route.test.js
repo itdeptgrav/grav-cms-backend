@@ -14,10 +14,20 @@
 const express = require("express");
 const mongoose = require("mongoose");
 
+/* The ledger routes check the ledger's company against the caller's
+   organisation (16 Oct 2026 audit), so the tester belongs to one: by default
+   it owns every company in this test database; `x-test-org` overrides it. */
 jest.mock("../../Middlewear/AccountantAuthMiddleware", () => ({
-  accountantAuth: (req, res, next) => {
+  accountantAuth: async (req, res, next) => {
     const raw = req.headers["x-test-user"];
     req.user = raw ? JSON.parse(raw) : { id: "tester", permissions: { canEdit: true } };
+    const org = req.headers["x-test-org"];
+    if (org) req.organization = JSON.parse(org);
+    else {
+      const { Acc_Company } = require("../../models/Accountant_model/Acc_MasterModels");
+      const ids = await Acc_Company.find({}).distinct("_id");
+      req.organization = { tallyCompanyIds: ids.map(String) };
+    }
     next();
   },
 }));
@@ -39,8 +49,10 @@ afterAll(async () => {
   await new Promise((r) => server.close(r));
 });
 
-async function call(path) {
-  const res = await fetch(`${base}${path}`, { headers: { "x-test-user": JSON.stringify({ id: "t", permissions: { canEdit: true } }) } });
+async function call(path, extraHeaders = {}) {
+  const res = await fetch(`${base}${path}`, {
+    headers: { "x-test-user": JSON.stringify({ id: "t", permissions: { canEdit: true } }), ...extraHeaders },
+  });
   return { status: res.status, body: await res.json() };
 }
 
@@ -210,6 +222,15 @@ describe("GET /ledgers/:id/statement — billWiseOutstanding (migrated, C0-D)", 
     const fx = await makeFixture();
     const { body } = await call(`/ledgers/${fx.salesLedger._id}/statement`);
     expect(body.billWiseOutstanding).toBeNull();
+  });
+
+  test("another organisation's ledger is refused, whatever company is named", async () => {
+    const fx = await makeFixture();
+    const other = { "x-test-org": JSON.stringify({ tallyCompanyIds: [String(new mongoose.Types.ObjectId())] }) };
+    expect((await call(`/ledgers/${fx.customer._id}/statement`, other)).status).toBe(403);
+    expect((await call(`/ledgers/${fx.customer._id}`, other)).status).toBe(403);
+    const named = await call(`/ledgers/${fx.customer._id}/statement?companyId=${new mongoose.Types.ObjectId()}`);
+    expect(named.status).toBe(403);
   });
 
   test("multiple open bills all appear, sorted by days overdue", async () => {

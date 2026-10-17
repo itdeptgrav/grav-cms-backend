@@ -116,6 +116,11 @@ const barcodeSchema = new mongoose.Schema(
          `applied`, `baseDelta`, `transactionId`, or `error` / `errorCode`
          / `skipped`. Null when the person unticked the box. */
       stock: { type: mongoose.Schema.Types.Mixed, default: null },
+      /* The variant this edit moved the label off and onto (16 Oct 2026,
+         owner: a sticker printed for the wrong variant is corrected on the
+         same screen) — { variantId, combination }; null on a figure-only edit. */
+      variantFrom: { type: mongoose.Schema.Types.Mixed, default: null },
+      variantTo: { type: mongoose.Schema.Types.Mixed, default: null },
     }],
 
     // ── Optional PO link (nullable) ──────────────────────────────────────────

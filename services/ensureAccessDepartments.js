@@ -36,7 +36,7 @@ const DEPARTMENTS = [
     legacyModel: "CEODepartment", legacyCollection: "ceodepartments",
     legacyUserType: "ceo", dashboardPath: "/ceo/dashboard",
     description: "Company-wide reporting and oversight." },
-  { key: "project_manager", slug: "project-manager", name: "Project Manager", sortOrder: 30,
+  { key: "project_manager", slug: "project-manager", name: "Production Management", sortOrder: 30,
     legacyModel: "ProjectManager", legacyCollection: "projectmanagers",
     legacyUserType: "project_manager", dashboardPath: "/project-manager/dashboard",
     description: "Production planning, work orders and scheduling." },
@@ -51,6 +51,20 @@ const DEPARTMENTS = [
     legacyModel: null, legacyCollection: null,
     legacyUserType: "mail", dashboardPath: "/mail/inbox",
     description: "Internal employee mail and connected Gmail in one inbox." },
+  // Chat is deliberately separate from Sales and Mail. It owns company chat
+  // plus the operator-facing OpenWA connection surface; granting Chat does not
+  // grant Sales CRM or Gmail access.
+  { key: "chat", slug: "chat", name: "Chat", sortOrder: 43,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "chat", dashboardPath: "/chat",
+    description: "Internal company chat and external WhatsApp conversations." },
+  // Requests is the employee ask desk. Keep the historic `mrf` slug because
+  // routes and existing role grants key on it; the product name and tile say
+  // Requests, and both /mrf and /requests open the same application.
+  { key: "mrf", slug: "mrf", name: "Requests", sortOrder: 44,
+    legacyModel: null, legacyCollection: null,
+    legacyUserType: "mrf", dashboardPath: "/mrf",
+    description: "Ask for materials or services and track approvals." },
   // Merchandising — internal coordination of a confirmed requirement, worked
   // from a Style. No legacy collection of its own (no legacy merchandiser
   // logins exist), so it only registers the department + onboarding tile; a
@@ -76,19 +90,19 @@ const DEPARTMENTS = [
     legacyModel: "StoreDepartment", legacyCollection: "storedepartments",
     legacyUserType: "store", dashboardPath: "/store/dashboard/overview",
     description: "Raw materials, stock and purchasing." },
-  { key: "mpc", slug: "mpc-measurement", name: "MPC Measurement", sortOrder: 70,
+  { key: "mpc", slug: "mpc-measurement", name: "Measurement", sortOrder: 70,
     legacyModel: "MpcMeasurement", legacyCollection: "mpcmeasurements",
     legacyUserType: "mpc-measurement", dashboardPath: "/mpc-measurement/dashboard",
     description: "Measurement collection and sizing." },
-  { key: "cutting", slug: "cutting-master", name: "Cutting Master", sortOrder: 80,
+  { key: "cutting", slug: "cutting-master", name: "Cutting", sortOrder: 80,
     legacyModel: "CuttingMasterDepartment", legacyCollection: "cuttingmasterdepartments",
-    legacyUserType: "cutting-master", dashboardPath: "/cutting-master/dashboard",
+    legacyUserType: "cutting-master", dashboardPath: "/cutting-master/dashboard/overview",
     description: "Fabric cutting and marker planning." },
   { key: "embroidery", slug: "embroidery", name: "Embroidery", sortOrder: 90,
     legacyModel: "EmbroideryDepartment", legacyCollection: "embroiderydepartments",
     legacyUserType: "embroidery", dashboardPath: "/embroidery/dashboard/overview",
     description: "Embroidery motifs and production." },
-  { key: "prod_supervisor", slug: "production-supervisor", name: "Production Supervisor", sortOrder: 100,
+  { key: "prod_supervisor", slug: "production-supervisor", name: "Production", sortOrder: 100,
     legacyModel: "ProductionSupervisorDepartment", legacyCollection: "productionsupervisordepartments",
     legacyUserType: "production-supervisor", dashboardPath: "/production-supervisor/dashboard",
     description: "Shop-floor supervision and progress." },
@@ -101,7 +115,7 @@ const DEPARTMENTS = [
      department, which is exactly what makes it appear in CEO → Access Control
      and therefore GRANTABLE from there. That grant is the whole access model:
      routes/DevOps/developer.js checks DepartmentRole("developer"). */
-  { key: "developer", slug: "developer", name: "Developer", sortOrder: 125,
+  { key: "developer", slug: "developer", name: "IT", sortOrder: 125,
     legacyModel: null, legacyCollection: "developerdepartments",
     legacyUserType: "developer", dashboardPath: "/developer",
     description: "Cross-department history, anomaly alerts, live settings and system health." },

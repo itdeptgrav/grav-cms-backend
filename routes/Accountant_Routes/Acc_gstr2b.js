@@ -20,6 +20,7 @@
 // =============================================================================
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const { Acc_GSTR2B } = require("../../models/Accountant_model/Acc_GSTR2B");
@@ -131,11 +132,15 @@ async function ensureIndexMigration() {
 // (some accountants type "INV/001/26-27", suppliers file "INV-001-26-27").
 function normInvNum(s) {
   if (!s) return "";
-  return String(s)
-    .toUpperCase()
-    .replace(/\s+/g, "")
-    .replace(/[\/\-\_\.]/g, "")
-    .replace(/^0+/, "");
+  /* (16 Oct 2026 audit) Leading zeros are dropped from EVERY number in it,
+     not only at the very start, so "INV-0001" meets "INV-1"; and a boundary
+     is kept between two numbers, so "INV/12/6" and "INV/1/26" stay apart
+     instead of both becoming "INV126". "INV/001/26-27", "INV-001-26-27" and
+     "INV001/26-27" are still one number. */
+  let t = String(s).toUpperCase().replace(/\s+/g, "").replace(/[\/\-_.]+/g, "|");
+  t = t.replace(/\d+/g, (d) => d.replace(/^0+(?=\d)/, ""));
+  t = t.replace(/\|(?!\d)|(?<!\d)\|/g, "");
+  return t.replace(/^\|+|\|+$/g, "");
 }
 
 const MONTH_ABBR = {
@@ -1176,15 +1181,8 @@ async function computeRecon(req, res, { persist }) {
     // window (period start − 1 month to period end + 1 month) to catch
     // invoices the supplier may have filed in a different return period than
     // we booked them.
-    const startOfPeriod = new Date(doc.periodYear, doc.periodMonth - 1, 1);
-    const endOfPeriod = new Date(
-      doc.periodYear,
-      doc.periodMonth,
-      0,
-      23,
-      59,
-      59,
-    );
+    /* the return month in India, whatever the server's own time zone */
+    const { from: startOfPeriod, to: endOfPeriod } = istMonthBounds(doc.periodYear, doc.periodMonth);
     const windowStart = new Date(startOfPeriod);
     windowStart.setMonth(windowStart.getMonth() - 1);
     const windowEnd = new Date(endOfPeriod);
@@ -1210,7 +1208,7 @@ async function computeRecon(req, res, { persist }) {
       status: "posted",
     })
       .select(
-        "voucherNumber voucherDate voucherType partyLedgerName partyLedgerId partyGstin ledgerEntries inventoryEntries",
+        "voucherNumber referenceNumber voucherDate voucherType partyLedgerName partyLedgerId partyGstin ledgerEntries inventoryEntries",
       )
       .lean();
 
@@ -1236,7 +1234,12 @@ async function computeRecon(req, res, { persist }) {
             break;
           }
         }
-      } // Sum GST line amounts from ledgerEntries that look like tax ledgers.
+      }
+      /* A journal with no supplier is a GST set-off or adjustment (Cr Input
+         CGST against Payable), not a supplier's invoice — reading it as one
+         filled "Only in books" with the month's set-offs (16 Oct 2026 audit). */
+      if (v.voucherType === "journal" && !supplierGSTIN) continue;
+      // Sum GST line amounts from ledgerEntries that look like tax ledgers.
       // Everything else on a purchase voucher (purchase/expense/discount
       // ledger, etc.) contributes to the taxable base — NOT just lines named
       // "purchase". A telephone expense voucher posts to "Telephone Expenses"
@@ -1249,11 +1252,18 @@ async function computeRecon(req, res, { persist }) {
       let taxableValue = 0;
       for (const le of v.ledgerEntries || []) {
         const lname = (le.ledgerName || "").toLowerCase();
-        // Tally import uses amount + type; newer entries use signedAmount
-        const amt =
-          le.signedAmount != null
-            ? Math.abs(Number(le.signedAmount))
-            : Number(le.amount || 0);
+        /* SIGNED, from the buyer's side (16 Oct 2026 audit): a debit is +, a
+           credit is −. A purchase discount (Cr) lowers the taxable value, and
+           a debit note (Cr Input GST, Cr Purchase Returns) comes out negative
+           — the sign the portal gives a supplier's credit note. Taking the
+           absolute value put every note in "mismatched" by twice its amount
+           and ADDED its tax to the books' total. */
+        const amt = le.type === "Cr" ? -Number(le.amount || 0) : Number(le.amount || 0);
+        /* Only INPUT tax is the credit 2B reports. A reverse-charge bill
+           carries the liability (Cr Output … RCM) beside the credit (Dr Input
+           … RCM); counting both cancelled the credit out. */
+        const isOutputTax = /output|payable/.test(lname) && /gst|cess/.test(lname);
+        if (isOutputTax) continue;
         if (/cgst/.test(lname)) cgst += amt;
         else if (/sgst|utgst/.test(lname)) sgst += amt;
         else if (/igst/.test(lname)) igst += amt;
@@ -1270,7 +1280,13 @@ async function computeRecon(req, res, { persist }) {
         _id: v._id,
         partyLedgerId: v.partyLedgerId ? String(v.partyLedgerId) : null,
         voucherType: v.voucherType,
-        bookDocNumber: v.voucherNumber || "",
+        /* the SUPPLIER's invoice number — what the portal carries. The bill
+           form keeps it as `referenceNumber`; our own voucher number
+           ("PUR/0012") never matched a 2B record, so every bill entered here
+           sat in "Only in books" and its 2B twin in "Only in 2B". Imported
+           bills carry the supplier's number as the voucher number itself. */
+        bookDocNumber: (v.voucherType !== "journal" && String(v.referenceNumber || "").trim()) || v.voucherNumber || "",
+        ourVoucherNumber: v.voucherNumber || "",
         bookDocDate: v.voucherDate,
         partyLedgerName: v.partyLedgerName || "",
         supplierGSTIN,
@@ -1424,7 +1440,15 @@ async function computeRecon(req, res, { persist }) {
       const diffTaxable = Math.abs(r2b.taxableValue - book.taxableValue);
       const diffTotalTax = Math.abs(taxR2b - book.totalTax);
 
-      const amountsMatch = diffTaxable <= amtTol && diffTotalTax <= amtTol;
+      /* The tax HEAD must agree (16 Oct 2026 audit): a bill booked as CGST +
+         SGST that the supplier filed as IGST is not credit you may take as
+         booked, even when the totals agree. Small differences inside the
+         split still do not drive the bucket. */
+      const headOf = (x) => ((x.igst || 0) > amtTol ? "igst" : (x.cgst || 0) + (x.sgst || 0) > amtTol ? "cgst+sgst" : "none");
+      const headR2b = headOf(r2b);
+      const headBook = headOf(book);
+      const headsDiffer = headR2b !== "none" && headBook !== "none" && headR2b !== headBook;
+      const amountsMatch = diffTaxable <= amtTol && diffTotalTax <= amtTol && !headsDiffer;
 
       // Date diff — informational only (shown in the UI, never affects match).
       let daysDiff = null;
@@ -1460,6 +1484,8 @@ async function computeRecon(req, res, { persist }) {
           reasons.push(`taxable value differs by ₹${diffTaxable.toFixed(2)}`);
         if (diffTotalTax > amtTol)
           reasons.push(`tax amount differs by ₹${diffTotalTax.toFixed(2)}`);
+        if (headsDiffer)
+          reasons.push(`filed as ${headR2b.toUpperCase()} but booked as ${headBook.toUpperCase()}`);
         mismatched.push({ ...entry, reasons });
       }
     }

@@ -19,6 +19,7 @@
 "use strict";
 
 const express = require("express");
+const { liveBalances, liveBalanceOf, openingSigned } = require("../../services/accounting/ledgerBalance");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const XLSX = require("xlsx");
@@ -1124,9 +1125,17 @@ router.get("/bank-ledgers", companyScope, async (req, res) => {
       isActive: true,
       groupId: { $in: bankGroups.map((g) => g._id) },
     })
-      .select("_id name groupName currentBalance balanceType bankDetails.accountNumber bankDetails.bankName")
+      .select("_id name groupName companyId openingBalance openingBalanceType bankDetails.accountNumber bankDetails.bankName")
       .sort({ name: 1 })
       .lean();
+    /* the real balance (opening + posted vouchers), not the drifting cache */
+    const live = await liveBalances(companyId, ledgers);
+    for (const l of ledgers) {
+      const b = live.get(String(l._id)) || { balance: 0, type: "Dr" };
+      l.currentBalance = b.balance;
+      l.balanceType = b.type;
+      l.currentBalanceType = b.type;
+    }
     res.json({ success: true, ledgers });
   } catch (e) {
     res.status(500).json({ success: false, message: e.message });

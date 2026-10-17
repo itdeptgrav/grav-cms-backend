@@ -210,7 +210,7 @@ async function applyLedgerBalances(voucher, direction, session) {
     if (!lid) continue;
     const led = await Acc_Ledger.findById(lid).session(session);
     if (led) {
-      led.balanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
+      led.currentBalanceType = led.currentBalance >= 0 ? "Dr" : "Cr";
       await led.save({ session });
     }
   }

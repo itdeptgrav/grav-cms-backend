@@ -32,6 +32,8 @@
 //          (invoices, receipts, payments, journals — all of them)
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
+const { openingSigned } = require("../../services/accounting/ledgerBalance");
 const mongoose = require("mongoose");
 const {
   Acc_Voucher,
@@ -106,7 +108,7 @@ async function groupIdsForKind(cId, kind) {
 async function balanceByLedger(cId, ledgerIds) {
   if (!ledgerIds.length) return new Map();
   const agg = await Acc_Voucher.aggregate([
-    { $match: { companyId: cId, status: "posted" } },
+    { $match: { companyId: cId, status: "posted", isOptional: { $ne: true }, "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     { $unwind: "$ledgerEntries" },
     { $match: { "ledgerEntries.ledgerId": { $in: ledgerIds } } },
     {
@@ -327,12 +329,8 @@ router.get("/:ledgerId/transactions", auth, companyScope, async (req, res) => {
     };
     if (from || to) {
       match.voucherDate = {};
-      if (from) match.voucherDate.$gte = new Date(from);
-      if (to) {
-        const e = new Date(to);
-        e.setHours(23, 59, 59, 999);
-        match.voucherDate.$lte = e;
-      }
+      if (from) match.voucherDate.$gte = istStart(from);
+      if (to) match.voucherDate.$lte = istEnd(to);
     }
 
     const vouchers = await Acc_Voucher.find(match)
@@ -343,12 +341,26 @@ router.get("/:ledgerId/transactions", auth, companyScope, async (req, res) => {
       .lean();
 
     // Build a running statement for THIS ledger.
-    const led = await Acc_Ledger.findById(lId)
+    const led = await Acc_Ledger.findOne({ _id: lId, companyId: cId })
       .select("name openingBalance openingBalanceType")
       .lean();
-    let running =
-      (led && led.openingBalanceType === "Cr" ? -1 : 1) *
-      Math.abs((led && led.openingBalance) || 0);
+    /* ── THE OPENING AT `from` (16 Oct 2026 audit) ────────────────────────
+       With a From date the running balance started at the master opening and
+       skipped every voucher before From, so every running and closing figure
+       was out by that history. The opening is the master opening plus every
+       posted movement before From — the statement's own rule
+       (partyOutstanding.partyLedgerStatement). */
+    let openingAtFrom = openingSigned(led);
+    if (from) {
+      const before = await Acc_Voucher.aggregate([
+        { $match: { companyId: cId, status: "posted", "ledgerEntries.ledgerId": lId, voucherDate: { $lt: istStart(from) } } },
+        { $unwind: "$ledgerEntries" },
+        { $match: { "ledgerEntries.ledgerId": lId } },
+        { $group: { _id: null, net: { $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", { $multiply: ["$ledgerEntries.amount", -1] }] } } } },
+      ]);
+      openingAtFrom += before[0] ? before[0].net : 0;
+    }
+    let running = openingAtFrom;
 
     const rows = [];
     for (const v of vouchers) {
@@ -381,10 +393,8 @@ router.get("/:ledgerId/transactions", auth, companyScope, async (req, res) => {
     res.json({
       ledgerId: lId,
       name: led ? led.name : null,
-      openingBalance: Math.abs(
-        (led && led.openingBalanceType === "Cr" ? -1 : 1) *
-          Math.abs((led && led.openingBalance) || 0),
-      ),
+      openingBalance: Math.abs(openingAtFrom),
+      openingType: openingAtFrom < 0 ? "Cr" : "Dr",
       count: rows.length,
       transactions: rows,
       closingBalance: Math.abs(running),

@@ -381,13 +381,24 @@ function agedBillsForLedger(bills, { asOf, closingBalance, fallbackFirstDate = n
   const when = asOf instanceof Date ? asOf : new Date(asOf);
   const buckets = { current: 0, "0-30": 0, "31-60": 0, "61-90": 0, "90+": 0 };
   const openBills = [];
+  /* ── BUCKETS ARE MEASURED ON THE BALANCE'S OWN SIDE (16 Oct 2026 audit) ──
+     Every open item used to be added as its absolute value, so an advance or
+     an on-account receipt (a credit on a customer) counted as MORE owed: a
+     ₹1 lakh invoice with ₹20k paid on account showed ₹1.2 lakh in the
+     buckets against an ₹80k balance. Items on the balance's side now count
+     up and items on the other side count down, so the buckets add up to the
+     outstanding the page prints beside them. */
+  const side = typeof closingBalance === "number" && closingBalance < 0 ? -1 : 1;
 
   for (const bill of bills || []) {
     if (!bill) continue;
     if (Math.abs(bill.remaining) < LEDGER_DETAIL_SETTLED_THRESHOLD) continue; // settled
 
-    const dueDate = bill.dueDate || null;
-    const creditDays = bill.creditDays || 0;
+    /* The INVOICE's due date (the row that raised the bill), as the Ageing
+       report reads it — not whichever row came first, which is often a
+       receipt's. */
+    const dueDate = bill.refDueDate || bill.dueDate || null;
+    const creditDays = bill.refCreditDays != null ? bill.refCreditDays : bill.creditDays || 0;
     const daysOverdue = dueDate
       ? Math.max(0, Math.floor((when - new Date(dueDate)) / 86400000))
       : Math.max(
@@ -400,7 +411,7 @@ function agedBillsForLedger(bills, { asOf, closingBalance, fallbackFirstDate = n
     if (daysOverdue > 30) bucket = "31-60";
     if (daysOverdue > 60) bucket = "61-90";
     if (daysOverdue > 90) bucket = "90+";
-    buckets[bucket] += Math.abs(bill.remaining);
+    buckets[bucket] += bill.remaining * side;
 
     openBills.push({
       billName: bill.billName,
@@ -444,7 +455,7 @@ function agedBillsForLedger(bills, { asOf, closingBalance, fallbackFirstDate = n
       bucket: "current",
       voucherCount: 0,
     });
-    buckets.current += Math.abs(unallocated);
+    buckets.current += unallocated * side;
   }
 
   openBills.sort((a, b) => b.daysOverdue - a.daysOverdue);

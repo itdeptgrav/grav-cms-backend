@@ -13,6 +13,7 @@
 // =============================================================================
 
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const mongoose = require("mongoose");
 const router = express.Router();
 const { accountantAuth } = require("../../Middlewear/AccountantAuthMiddleware");
@@ -287,8 +288,8 @@ router.get("/", companyScope, async (req, res) => {
     if (status) filter.status = status;
     if (from || to) {
       filter.voucherDate = {};
-      if (from) filter.voucherDate.$gte = new Date(from);
-      if (to) filter.voucherDate.$lte = new Date(to);
+      if (from) filter.voucherDate.$gte = istStart(from);
+      if (to) filter.voucherDate.$lte = istEnd(to);
     }
     if (search) {
       const rx = new RegExp(

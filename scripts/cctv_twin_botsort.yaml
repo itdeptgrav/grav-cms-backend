@@ -1,0 +1,15 @@
+# Stable camera-local tracking settings proven in PHONE_DETC.
+# Appearance is used only to keep a transient track attached to the same body;
+# it never assigns a person's name.
+tracker_type: botsort
+track_high_thresh: 0.20
+track_low_thresh: 0.05
+new_track_thresh: 0.35
+track_buffer: 90
+match_thresh: 0.85
+fuse_score: True
+gmc_method: none
+with_reid: True
+model: auto
+proximity_thresh: 0.5
+appearance_thresh: 0.8

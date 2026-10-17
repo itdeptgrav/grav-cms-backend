@@ -5,6 +5,7 @@
  */
 
 const express = require("express");
+const { openingSigned } = require("../../services/accounting/ledgerBalance");
 const mongoose = require("mongoose");
 const router = express.Router();
 const {
@@ -172,10 +173,10 @@ router.get("/trial-balance", auth, companyScope, async (req, res) => {
       let opening, closing;
       if (led.balanceFromTrialBalance === true && !from) {
         // TB-sourced closing. Back-derive the opening.
-        closing = led.openingBalance || 0;
+        closing = openingSigned(led);
         opening = closing - netMove;
       } else {
-        opening = (led.openingBalance || 0) + (priorMap[lid] || 0);
+        opening = openingSigned(led) + (priorMap[lid] || 0);
         closing = opening + netMove;
       }
 
@@ -549,27 +550,46 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
       return name;
     }
 
-    const voucherMatch = {
-      companyId: cId,
-      status: "posted",
-      voucherDate: { $lte: asOfDate },
+    /* ── A BALANCE SHEET IS "AS AT", NEVER "FROM" (16 Oct 2026 audit) ───────
+       A From date used to restrict the movements to from..asOf while still
+       adding them to the opening balance, so every ledger lost all its
+       history before From — a bank at ₹20 lakh on 31 March showed only
+       April's movements. Balances now run from the beginning of the books to
+       asOf, whatever From says. From only sets where the CURRENT period's
+       profit starts (else the start of the financial year that holds asOf);
+       profit before that is shown on its own line, so the two add up to what
+       the revenue and expense ledgers hold and the sheet still balances. */
+    const asOfIst = new Date(asOfDate.getTime() + 330 * 60000);
+    const fyStartYear = asOfIst.getUTCMonth() >= 3 ? asOfIst.getUTCFullYear() : asOfIst.getUTCFullYear() - 1;
+    const periodStart = fromDate || new Date(`${fyStartYear}-04-01T00:00:00.000+05:30`);
+    const signedOf = {
+      $cond: [
+        { $ne: [{ $ifNull: ["$ledgerEntries.signedAmount", null] }, null] },
+        "$ledgerEntries.signedAmount",
+        { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", { $multiply: ["$ledgerEntries.amount", -1] }] },
+      ],
     };
-    if (fromDate) voucherMatch.voucherDate.$gte = fromDate;
-
     const movements = await Acc_Voucher.aggregate([
-      { $match: voucherMatch },
+      { $match: { companyId: cId, status: "posted", isOptional: { $ne: true }, voucherDate: { $lte: asOfDate } } },
       { $unwind: "$ledgerEntries" },
       {
         $group: {
           _id: "$ledgerEntries.ledgerId",
-          net: { $sum: "$ledgerEntries.signedAmount" },
+          net: { $sum: signedOf },
+          period: { $sum: { $cond: [{ $gte: ["$voucherDate", periodStart] }, signedOf, 0] } },
         },
       },
     ]);
     const moveMap = {};
+    const periodMoveMap = {};
     movements.forEach((m) => {
-      if (m && m._id) moveMap[m._id.toString()] = m.net;
+      if (m && m._id) {
+        moveMap[m._id.toString()] = m.net;
+        periodMoveMap[m._id.toString()] = m.period;
+      }
     });
+    let periodRevenue = 0;
+    let periodExpense = 0;
 
     // Compute net profit (revenue - expense) up to asOf and add to equity
     let revenueNet = 0,
@@ -635,8 +655,8 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
       // BALANCE: TB-flagged → stored closing. Otherwise → opening + moves.
       const closing =
         led.balanceFromTrialBalance === true
-          ? led.openingBalance || 0
-          : (led.openingBalance || 0) + (moveMap[led._id.toString()] || 0);
+          ? openingSigned(led)
+          : openingSigned(led) + (moveMap[led._id.toString()] || 0);
 
       const primaryName = getPrimaryGroupName(grp);
       const line = {
@@ -710,8 +730,13 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
       } else if (nature === "asset") buckets.asset.push(line);
       else if (nature === "liability") buckets.liability.push(line);
       else if (nature === "equity") buckets.equity.push(line);
-      else if (nature === "revenue") revenueNet += -closing;
-      else if (nature === "expense") expenseNet += closing;
+      else if (nature === "revenue") {
+        revenueNet += -closing;
+        periodRevenue += -(periodMoveMap[led._id.toString()] || 0);
+      } else if (nature === "expense") {
+        expenseNet += closing;
+        periodExpense += periodMoveMap[led._id.toString()] || 0;
+      }
     });
 
     // Sort each bucket by user-set groupOrder, then alphabetically. Wrapped
@@ -744,6 +769,9 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
     //     piece that was missing/!wrong before and caused the false
     //     "OUT OF BALANCE".
     const netProfit = revenueNet - expenseNet; // <0 = loss, >0 = profit
+    /* the current period's profit (from periodStart) and what came before */
+    const periodProfit = periodRevenue - periodExpense;
+    const earlierProfit = netProfit - periodProfit;
 
     const rawAssets = buckets.asset.reduce((s, x) => s + x.amount, 0); // Dr+
     const rawLiab = buckets.liability.reduce((s, x) => s + x.amount, 0); // signed
@@ -753,29 +781,35 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
     const liabilitiesTotal = -rawLiab;
     let equityTotal = -rawEquity;
 
-    // Assets side carries any current-period LOSS (Tally convention).
+    // Assets side carries a LOSS, equity a PROFIT (Tally convention) — the
+    // current period's and the earlier periods' each on their own line.
     let assetsTotal = rawAssets;
-    if (netProfit < 0) {
-      assetsTotal += Math.abs(netProfit);
-      buckets.asset.push({
-        ledgerName: "Profit & Loss A/c (Current Period Loss)",
-        groupName: "Profit & Loss A/c",
-        amount: Math.abs(netProfit), // Dr on assets side
-        displayAmount: Math.abs(netProfit),
-        signedAmount: Math.abs(netProfit),
-        synthetic: true,
-      });
-    } else if (netProfit > 0) {
-      equityTotal += netProfit;
-      buckets.equity.push({
-        ledgerName: "Net Profit (Current Period)",
-        groupName: "Profit & Loss",
-        amount: -netProfit, // Cr in equity
-        displayAmount: netProfit,
-        signedAmount: -netProfit,
-        synthetic: true,
-      });
-    }
+    const profitLine = (amount, current) => {
+      if (Math.abs(amount) < 0.005) return;
+      if (amount < 0) {
+        assetsTotal += Math.abs(amount);
+        buckets.asset.push({
+          ledgerName: current ? "Profit & Loss A/c (Current Period Loss)" : "Profit & Loss A/c (Loss of Earlier Periods)",
+          groupName: "Profit & Loss A/c",
+          amount: Math.abs(amount), // Dr on assets side
+          displayAmount: Math.abs(amount),
+          signedAmount: Math.abs(amount),
+          synthetic: true,
+        });
+      } else {
+        equityTotal += amount;
+        buckets.equity.push({
+          ledgerName: current ? "Net Profit (Current Period)" : "Profit & Loss A/c (Earlier Periods)",
+          groupName: "Profit & Loss",
+          amount: -amount, // Cr in equity
+          displayAmount: amount,
+          signedAmount: -amount,
+          synthetic: true,
+        });
+      }
+    };
+    profitLine(earlierProfit, false);
+    profitLine(periodProfit, true);
 
     const liabEquityTotal = liabilitiesTotal + equityTotal;
 
@@ -882,6 +916,10 @@ router.get("/balance-sheet", auth, companyScope, async (req, res) => {
         net: sectionNet(buckets.equity),
       },
       netProfit,
+      /* netProfit = periodProfit (from periodStart) + earlierProfit */
+      periodProfit,
+      earlierProfit,
+      periodStart,
       check: {
         assetsTotal,
         liabEquityTotal,
@@ -1117,7 +1155,20 @@ router.get("/cash-flow", auth, companyScope, async (req, res) => {
     })
       .select("_id")
       .lean();
+    /* and every group beneath them (16 Oct 2026 audit): a bank ledger kept
+       under a sub-group of Bank Accounts ("HDFC Current A/cs") was left out
+       of the cash flow while the payment form offered it as a bank */
     const cashGroupIds = cashGroups.map((g) => g._id);
+    let frontier = cashGroupIds;
+    const seenGroups = new Set(cashGroupIds.map(String));
+    while (frontier.length) {
+      const kids = await Acc_Group.find({ companyId: cId, parent: { $in: frontier } }).select("_id").lean();
+      frontier = kids.map((k) => k._id).filter((k) => !seenGroups.has(String(k)));
+      frontier.forEach((k) => {
+        seenGroups.add(String(k));
+        cashGroupIds.push(k);
+      });
+    }
     const cashLedgers = await Acc_Ledger.find({
       companyId: cId,
       groupId: { $in: cashGroupIds },
@@ -1127,6 +1178,7 @@ router.get("/cash-flow", auth, companyScope, async (req, res) => {
     const match = {
       companyId: cId,
       status: "posted",
+      isOptional: { $ne: true },
       "ledgerEntries.ledgerId": { $in: cashLedgerIds },
     };
     if (from || to) {
@@ -1192,7 +1244,44 @@ router.get("/cash-flow", auth, companyScope, async (req, res) => {
       { inflow: 0, outflow: 0, net: 0 },
     );
 
-    res.json({ companyId, dateRange: { from, to }, breakdown, totals });
+    /* ── the statement the page draws (16 Oct 2026 audit) ───────────────
+       services/accounting/cashFlowStatement.js — the page read activities /
+       openingCash / closingCash / internalTransfers and this route never sent
+       them, so every section showed ₹0. */
+    const { buildCashFlow } = require("../../services/accounting/cashFlowStatement");
+    const { openingSigned } = require("../../services/accounting/ledgerBalance");
+    const cashIdSet = new Set(cashLedgerIds.map(String));
+    const allGroups = await Acc_Group.find({ companyId: cId }).select("_id name parent").lean();
+    const groupById = new Map(allGroups.map((g) => [String(g._id), g]));
+    const rootOf = (gid) => {
+      let g = groupById.get(String(gid));
+      for (let i = 0; g && g.parent && groupById.get(String(g.parent)) && i < 25; i++) g = groupById.get(String(g.parent));
+      return g ? g.name : "";
+    };
+    const periodVouchers = await Acc_Voucher.find(match)
+      .select("ledgerEntries.ledgerId ledgerEntries.ledgerName ledgerEntries.groupName ledgerEntries.type ledgerEntries.amount")
+      .lean();
+    const counterpartIds = new Set();
+    for (const v of periodVouchers) for (const e of v.ledgerEntries || []) if (e.ledgerId) counterpartIds.add(String(e.ledgerId));
+    const infoLedgers = await Acc_Ledger.find({ _id: { $in: [...counterpartIds] } }).select("name groupId groupName").lean();
+    const ledgerInfo = new Map(
+      infoLedgers.map((l) => [String(l._id), { name: l.name, groupName: l.groupName || groupById.get(String(l.groupId))?.name || "", rootName: rootOf(l.groupId) }]),
+    );
+    /* cash at the start: the cash ledgers' openings + every posted movement
+       on them before the period */
+    let openingCash = cashLedgers.reduce((sum, l) => sum + openingSigned(l), 0);
+    if (from) {
+      const before = await Acc_Voucher.aggregate([
+        { $match: { companyId: cId, status: "posted", isOptional: { $ne: true }, voucherDate: { $lt: from }, "ledgerEntries.ledgerId": { $in: cashLedgerIds } } },
+        { $unwind: "$ledgerEntries" },
+        { $match: { "ledgerEntries.ledgerId": { $in: cashLedgerIds } } },
+        { $group: { _id: null, net: { $sum: { $cond: [{ $eq: ["$ledgerEntries.type", "Dr"] }, "$ledgerEntries.amount", { $multiply: ["$ledgerEntries.amount", -1] }] } } } },
+      ]);
+      openingCash += before[0]?.net || 0;
+    }
+    const statement = buildCashFlow({ vouchers: periodVouchers, cashIds: cashIdSet, ledgerInfo, openingCash });
+
+    res.json({ companyId, dateRange: { from, to }, ...statement, breakdown, totals });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1210,11 +1299,9 @@ router.get("/dashboard", auth, companyScope, async (req, res) => {
 
     const today = new Date();
     const thirtyAgo = new Date(today.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const fyStart = new Date(
-      today.getFullYear(),
-      today.getMonth() >= 3 ? 3 : -9,
-      1,
-    );
+    /* 1 April of this Indian FY, at India's midnight (16 Oct 2026 audit) */
+    const { istFyStartYear: fyYearOf } = require("../../services/accounting/istDates");
+    const fyStart = new Date(`${fyYearOf(today)}-04-01T00:00:00.000+05:30`);
 
     const [
       recent30Sales,
@@ -1404,24 +1491,24 @@ router.get("/data-range", auth, companyScopeOptional, async (req, res) => {
       });
     }
 
-    const min = new Date(agg[0].minDate);
-    const max = new Date(agg[0].maxDate);
+    /* India's days, whatever the server's zone (16 Oct 2026 audit): with
+       getMonth() and toISOString() a voucher at India's midnight on 1 April
+       counted in the PREVIOUS year on a UTC server, and on a server in India
+       the year printed as 31 Mar … 30 Mar. */
+    const { istYmd, istFyStartYear } = require("../../services/accounting/istDates");
     // FY that contains the EARLIEST voucher (Indian FY: Apr 1 – Mar 31).
-    const fyStartYear =
-      min.getMonth() >= 3 ? min.getFullYear() : min.getFullYear() - 1;
-    const fyStart = new Date(fyStartYear, 3, 1);
-    const fyEnd = new Date(fyStartYear + 1, 2, 31);
+    const fyStartYear = istFyStartYear(agg[0].minDate);
 
     res.json({
       hasData: true,
-      minDate: min.toISOString().slice(0, 10),
-      maxDate: max.toISOString().slice(0, 10),
+      minDate: istYmd(agg[0].minDate),
+      maxDate: istYmd(agg[0].maxDate),
       count: agg[0].count,
       fy: {
         startYear: fyStartYear,
         label: `FY ${fyStartYear}-${String(fyStartYear + 1).slice(2)}`,
-        start: fyStart.toISOString().slice(0, 10),
-        end: fyEnd.toISOString().slice(0, 10),
+        start: `${fyStartYear}-04-01`,
+        end: `${fyStartYear + 1}-03-31`,
       },
     });
   } catch (e) {
@@ -1451,9 +1538,11 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
     const cId = new mongoose.Types.ObjectId(companyId);
     const today = new Date();
 
-    // Default to current Indian FY (April–March)
-    let fyStart = new Date(today.getFullYear(), 3, 1); // April 1
-    if (today.getMonth() < 3) fyStart.setFullYear(today.getFullYear() - 1);
+    // Default to current Indian FY (April–March), on India's calendar
+    // (16 Oct 2026 audit: server-local dates, so on a UTC server the year
+    // started at 05:30 IST and dropped India-midnight vouchers of 1 April)
+    const { istFyStartYear, istYmd } = require("../../services/accounting/istDates");
+    const fyStart = new Date(`${istFyStartYear(today)}-04-01T00:00:00.000+05:30`);
 
     const dateFrom = from ? new Date(`${from}T00:00:00.000+05:30`) : fyStart;
     const dateTo = to ? new Date(`${to}T23:59:59.999+05:30`) : today;
@@ -1545,8 +1634,6 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
     // expense are now classified by the GROUP's nature and NETTED (signed),
     // exactly like the /profit-loss report, so the dashboard KPI cards and
     // the P&L report can never drift apart again.
-    const receivableGroups = /sundry\s*debtor/i;
-    const payableGroups = /sundry\s*creditor/i;
 
     for (const e of entries) {
       const gn = e.groupName || "";
@@ -1564,14 +1651,6 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
       totalRevenue += revAmt;
       totalExpenses += expAmt;
 
-      // Receivables (Dr balance in Sundry Debtors)
-      if (receivableGroups.test(gn) && sa > 0) {
-        totalReceivables += sa;
-      }
-      // Payables (Cr balance in Sundry Creditors)
-      if (payableGroups.test(gn) && sa < 0) {
-        totalPayables += Math.abs(sa);
-      }
 
       // Count voucher types (deduplicate by voucher _id)
       const vKey = `${e.voucherType}:${e.voucherNumber}`;
@@ -1586,14 +1665,14 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
 
       // Monthly trend (by voucherDate) — uses the same signed, nature-based
       // amounts so the trend reconciles to the KPI cards.
-      const d = new Date(e.voucherDate);
-      const mk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+      // India's day: a voucher at India's midnight on the 1st is that month
+      const dk = istYmd(e.voucherDate);
+      const mk = dk.slice(0, 7);
       if (!monthlyMap[mk]) monthlyMap[mk] = { revenue: 0, expenses: 0 };
       monthlyMap[mk].revenue += revAmt;
       monthlyMap[mk].expenses += expAmt;
 
       // Daily trend
-      const dk = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
       if (!dailyMap[dk]) dailyMap[dk] = { revenue: 0, expenses: 0 };
       dailyMap[dk].revenue += revAmt;
       dailyMap[dk].expenses += expAmt;
@@ -1630,10 +1709,10 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
     const dailyKeys = Object.keys(dailyMap).sort();
     const dailyTrend = dailyKeys.map((dk) => {
       const data = dailyMap[dk];
-      const dd = new Date(dk + "T00:00:00");
+      const [, mm, dday] = dk.split("-").map(Number);
       return {
         day: dk,
-        label: `${dd.getDate()} ${monthNames[dd.getMonth()]}`,
+        label: `${dday} ${monthNames[mm - 1]}`,
         revenue: parseFloat(data.revenue.toFixed(2)),
         expenses: parseFloat(data.expenses.toFixed(2)),
         profit: parseFloat((data.revenue - data.expenses).toFixed(2)),
@@ -1697,6 +1776,28 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
       { $limit: 10 },
     ]);
 
+    /* ── WHAT IS OWED, NOT WHAT WAS BILLED (16 Oct 2026 audit) ─────────────
+       These two cards used to add the period's Dr lines on Sundry Debtors
+       (and Cr lines on Sundry Creditors) — the period's SALES and PURCHASES,
+       with every receipt, payment, credit note and opening left out, and
+       sub-groups missed. The page calls them "Owed, both ways". They are now
+       the outstanding balances as at the period's end, from the very report
+       the Customer / Supplier Outstanding and ageing screens print
+       (services/partyOutstanding.service.js), so the three cannot disagree. */
+    try {
+      const { partyOutstandingReport } = require("../../services/partyOutstanding.service");
+      const [rec, pay] = await Promise.all([
+        partyOutstandingReport("customer", { companyId, asOf: dateTo }),
+        partyOutstandingReport("supplier", { companyId, asOf: dateTo }),
+      ]);
+      totalReceivables = rec && rec.totals ? rec.totals.primaryTotal : 0;
+      totalPayables = pay && pay.totals ? pay.totals.primaryTotal : 0;
+    } catch (e) {
+      console.error("[overview] outstanding:", e.message);
+      totalReceivables = null;
+      totalPayables = null;
+    }
+
     res.json({
       success: true,
       overview: {
@@ -1705,8 +1806,8 @@ router.get("/dashboard-overview", auth, companyScope, async (req, res) => {
           totalRevenue: parseFloat(totalRevenue.toFixed(2)),
           totalExpenses: parseFloat(totalExpenses.toFixed(2)),
           netProfit: parseFloat((totalRevenue - totalExpenses).toFixed(2)),
-          totalReceivables: parseFloat(totalReceivables.toFixed(2)),
-          totalPayables: parseFloat(totalPayables.toFixed(2)),
+          totalReceivables: totalReceivables == null ? null : parseFloat(totalReceivables.toFixed(2)),
+          totalPayables: totalPayables == null ? null : parseFloat(totalPayables.toFixed(2)),
           cashFlow: {
             inflow: parseFloat(totalRevenue.toFixed(2)),
             outflow: parseFloat(totalExpenses.toFixed(2)),

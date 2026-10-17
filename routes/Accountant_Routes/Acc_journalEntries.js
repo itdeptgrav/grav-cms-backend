@@ -8,6 +8,7 @@
 // one. Posting now writes a real journal voucher — see
 // services/journalEntryPosting.service.js for the whole story.
 const express = require("express");
+const { istStart, istEnd, istMonthBounds } = require("../../services/accounting/istDates");
 const router = express.Router();
 const mongoose = require("mongoose");
 const AccountantAuthMiddleware = require("../../Middlewear/AccountantAuthMiddleware");
@@ -88,8 +89,8 @@ router.get("/", async (req, res) => {
     }
     if (startDate || endDate) {
       filter.entryDate = {};
-      if (startDate) filter.entryDate.$gte = new Date(startDate);
-      if (endDate) filter.entryDate.$lte = new Date(endDate);
+      if (startDate) filter.entryDate.$gte = istStart(startDate);
+      if (endDate) filter.entryDate.$lte = istEnd(endDate);
     }
 
     const skip = (parseInt(page) - 1) * parseInt(limit);

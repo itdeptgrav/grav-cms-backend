@@ -126,6 +126,30 @@ async function uploadCompanyFile(buffer, { fileName, mimeType, folderPath = [] }
   };
 }
 
+/**
+ * Replace a document's bytes in place — Save over a workbook from Sheets. Same
+ * Drive object, so its id, name and privacy are untouched; only the content and
+ * size change.
+ */
+async function replaceCompanyFile(driveFileId, buffer, { mimeType } = {}) {
+  const drive = driveClient();
+  const readable = new Readable();
+  readable._read = () => {};
+  readable.push(buffer);
+  readable.push(null);
+  const res = await drive.files.update({
+    fileId: driveFileId,
+    supportsAllDrives: true,
+    media: { mimeType, body: readable },
+    fields: "id, mimeType, size",
+  });
+  return {
+    driveFileId: res.data.id,
+    mimeType: res.data.mimeType || mimeType,
+    bytes: res.data.size ? Number(res.data.size) : buffer.length,
+  };
+}
+
 /** Stream a private document back through our own authenticated route. */
 async function streamCompanyFile(driveFileId) {
   const drive = driveClient();
@@ -168,4 +192,4 @@ async function deleteCompanyFile(driveFileId) {
   }
 }
 
-module.exports = { uploadCompanyFile, streamCompanyFile, deleteCompanyFile };
+module.exports = { uploadCompanyFile, replaceCompanyFile, streamCompanyFile, deleteCompanyFile };

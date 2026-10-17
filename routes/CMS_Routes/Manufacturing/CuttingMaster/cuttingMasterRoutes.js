@@ -162,6 +162,48 @@ router.get("/master-stats", async (req, res) => {
   }
 });
 
+// ── GET /overview?from=&to= ─────────────────────────────────────────────────
+// The cutting overview in one read (16 Oct 2026): every day, shift hour,
+// person and work order of the range, from the cutting masters' own dated
+// records (services/manufacturing/cuttingOverview.js). Each work order also
+// carries its quantity, its cut-so-far and its customer, so the table reads
+// "cut in the range" beside "cut of the order".
+router.get("/overview", async (req, res) => {
+  try {
+    const CuttingMasterRecord = require("../../../../models/CMS_Models/Manufacturing/CuttingMaster/CuttingMasterRecord");
+    const overview = require("../../../../services/manufacturing/cuttingOverview");
+    const shiftHours = require("../../../../services/manufacturing/shiftHours");
+    const range = overview.rangeOf(req.query, shiftHours.istDayKeyOf(new Date()));
+    const records = await CuttingMasterRecord.find({ date: { $gte: range.from, $lte: range.to } })
+      .select("employeeId employeeName biometricId designation date entries.woId entries.woNumber entries.stockItemName entries.variants entries.quantityCut entries.timestamp")
+      .lean();
+    const out = overview.summarise(records, range);
+
+    const ids = out.workOrders.map((w) => w.woId).filter((id) => mongoose.Types.ObjectId.isValid(id));
+    if (ids.length) {
+      const wos = await WorkOrder.find({ _id: { $in: ids } }).select("_id quantity cuttingProgress.completed customerRequestId").lean();
+      const byId = new Map(wos.map((w) => [String(w._id), w]));
+      const reqIds = [...new Set(wos.map((w) => w.customerRequestId).filter(Boolean).map(String))];
+      const reqs = reqIds.length ? await CustomerRequest.find({ _id: { $in: reqIds } }).select("_id requestId customerInfo.name").lean() : [];
+      const reqById = new Map(reqs.map((r) => [String(r._id), r]));
+      for (const w of out.workOrders) {
+        const doc = byId.get(String(w.woId));
+        if (!doc) continue;
+        const r = reqById.get(String(doc.customerRequestId || ""));
+        w.quantity = doc.quantity || 0;
+        w.cutSoFar = doc.cuttingProgress?.completed || 0;
+        w.moId = doc.customerRequestId ? String(doc.customerRequestId) : null;
+        w.orderRef = r?.requestId || "";
+        w.customer = r?.customerInfo?.name || "";
+      }
+    }
+    res.json({ success: true, ...out });
+  } catch (error) {
+    console.error("cutting overview error:", error);
+    res.status(500).json({ success: false, message: "The cutting overview could not be read." });
+  }
+});
+
 // ── GET /barcode-search?barcode=WO-7e891fe6-005 ──────────────────────────────
 router.get("/barcode-search", async (req, res) => {
   try {
@@ -306,8 +348,34 @@ router.get("/manufacturing-orders", cutting.cuttingDepartment("viewer"), cutting
       ? await WorkOrder.find({
         customerRequestId: { $in: manufacturingOrders.map((o) => o._id) },
         ...cutting.workOrderScope(req.cutting.companyId),
-      }).select("_id customerRequestId").lean()
+      }).select("_id customerRequestId stockItemId stockItemName variantAttributes quantity cuttingProgress.completed").lean()
       : [];
+
+    /* What each order makes (16 Oct 2026, for the cutting overview's slab):
+       its products, each with its photo — the variant's first, else the
+       product's — pieces, pieces cut and how many variants. Additive; the
+       Assigned Work page ignores it. */
+    const productsByOrder = new Map();
+    if (queueWorkOrders.length) {
+      const siIds = [...new Set(queueWorkOrders.map((w) => w.stockItemId).filter(Boolean).map(String))];
+      const sis = siIds.length ? await StockItem.find({ _id: { $in: siIds } }).select("_id name images variants.attributes variants.images").lean() : [];
+      const siById = new Map(sis.map((x) => [String(x._id), x]));
+      for (const w of queueWorkOrders) {
+        const key = String(w.customerRequestId);
+        if (!productsByOrder.has(key)) productsByOrder.set(key, new Map());
+        const pk = String(w.stockItemId || w.stockItemName || "");
+        const byProduct = productsByOrder.get(key);
+        const si = siById.get(String(w.stockItemId || ""));
+        if (!byProduct.has(pk)) byProduct.set(pk, { name: w.stockItemName || si?.name || "", image: null, quantity: 0, cut: 0, variants: 0 });
+        const p = byProduct.get(pk);
+        p.quantity += w.quantity || 0;
+        p.cut += w.cuttingProgress?.completed || 0;
+        p.variants += 1;
+        /* Every photo in this database sits on a variant (the product's own
+           list is empty), so the fallback is any variant's photo. */
+        if (!p.image) p.image = pickStockItemImage(si, w.variantAttributes) || (si?.variants || []).find((v) => v.images?.[0])?.images?.[0] || null;
+      }
+    }
     const targetByWorkOrder = await stageTargets.targetsByWorkOrder(
       req.cutting.companyId, queueWorkOrders.map((w) => String(w._id)),
     );
@@ -371,6 +439,7 @@ router.get("/manufacturing-orders", cutting.cuttingDepartment("viewer"), cutting
         /* PPC's cutting targets for this order, and how many still await
            Cutting's answer. Absent targets are simply none. */
         ppcTargets: orderTargets,
+        products: [...(productsByOrder.get(order._id.toString())?.values() || [])].sort((a, b) => b.quantity - a.quantity).slice(0, 6),
         awaitingPpcTargetCount: orderTargets.filter((t) => t.awaitingResponse).length,
         orderType: isMeasurement
           ? "measurement_conversion"
