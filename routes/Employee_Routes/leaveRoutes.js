@@ -122,8 +122,11 @@ async function countMonthlyUsage(
   leaveTypeFilter,
   excludeId,
 ) {
-  const month = new Date(fromDate).getMonth() + 1;
-  const year = new Date(fromDate).getFullYear();
+  /* read the month from the date string itself: new Date("2026-11-01") is UTC
+     midnight, which a server west of UTC reads as 31 October */
+  const [year, month] = typeof fromDate === "string" && /^\d{4}-\d{2}/.test(fromDate)
+    ? fromDate.split("-").map(Number)
+    : [new Date(fromDate).getFullYear(), new Date(fromDate).getMonth() + 1];
   const mStr = String(month).padStart(2, "0");
   const monthStart = `${year}-${mStr}-01`;
   const monthEnd = `${year}-${mStr}-${new Date(year, month, 0).getDate()}`;
@@ -143,6 +146,25 @@ async function countMonthlyUsage(
     used += a.isHalfDay ? 0.5 : countLeaveDays(aFrom, aTo);
   }
   return { used, monthStart, monthEnd };
+}
+
+/* ── THE MONTHLY CAP, MONTH BY MONTH (17 Oct 2026) ─────────────────────────
+   The cap is "so many days away in a month". It used to be read once, for the
+   month the leave STARTS in, against the whole request — so 28 Oct → 5 Nov
+   (9 days) was held to October's room alone, and a leave in a later month was
+   judged by what had already been taken earlier. Each month the leave touches
+   now gives its own room: min(the days of the leave in that month, cap − days
+   already away that month). The paid share is the sum. */
+const { monthSegments, roomFromMonths } = require("../../services/leaveMonths");
+async function monthlyRoom(employeeId, fromDate, toDate, isHalfDay, cap, leaveTypeFilter, excludeId, clCap = 0) {
+  const segs = monthSegments(fromDate, toDate, isHalfDay, countLeaveDays);
+  const used = [];
+  const clUsed = [];
+  for (const sg of segs) {
+    used.push((await countMonthlyUsage(employeeId, sg.from, leaveTypeFilter, excludeId)).used);
+    if (clCap) clUsed.push((await countMonthlyUsage(employeeId, sg.from, "CL", excludeId)).used);
+  }
+  return roomFromMonths(segs, used, cap, clCap ? [{ cap: clCap, used: clUsed }] : []);
 }
 
 async function resolveLeaveOverlap({
@@ -346,6 +368,53 @@ router.get("/balance", AllEmployeeAppMiddleware, async (req, res) => {
           canApplySL: wc,
           canApplyPL: pc,
         },
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+/* ── HOW MANY DAYS FIT, FOR THESE DATES (17 Oct 2026) ───────────────────────
+   The app asks this instead of working the caps out itself, so a change to a
+   leave rule is a backend change only — no new app build. It applies the same
+   rules as POST / (balance less pending requests, the CL monthly cap, the
+   monthly days-away cap month by month); POST / is still the one that decides. */
+router.get("/room", AllEmployeeAppMiddleware, async (req, res) => {
+  try {
+    const fromDate = String(req.query.from || "").slice(0, 10);
+    const toDate = String(req.query.to || req.query.from || "").slice(0, 10);
+    const isHalfDay = req.query.halfDay === "1" || req.query.halfDay === "true";
+    const excludeId = req.query.exclude && /^[0-9a-f]{24}$/i.test(String(req.query.exclude)) ? String(req.query.exclude) : undefined;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(fromDate) || !/^\d{4}-\d{2}-\d{2}$/.test(toDate) || toDate < fromDate)
+      return res.status(400).json({ success: false, message: "Give from and to as YYYY-MM-DD, to not before from." });
+    const config = await LeaveConfig.getConfig();
+    const emp = await Employee.findById(req.user.id).select("biometricId dateOfJoining address").lean();
+    if (!emp) return res.status(404).json({ success: false, message: "Employee not found" });
+    const year = Number(fromDate.slice(0, 4));
+    const bal = await ensureBalance(req.user.id, year, emp.biometricId, config);
+    const wd = workingDaysSinceJoining(emp.dateOfJoining);
+    const plOk = wd >= config.daysRequiredForPL;
+    const ent = { CL: config.clPerYear, SL: config.slPerYear, PL: bal.plEligible || plOk ? config.plPerYear : 0 };
+    const reserved = await computeReserved(req.user.id, year);
+    const left = (t) => Math.max(0, (ent[t] || 0) - (bal.consumed?.[t] || 0) - (reserved?.[t] || 0));
+    const capInfo = monthlyLeaveCap(emp, config);
+    const total = await monthlyRoom(req.user.id, fromDate, toDate, isHalfDay, capInfo.cap, null, excludeId);
+    const cl = await monthlyRoom(req.user.id, fromDate, toDate, isHalfDay, capInfo.cap, null, excludeId, config.maxCLPerMonth || 3);
+    const days = isHalfDay ? 0.5 : countLeaveDays(fromDate, toDate);
+    res.json({
+      success: true,
+      data: {
+        days,
+        monthlyCap: capInfo.cap,
+        months: total.months,
+        monthlyRoom: total.room,
+        max: {
+          CL: wd >= config.initialWaitingDays ? Math.min(left("CL"), cl.room) : 0,
+          PL: plOk || bal.plEligible ? Math.min(left("PL"), total.room) : 0,
+          SL: wd >= config.initialWaitingDays ? left("SL") : 0,
+        },
+        balanceLeft: { CL: left("CL"), PL: left("PL"), SL: left("SL") },
       },
     });
   } catch (err) {
@@ -1800,16 +1869,6 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
       });
 
     let effectiveAvailable = availableBalance;
-    if (leaveType === "CL") {
-      const maxCLMonth = config.maxCLPerMonth || 3;
-      const { used: clUsed } = await countMonthlyUsage(
-        req.user.id,
-        fromDate,
-        "CL",
-      );
-      const clRemainingThisMonth = Math.max(0, maxCLMonth - clUsed);
-      effectiveAvailable = Math.min(availableBalance, clRemainingThisMonth);
-    }
 
     /* The cap follows the PERMANENT address. This read `current` first, which
        inverted the rule it was written for: the bigger allowance exists for
@@ -1818,12 +1877,8 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
        See services/leaveHomeState.service.js. */
     const capInfo = monthlyLeaveCap(emp, config);
     const monthlyCap = capInfo.cap;
-    const { used: totalMonthUsed } = await countMonthlyUsage(
-      req.user.id,
-      fromDate,
-      null,
-    );
-    const monthlyRemaining = Math.max(0, monthlyCap - totalMonthUsed);
+    /* each month the leave touches, against its own cap (see monthlyRoom) */
+    const { room: monthlyRemaining } = await monthlyRoom(req.user.id, fromDate, toDate, !!isHalfDay, monthlyCap, null, undefined, leaveType === "CL" ? config.maxCLPerMonth || 3 : 0);
     effectiveAvailable = Math.min(effectiveAvailable, monthlyRemaining);
 
     const paidDays = Math.min(totalDays, effectiveAvailable);
