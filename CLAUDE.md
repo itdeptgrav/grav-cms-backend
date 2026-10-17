@@ -629,6 +629,22 @@ table with `slotsPerSide` (13) slots down its left and right. Its fields:
 
 - `id`, `name`, `x`, `y`, `rotation`
 - `pitch`, `tableWidth` (cm)
+- `qcMachineId` — the register machine that is the line's QC table (a
+  scanner station fixed at the line's end); must exist, and may not also be
+  in a slot or at another line's QC table
+- `slotDepth` — cm a slot reaches out from the middle (60–400); 0 keeps the
+  kind's own (130 a line, 160 a row). The fusing places are 220
+- `cols` — slots along the line per side; more slots than columns stack in
+  rows outward (bounded by `slotsPerSide`, default one row). `qcDepth` (60–400,
+  default 90) is the QC table's depth along the line. A `tableWidth` of 0
+  means no table for any kind (otherwise bounded 30–400)
+- `kind` — "line" (a sewing line), "cell" (a short line with a HEAD station
+  before slot 1: `headMachineId`, checked like a QC table) or "row" (one row
+  of slots, no table, no QC; only "L" slots kept, `tableWidth` 0)
+- an empty `qcMachineId` / `headMachineId` is stored as `null` — an empty
+  string cannot be cast to an ObjectId and fails the whole save (500)
+- `zoneId`, `qcZoneId` — the `chamberTemplates[].id` of the zones that mark
+  the line and its QC table; the frontend re-draws them around the line
 - `slots: [{ side: "L" | "R", index, item, machineId }]`, holding filled slots
   only — `item` is "machine" (a register `machineId`) or "table" (a plain
   work table: no id, no register lookup, no limit)
@@ -2222,28 +2238,25 @@ requests only):
 Tests: `test/store-purchase/mrf-item-split.route.test.js` (10). The four
 failures in `mrf-chat-legacy-numbering` and `mrf-tenancy` are identical at HEAD.
 
-## Scan a barcode to match an MRF line (14 Oct 2026, owner)
+## Order simulation history — 3 Oct 2026
 
-`GET /api/cms/inventory/mrf/data/raw-items/scan?code=` (mrfRoutes, behind
-`requireTenant`; reads only) turns what the Store's scanner read into the
-product for the Match to Inventory popup, in the same shape as
-`/data/raw-items` (`pickerItem`, now shared by both). Every rule is
-`services/mrfScanMatch.service.js`:
+`models/CMS_Models/Manufacturing/Production/OrderSimulationRun.js`, rules in
+`services/production/orderSimulationRuns.js` (tested:
+`orderSimulationRuns.test.js`), router
+`routes/CMS_Routes/Production/Dashboard/orderSimulationRoutes.js` at
+`/api/cms/production/order-simulations`: list (no report, no inputs), read
+one (report gunzipped), save (report gzip in a Buffer — 1.7 MB of JSON is
+~230 KB; refused over 25 MB), rename / soft-delete by whoever ran it or an
+admin (`canChange`). Authentication only — a saved what-if is not a
+production write, so no department approval queue on the mount.
 
-- **our raw-item label** — `itemid=`, `RawItem=`, the label URL, the bare id —
-  parsed with QC's `rawMaterialIdOf`; answers the label's material AND
-  variant (`via: "label"`, `label: {quantity, unit}`; `variantGone` when the
-  item lost that variant). A **VOIDED** label is refused with
-  `identityRefusal`'s message.
-- a **raw item's own id** (`via: "item-id"`).
-- an **exact SKU**, item or variant, case and surrounding spaces ignored, the
-  code regex-escaped (`via: "item-sku" | "variant-sku"`). Variant SKUs are
-  NOT unique (20 repeats on 14 Oct 2026): several matches answer
-  `reason: "AMBIGUOUS"` with `candidates`, never a guess.
-- a shelf `loc=LOC-` label → `LOCATION_LABEL`; anything else → `NOT_FOUND`
-  with the code in the message. Empty → 400.
-
-Scoped with `tenantFilter` folded into `$and` (the read-through filter is an
-`$or`, so it must not be spread beside another `$or`) — another company's
-label or SKU is not found. Tests:
-`test/store-purchase/mrf-scan-match.route.test.js` (8).
+**The Atlas cluster is at its plan's 500-collection limit** (3 Oct 2026: 501
+across the databases — `test` 409, `cowork` 47, `chefo-canteen-owner` 20,
+`bss` 9, `chefo-booking` 9, `grav-cms` 3, `employees` / `measurements` /
+`JadiButi` 1 each), so `orderSimulationRuns` cannot be created: a save
+answers **507 `COLLECTION_LIMIT`** in words and the CMS keeps the run in the
+browser instead. Any other NEW model hits the same wall — Mongoose's
+auto-create fails quietly at start-up and the first insert throws
+"cannot create a new collection -- already using 500 collections of 500".
+Nothing was dropped: the owner chose browser storage for now over dropping
+the empty `measurements` / `employees` databases or a bigger plan.

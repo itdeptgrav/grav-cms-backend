@@ -1937,6 +1937,11 @@ app.use("/api/cms/merchandising", require("./routes/CMS_Routes/Merchandising/ppm
    point: Merchandising hands off, and the receiving decision stays PPC's. */
 app.use("/api/cms/ppc", require("./routes/CMS_Routes/PPC/inboundPacksRoute"));
 
+/* ── FOLLOW-UPS BETWEEN THE PRODUCTION MANAGER, MERCHANDISING AND R&D ─────
+   (9 Oct 2026). One thing one department waits on another for, owned by a
+   named person with a date; raised by hand or at a style hand-off. */
+app.use("/api/cms/follow-ups", require("./routes/CMS_Routes/FollowUps/followUpsRoute"));
+
 /* ── AND THE SECOND INBOUND QUEUE: ISSUED IE RELEASES ────────────────────
    Same mount, same live `ppc` grant, PPC's own receipt collection. Industrial
    Engineering issues into `ie_releases` and writes nothing here; PPC answers
@@ -2523,6 +2528,13 @@ const productionSupervisorWrites = (entity, extra = {}) =>
 
 const productionMachineLayout = require("./routes/CMS_Routes/Production/Dashboard/canvasLayoutRoutes.js");
 app.use("/api/cms/production/canvas-layout", ieOrDepartmentWrites(productionSupervisorWrites("machine layout")), productionMachineLayout);
+
+// The Order simulation's history (3 Oct 2026): every finished run, to open
+// again or compare. A record of a what-if, not a production write — the
+// router authenticates and lets only whoever ran a run (or an admin) rename
+// or delete it; no department approval queue in front.
+const orderSimulationRoutes = require("./routes/CMS_Routes/Production/Dashboard/orderSimulationRoutes");
+app.use("/api/cms/production/order-simulations", orderSimulationRoutes);
 
 /* ---------------------------------------------------------------------
  * The scanner floor's READ routers (restored 25 Sep 2026).
@@ -4059,6 +4071,15 @@ try {
   }
 } catch (e) {
   console.warn("⚠️ Cowork punch-out offline sync not available:", e.message);
+}
+
+// The follow-ups' morning reminder: overdue and due-today, one email a person.
+try {
+  if (!skipBackgroundJob("follow-up reminders (09:30 IST)")) {
+    require("./services/followUps/followUps.service").startFollowUpReminders();
+  }
+} catch (e) {
+  console.warn("⚠️ Follow-up reminders not available:", e.message);
 }
 
 // Start persistent OT reminder notifications (random 5-20 min intervals)
