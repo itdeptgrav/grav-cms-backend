@@ -8,13 +8,22 @@
 
    Run:      node scripts/oneoff/createDemoOrder.js
    Re-run:   prints the demo order already made and stops (tagged by TAG below).
-   Remove:   node scripts/oneoff/createDemoOrder.js --remove   (the order + its work orders) */
+   Remove:   node scripts/oneoff/createDemoOrder.js --remove   (the order + its work orders)
+   Another:  node scripts/oneoff/createDemoOrder.js --tag DEMO-2 --deadline 2026-10-31
+             (a second demo beside the first; --remove with the same --tag removes it) */
 require("dotenv").config();
 const crypto = require("crypto");
 const mongoose = require("mongoose");
 
-const TAG = "DEMO-CUTTING-24OCT";
-const DEADLINE = new Date("2026-10-24T00:00:00.000Z");
+const argOf = (name) => {
+  const i = process.argv.indexOf(`--${name}`);
+  return i > -1 ? process.argv[i + 1] : null;
+};
+const TAG = argOf("tag") || "DEMO-CUTTING-24OCT";
+const DEADLINE_DAY = argOf("deadline") || "2026-10-24";
+if (!/^\d{4}-\d{2}-\d{2}$/.test(DEADLINE_DAY)) throw new Error("--deadline must be YYYY-MM-DD");
+const DEADLINE = new Date(`${DEADLINE_DAY}T00:00:00.000Z`);
+const DEADLINE_WORDS = DEADLINE.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric", timeZone: "UTC" });
 /* pieces per size, by product */
 const QTY = {
   "Black Pant": { 30: 10, 32: 20, 34: 20, 36: 10, 38: 10 },
@@ -31,7 +40,7 @@ const round = (n, d = 3) => Math.round((Number(n) || 0) * 10 ** d) / 10 ** d;
   const CR = db.collection("customerrequests");
   const WO = db.collection("workorders");
 
-  const existing = await CR.findOne({ "customerInfo.description": new RegExp(TAG) });
+  const existing = await CR.findOne({ "customerInfo.description": new RegExp(`^${TAG} ·`) });
   if (process.argv.includes("--remove")) {
     if (!existing) { console.log("No demo order to remove."); return mongoose.disconnect(); }
     const w = await WO.deleteMany({ customerRequestId: existing._id });
@@ -92,7 +101,7 @@ const round = (n, d = 3) => Math.round((Number(n) || 0) * 10 ** d) / 10 ** d;
     ...src,
     _id: crId,
     requestId,
-    customerInfo: { ...src.customerInfo, deliveryDeadline: DEADLINE, description: `${TAG} · demo order for testing PPC planning and cutting — delivery 24 Oct 2026` },
+    customerInfo: { ...src.customerInfo, deliveryDeadline: DEADLINE, description: `${TAG} · demo order for testing PPC planning and cutting — delivery ${DEADLINE_WORDS}` },
     items,
     quotations,
     taxSummary: src.taxSummary,
@@ -156,7 +165,7 @@ const round = (n, d = 3) => Math.round((Number(n) || 0) * 10 ** d) / 10 ** d;
   }
   if (made.length) await WO.insertMany(made);
 
-  console.log(`Made ${requestId} (MO-${requestId}) · id ${crId} · delivery 24 Oct 2026`);
+  console.log(`Made ${requestId} (MO-${requestId}) · id ${crId} · delivery ${DEADLINE_WORDS}`);
   for (const d of made) console.log(`  ${d.stockItemName} · ${d.variantAttributes.map((a) => a.value).join("/")} · ${d.quantity} pcs · fabric lines ${d.rawMaterials.length}`);
   console.log(`  ${made.length} work orders, ${made.reduce((a, d) => a + d.quantity, 0)} pieces. Nothing planned, nothing cut.`);
   await mongoose.disconnect();
