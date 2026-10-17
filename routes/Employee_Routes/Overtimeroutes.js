@@ -285,6 +285,9 @@ router.get("/check", AllEmployeeAppMiddleware, async (req, res) => {
         pendingReports.push({
           dateStr,
           ...stayOver,
+          /* the day the grace applies to (the app said "tomorrow", which is
+             wrong for a Saturday's overtime or a report filed a day late) */
+          nextDateStr: OvertimeReport.getNextWorkingDay(dateStr),
           employeeName: `${emp.firstName} ${emp.lastName}`,
         });
       }

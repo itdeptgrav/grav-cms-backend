@@ -4078,16 +4078,48 @@ app.post("/api/cms/production/sync/manual", async (req, res) => {
 
    Pinned by test/production/s0-security-containment.test.js. */
 
-app.get("/api/app/version", (req, res) => {
-  res.json({
-    success: true,
-    data: {
-      latestVersion: process.env.APP_LATEST_VERSION || "1.0.0",
-      minVersion: process.env.APP_MIN_VERSION || "1.0.0",
-      updateUrl: "https://cms.grav.in/app/download",
-      message: "A new version of GRAV is available. Please update to continue.",
-    },
-  });
+/* THE EMPLOYEE APP'S SETTINGS, FROM THE SERVER (17 Oct 2026). Public (the
+   app reads it before sign-in), values from the developer side's live
+   settings ("Employee app" group, services/devConfig.js), live within 30 s.
+   /api/app/version stays for builds older than 2.0.1-vc66. */
+async function employeeAppConfig() {
+  const { getSetting } = require("./services/devConfig");
+  const read = async (k, d) => { try { return await getSetting(k); } catch (_) { return d; } };
+  let statusLabels = {};
+  try { statusLabels = JSON.parse((await read("app.statusLabels", "")) || "{}"); } catch (_) {}
+  return {
+    minVersion: await read("app.minVersion", "1.0.0"),
+    latestVersion: await read("app.latestVersion", "2.0.1"),
+    message: await read("app.updateMessage", "A new version of GRAV is available. Please update to continue."),
+    updateUrl: "https://play.google.com/store/apps/details?id=com.grav.crm",
+    requireUpdateSince: (await read("app.requireUpdateSince", "")) || null,
+    notice: (await read("app.notice", "")) || null,
+    noticeTone: await read("app.noticeTone", "info"),
+    hiddenWorkTiles: String(await read("app.hiddenWorkTiles", "")).split(",").map((x) => x.trim()).filter(Boolean),
+    statusLabels,
+    /* what still counts as open for the app's red dots; withdraw_pending is a
+       leave somebody asked to take back, still waiting on a manager */
+    openStatuses: ["pending", "manager_approved", "awaiting_hr", "requested", "withdraw_pending"],
+    badgeRefreshSeconds: await read("app.badgeRefreshSeconds", 90),
+    updateCheckMinutes: await read("app.updateCheckMinutes", 15),
+    serverTime: new Date().toISOString(),
+  };
+}
+app.get("/api/app/config", async (req, res) => {
+  try {
+    res.set("Cache-Control", "no-store");
+    res.json({ success: true, data: await employeeAppConfig() });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+app.get("/api/app/version", async (req, res) => {
+  try {
+    const c = await employeeAppConfig();
+    res.json({ success: true, data: { latestVersion: c.latestVersion, minVersion: c.minVersion, updateUrl: c.updateUrl, message: c.message } });
+  } catch (err) {
+    res.json({ success: true, data: { latestVersion: process.env.APP_LATEST_VERSION || "1.0.0", minVersion: process.env.APP_MIN_VERSION || "1.0.0", updateUrl: "https://cms.grav.in/app/download", message: "A new version of GRAV is available. Please update to continue." } });
+  }
 });
 
 if (!skipBackgroundJob("hourly attendance sync (eTimeOffice pull + write)")) {

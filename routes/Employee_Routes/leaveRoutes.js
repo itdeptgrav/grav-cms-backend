@@ -1881,7 +1881,14 @@ router.post("/", AllEmployeeAppMiddleware, async (req, res) => {
     const { room: monthlyRemaining } = await monthlyRoom(req.user.id, fromDate, toDate, !!isHalfDay, monthlyCap, null, undefined, leaveType === "CL" ? config.maxCLPerMonth || 3 : 0);
     effectiveAvailable = Math.min(effectiveAvailable, monthlyRemaining);
 
-    const paidDays = Math.min(totalDays, effectiveAvailable);
+    /* The app's split lets the employee take FEWER paid days than allowed
+       (keep some balance, the rest unpaid). That number was sent nowhere;
+       now a paidDays in the body lowers the paid part, never raises it. */
+    const askedPaid = Number(req.body.paidDays);
+    const paidCeiling = Number.isFinite(askedPaid) && askedPaid >= 0
+      ? Math.min(effectiveAvailable, Math.round(askedPaid * 2) / 2)
+      : effectiveAvailable;
+    const paidDays = Math.min(totalDays, paidCeiling);
     const lwpDays = Math.max(0, totalDays - paidDays);
 
     const rd = false;
