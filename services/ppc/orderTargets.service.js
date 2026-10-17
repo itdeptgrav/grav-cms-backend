@@ -269,8 +269,13 @@ async function orderDetail(companyId, moId, asOfDay) {
 async function departmentDay(department, asOfDay) {
   if (!DEPARTMENTS.includes(department)) return { targets: [], upcoming: [] };
   /* Running or just ended (last 7 days), AND starting in the next 14 days —
-     27 Sep 2026: "the upcoming assigned targets also can showcase". */
-  const targets = await PpcOrderTarget.find({ department, status: "active", from: { $lte: ev.shiftDay(asOfDay, 14) }, to: { $gte: ev.shiftDay(asOfDay, -7) } })
+     27 Sep 2026: "the upcoming assigned targets also can showcase".
+     A target whose last day has passed with pieces still owed is NOT ended
+     (17 Oct 2026, owner: "even if the date passes it should not matter …
+     there might be a delay"): every active target is read, and one that is
+     over stays while anything is left to make, carrying what is still owed
+     (`carryOver`) until it is met or PPC ends or replaces it. */
+  const targets = await PpcOrderTarget.find({ department, status: "active", from: { $lte: ev.shiftDay(asOfDay, 14) } })
     .sort({ from: 1 }).lean();
   /* one order read and one standard read per order/company, all at once */
   const ctxByMo = new Map(); const stdByCo = new Map();
@@ -291,11 +296,22 @@ async function departmentDay(department, asOfDay) {
       moId: ctx.moId, moNumber: ctx.moNumber, customerName: ctx.customerName, deliveryDate: ctx.deliveryDate, description: ev.describeTarget(t), assignedBy: t.assignedBy?.name || "",
       startsInDays: t.from > asOfDay ? Math.round((Date.parse(t.from) - Date.parse(asOfDay)) / 86400000) : 0,
     });
+    const e = out[out.length - 1];
+    /* what was made AFTER the last day still pays the target off — late is
+       late, but it is done (whole days, whatever the target's hours were) */
+    let late = 0;
+    if (e.over) { const day = { ...t, hoursFrom: "", hoursTo: "" }; for (let d = ev.shiftDay(t.to, 1); d <= asOfDay; d = ev.shiftDay(d, 1)) late += ev.doneOn(events, day, d); }
+    let owed = Math.max(0, (Number(e.span?.remaining) || 0) - late);
+    /* never more than the order itself still has to make */
+    if (ctx.quantity > 0) owed = Math.min(owed, Math.max(0, ctx.quantity - doneOverall));
+    if (e.over && owed > 0) e.carryOver = { remaining: owed, doneLate: late, daysOver: Math.round((Date.parse(asOfDay) - Date.parse(t.to)) / 86400000) };
+    /* an over target met in full drops off after its week, as before */
+    else if (e.over && t.to < ev.shiftDay(asOfDay, -7)) out.pop();
   }
   const upcoming = out.filter((x) => x.from > asOfDay).sort((a, b) => a.from.localeCompare(b.from));
   const current = out.filter((x) => x.from <= asOfDay);
   /* Today's targets first, then ones that just ended (still worth a glance). */
-  current.sort((a, b) => (b.covers - a.covers) || a.from.localeCompare(b.from));
+  current.sort((a, b) => (b.covers - a.covers) || (Boolean(b.carryOver) - Boolean(a.carryOver)) || a.from.localeCompare(b.from));
   const covering = current.filter((x) => x.covers);
   const summary = {
     targets: covering.length,
@@ -303,6 +319,9 @@ async function departmentDay(department, asOfDay) {
     doneToday: covering.reduce((n, x) => n + (x.today?.done || 0), 0),
     behind: covering.filter((x) => x.status === "behind").length,
     achieved: covering.filter((x) => x.status === "achieved" || x.status === "exceeded").length,
+    /* past their last day with pieces still owed */
+    overdue: current.filter((x) => x.carryOver).length,
+    overdueRemaining: current.reduce((n, x) => n + (x.carryOver?.remaining || 0), 0),
   };
   return { department, ...ev.DEPARTMENT_META[department], asOfDay, summary: { ...summary, upcoming: upcoming.length }, targets: current, upcoming };
 }

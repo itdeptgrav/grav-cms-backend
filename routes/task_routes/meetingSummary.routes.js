@@ -22,7 +22,7 @@
 
 const express = require("express");
 const router = express.Router();
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { generateSummaryDocx, needsActionGroups } = require("./generateSummaryDocx");
 
 /**

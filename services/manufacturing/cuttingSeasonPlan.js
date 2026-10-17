@@ -153,7 +153,7 @@ function plannedBySize(plan) {
  * divide into a marker of at most 12 garments; the BOM consumption from the
  * work orders' fabric when it is in metres and the same for all of them.
  */
-function suggestLay(plan, { cuttingMaster = "" } = {}) {
+function suggestLay(plan, { cuttingMaster = "", sizeQuantities = false } = {}) {
   if (!plan?.lays?.length) return null;
   const v = { tableNo: "", cuttingMaster: str(cuttingMaster), styleNo: "", colour: "", layNo: "", fabricLot: "", markerLength: "", markerWidth: "", markerEff: "", ratio: Object.fromEntries(SIZES.map((s) => [s, ""])), plies: "", fabricIssued: "", fabricReturned: "", bomCons: "", remarks: "" };
   const h = headerFromPlan(plan);
@@ -166,6 +166,24 @@ function suggestLay(plan, { cuttingMaster = "" } = {}) {
   if (boms.length === 1) v.bomCons = boms[0];
   const from = [];
   const cp = plan.cutPlan;
+  if (sizeQuantities) {
+    /* STARTED FROM AN ORDER (17 Oct 2026, owner: "the size ratios will be like
+       WO quantities … in each size we fill the quantity, and the plies"): each
+       size column holds the pieces its work orders still need, on one ply, so
+       the lay's Pcs Cut is the order's remaining quantity. The cutting master
+       types the real marker over it. */
+    const { columns, other } = plannedBySize(plan);
+    const sizes = SIZES.filter((s) => columns[s] > 0);
+    /* a size that is not a log-book column (30, 32, Free) gets a column of its own on this lay */
+    const extra = other.filter((o) => o.size && o.size !== "No size" && o.pieces > 0);
+    if (sizes.length || extra.length) {
+      for (const s of sizes) v.ratio[s] = String(columns[s]);
+      for (const o of extra) v.ratio[extraSize(o.size)] = String(o.pieces);
+      v.plies = "1";
+      from.push("the work orders' quantities");
+    }
+    return { values: v, from };
+  }
   if (cp && (cp.ratio || []).some((r) => sizeColumn(r.size))) {
     for (const r of cp.ratio || []) { const col = sizeColumn(r.size); if (col && Number(r.count) > 0) v.ratio[col] = String(r.count); }
     if (cp.plies) v.plies = String(cp.plies);
@@ -187,21 +205,45 @@ function suggestLay(plan, { cuttingMaster = "" } = {}) {
         from.push("the pieces PPC planned");
       }
     }
+    /* NOTHING LEFT BLANK (17 Oct 2026, owner: "the number of plies and all
+       haven't filled"): when the pieces do not divide into a small marker, or
+       a size is not a log-book column (36, 38), each size holds its planned
+       pieces on one ply — the lay's Pcs Cut is what PPC planned. */
+    if (!v.plies) {
+      const extra = other.filter((o) => o.size && o.size !== "No size" && o.pieces > 0);
+      if (sizes.length || extra.length) {
+        for (const s of sizes) v.ratio[s] = String(columns[s]);
+        for (const o of extra) v.ratio[extraSize(o.size)] = String(o.pieces);
+        v.plies = "1";
+        from.push("the pieces PPC planned");
+      }
+    }
   }
   return { values: v, from };
 }
+
+/** A size that is not a log-book column, as a lay stores it (cuttingLogBook.js extraKey). */
+const extraSize = (k) => String(k || "").trim().replace(/[.$]/g, "-").slice(0, 12);
 
 /** What the lay cuts against what PPC asked, size by size and in all. */
 function planCheck(plan, lays = []) {
   if (!plan?.lays?.length) return null;
   const { columns, other } = plannedBySize(plan);
   const cut = Object.fromEntries(SIZES.map((s) => [s, 0]));
-  for (const l of lays) for (const s of SIZES) cut[s] += (Number(l.ratio?.[s]) || 0) * (Number(l.plies) || 0);
+  const cutExtra = {};
+  for (const l of lays) {
+    for (const s of SIZES) cut[s] += (Number(l.ratio?.[s]) || 0) * (Number(l.plies) || 0);
+    for (const [k, v] of Object.entries(l.ratioExtra || {})) cutExtra[k] = (cutExtra[k] || 0) + (Number(v) || 0) * (Number(l.plies) || 0);
+  }
   const rows = SIZES.filter((s) => columns[s] || cut[s]).map((s) => ({ size: s, planned: columns[s], cut: cut[s], diff: cut[s] - columns[s] }));
+  /* the other sizes, compared size by size too (17 Oct 2026) */
+  const extraSizes = [...new Set([...other.filter((o) => o.size !== "No size").map((o) => extraSize(o.size)), ...Object.keys(cutExtra)])];
+  for (const k of extraSizes) { const p = other.filter((o) => extraSize(o.size) === k).reduce((a, o) => a + o.pieces, 0); rows.push({ size: k, planned: p, cut: cutExtra[k] || 0, diff: (cutExtra[k] || 0) - p, extra: true }); }
   const planned = plan.pieces;
-  const cutTotal = SIZES.reduce((a, s) => a + cut[s], 0);
+  const cutTotal = SIZES.reduce((a, s) => a + cut[s], 0) + Object.values(cutExtra).reduce((a, b) => a + b, 0);
   const notes = [];
-  if (other.length) notes.push(`PPC's sizes ${other.map((o) => o.size).join(", ")} are not columns of the log book, so they are compared in the total only.`);
+  const unsized = other.filter((o) => o.size === "No size");
+  if (unsized.length) notes.push(`${unsized.reduce((a, o) => a + o.pieces, 0)} pieces PPC planned have no size, so they are compared in the total only.`);
   const styles = uniq((plan.lines || []).map((x) => x.styleNo || x.productName).map((s) => s.toLowerCase()));
   const typed = uniq(lays.map((l) => str(l.styleNo).toLowerCase()));
   if (typed.length && styles.length && typed.some((t) => !styles.includes(t))) notes.push(`The lay's style (${uniq(lays.map((l) => l.styleNo)).join(", ")}) is not one PPC planned for this lay.`);

@@ -87,6 +87,8 @@ const laySchema = new mongoose.Schema({
   /* a fraction, as the workbook stores it: 0.84 is 84% */
   markerEff: { type: Number, default: null },
   ratio: { type: sizeRatio, default: () => ({}) },
+  /* sizes that are not XS…3XL ({ "30": 3 }) — cuttingLogBook.js normaliseLay */
+  ratioExtra: { type: mongoose.Schema.Types.Mixed, default: () => ({}) },
   plies: { type: Number, required: true },
   fabricIssued: { type: Number, default: null },
   fabricReturned: { type: Number, default: null },
@@ -109,6 +111,10 @@ const planSchema = new mongoose.Schema({
   fabrics: { type: [new mongoose.Schema({ key: String, rawItemId: String, variant: String, name: String, pieces: Number }, { _id: false })], default: [] },
   pieces: { type: Number, default: 0 },
   cutPlan: { type: mongoose.Schema.Types.Mixed, default: null },
+  /* "order" when it was started from an order card (17 Oct 2026), else PPC's lay */
+  source: { type: String, default: "" },
+  /* the lay's number on its order(s): 1 for an order's first lay, 2 for the next … (17 Oct 2026) */
+  layNo: { type: String, default: "" },
   suggestion: { type: mongoose.Schema.Types.Mixed, default: null },
   takenAt: { type: Date, default: null },
   takenBy: who,
@@ -148,6 +154,43 @@ const cuttingSeasonSchema = new mongoose.Schema({
   pieces: { type: [pieceSchema], default: [] },
   /* filled at Close; a live tally is computed on read while active */
   products: { type: [productSchema], default: [] },
+  /* THE FABRIC ISSUED, SCANNED (17 Oct 2026, owner): the store's raw-item
+     labels the cutting master was handed, scanned before the lay; their
+     quantities add up to the lay's Fabric Issued. A read of each label as it
+     was — nothing about stock moves here (the store issued it already). */
+  fabricScans: { type: [new mongoose.Schema({
+    barcodeId: { type: mongoose.Schema.Types.ObjectId, ref: "Barcode", required: true },
+    rawItemId: { type: mongoose.Schema.Types.ObjectId, default: null },
+    rawItemName: { type: String, default: "" },
+    rawItemSku: { type: String, default: "" },
+    variantText: { type: String, default: "" },
+    unit: { type: String, default: "" },
+    quantity: { type: Number, default: 0 },
+    /* where the quantity came from: "issued" (the label's MRF issue log),
+       "label" (what the label says), "mrf-history" (an MRF issue before the log) */
+    source: { type: String, default: "" },
+    mrfNumber: { type: String, default: "" },
+    scannedAt: { type: Date, default: Date.now },
+    scannedBy: who,
+  }, { _id: false })], default: [] },
+  /* THE PIECE LABELS PRINTED FROM THE LAY (17 Oct 2026, owner): each run is
+     one work order's units from..to, counted as cut on the work order the
+     moment they were allotted, so two prints never share a number. */
+  printRuns: { type: [new mongoose.Schema({
+    workOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", required: true },
+    workOrderNumber: { type: String, default: "" },
+    shortId: { type: String, default: "" },
+    size: { type: String, default: "" },
+    variantText: { type: String, default: "" },
+    productName: { type: String, default: "" },
+    from: { type: Number, required: true },
+    to: { type: Number, required: true },
+    count: { type: Number, required: true },
+    panels: { type: Number, default: 1 },
+    layNo: { type: String, default: "" },
+    at: { type: Date, default: Date.now },
+    by: who,
+  }, { _id: false })], default: [] },
   piecesCount: { type: Number, default: 0 },
   plan: { type: planSchema, default: null },
 }, { timestamps: true, collection: "cutting_seasons" });

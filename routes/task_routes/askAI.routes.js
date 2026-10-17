@@ -24,7 +24,7 @@
 
 const express = require("express");
 const router = express.Router();
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { db } = require("../../config/firebaseAdmin");
 const { verifyCoworkToken, verifyEmployeeToken } = require("../../Middlewear/coworkAuth");
 

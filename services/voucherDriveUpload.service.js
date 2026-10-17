@@ -23,7 +23,7 @@
  * fetch private files without adding any new field to the voucher model.
  */
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 // ── Service Account auth (never expires) ─────────────────────────────────────

@@ -33,7 +33,7 @@
 // wanted, THAT is when a stored index earns its keep — and it should then store
 // only messages that matched a known customer, never the whole mailbox.
 
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { getEmployeeGmailToken } = require("../routes/services/googleEmployeeGmailService");
 const { identityFor } = require("./customerIdentityLookup.service");
 

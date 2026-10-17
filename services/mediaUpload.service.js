@@ -11,7 +11,7 @@
  */
 
 const cloudinary = require("cloudinary").v2;
-const { google } = require("googleapis");
+const { google } = require("../utils/lazyGoogleapis");
 const { Readable } = require("stream");
 
 // ── Cloudinary config ─────────────────────────────────────

@@ -1,7 +1,7 @@
 // GRAV-CMS-BACKEND/routes/services/googleGmailService.js
 // Fetches Gmail messages using the admin OAuth2 refresh token.
 
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const { getOAuth2Client } = require("./googleAuthService");
 
 function getGmailClient() {

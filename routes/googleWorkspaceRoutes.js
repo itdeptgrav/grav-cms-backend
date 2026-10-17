@@ -465,7 +465,7 @@ router.get("/employee-gmail/thread", async (req, res) => {
 router.post("/employee-gmail/backfill-display-names", async (req, res) => {
   try {
     const { db, admin } = require("../config/firebaseAdmin");
-    const { google } = require("googleapis");
+    const { google } = require("../utils/lazyGoogleapis");
 
     const snap = await db.collection("cowork_employees").get();
     const results = { patched: [], skipped: [], failed: [] };

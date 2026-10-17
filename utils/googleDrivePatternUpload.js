@@ -1,5 +1,5 @@
 // googleDrivePatternUpload.js
-const { google } = require("googleapis");
+const { google } = require("./lazyGoogleapis");
 const stream = require("stream");
 
 // ── Auth (Service Account) ───────────────────────────────────────

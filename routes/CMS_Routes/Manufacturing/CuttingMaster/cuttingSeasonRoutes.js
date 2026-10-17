@@ -132,12 +132,56 @@ const seasonView = (s, products) => ({
   lays: (s.lays || []).map(layView),
   log: logBook.summarize(s.lays || []),
   /* PPC's lay it was started for (16 Oct 2026) and the cut against it */
-  plan: s.plan || null,
+  plan: planWithSizes(s.plan),
   planCheck: seasonPlan.planCheck(s.plan, s.lays || []),
+  /* the fabric issued, scanned (17 Oct 2026) and the piece labels printed */
+  fabricScans: (s.fabricScans || []).map((f) => ({ ...f, barcodeId: String(f.barcodeId), rawItemId: f.rawItemId ? String(f.rawItemId) : null })),
+  ...fabricTotals(s.fabricScans || []),
+  printRuns: (s.printRuns || []).map((r) => ({ ...r, workOrderId: String(r.workOrderId) })),
 });
+/* A season started from an order before 17 Oct 2026 had no column for a size
+   outside XS…3XL, so its suggested lay left those sizes (and the plies) blank.
+   On read the order's own suggestion fills what is still blank; nothing set is
+   changed, and nothing is written. */
+function planWithSizes(plan) {
+  if (!plan?.suggestion?.values) return plan || null;
+  /* the lay number fills a blank Lay No on every season that has one (17 Oct 2026) */
+  if (plan.layNo && !String(plan.suggestion.values.layNo || "").trim()) plan = { ...plan, suggestion: { ...plan.suggestion, values: { ...plan.suggestion.values, layNo: plan.layNo } } };
+  const blank = (x) => x === undefined || x === null || String(x).trim() === "";
+  /* a lay PPC planned whose suggestion was left empty (sizes outside XS…3XL) is filled on read too */
+  const empty = blank(plan.suggestion.values.plies) && Object.values(plan.suggestion.values.ratio || {}).every(blank);
+  if (plan.source !== "order" && !empty) return plan;
+  const fresh = plan.source === "order" ? seasonPlan.suggestLay(plan, { sizeQuantities: true })?.values : seasonPlan.suggestLay(plan)?.values;
+  if (!fresh) return plan;
+  const v = plan.suggestion.values;
+  const ratio = { ...(v.ratio || {}) };
+  let changed = false;
+  for (const [k, n] of Object.entries(fresh.ratio || {})) if (!blank(n) && blank(ratio[k])) { ratio[k] = n; changed = true; }
+  const plies = blank(v.plies) && !blank(fresh.plies) ? fresh.plies : v.plies;
+  if (!changed && plies === v.plies) return plan;
+  return { ...plan, suggestion: { ...plan.suggestion, values: { ...v, ratio, plies } } };
+}
+const METRES = /^(m|mtr|mtrs|meter|meters|metre|metres)$/i;
+/* FABRIC ISSUED IN THE LABELS' OWN UNIT (17 Oct 2026, owner: "fabric issued
+   can be whatever the unit of the issued fabric — just the unit is enough").
+   One unit across the scans: their total, in it. Several: the metres when any
+   label is in metres, else the first scanned unit; every unit's total stays in
+   `fabricByUnit` for the screen to name. `fabricIssuedM` is kept as the same
+   figure for older readers. */
+function fabricTotals(scans) {
+  const byUnit = {};
+  for (const f of scans) { const u = String(f.unit || "").trim() || "?"; byUnit[u] = Math.round(((byUnit[u] || 0) + (Number(f.quantity) || 0)) * 1000) / 1000; }
+  const units = Object.keys(byUnit);
+  if (!units.length) return { fabricIssued: null, fabricIssuedUnit: "", fabricIssuedM: null, fabricByUnit: byUnit };
+  const metric = units.filter((u) => METRES.test(u));
+  const unit = units.length === 1 ? units[0] : metric.length ? "m" : units[0];
+  const total = units.length === 1 ? byUnit[unit] : metric.length ? metric.reduce((a, u) => a + byUnit[u], 0) : byUnit[unit];
+  const value = Math.round(total * 1000) / 1000;
+  return { fabricIssued: value, fabricIssuedUnit: unit, fabricIssuedM: value, fabricByUnit: byUnit };
+}
 function layView(l) {
   const { _id, createdBy, updatedBy, createdAt, updatedAt, ...typed } = l;
-  return { id: String(_id), ...typed, ...logBook.inFeet(l), ratio: { ...Object.fromEntries(logBook.SIZES.map((k) => [k, Number(l.ratio?.[k]) || 0])) }, ...logBook.computeLay(l), createdBy: createdBy || {}, updatedBy: updatedBy || {}, createdAt, updatedAt };
+  return { id: String(_id), ...typed, ...logBook.inFeet(l), ratio: { ...Object.fromEntries(logBook.SIZES.map((k) => [k, Number(l.ratio?.[k]) || 0])), ...logBook.extrasOf(l) }, ...logBook.computeLay(l), createdBy: createdBy || {}, updatedBy: updatedBy || {}, createdAt, updatedAt };
 }
 async function loadSeason(req, res, { forWrite = false } = {}) {
   if (!isId(req.params.id)) { fail(res, 404, "Season not found"); return null; }
@@ -285,8 +329,34 @@ router.get("/seasons/ppc-lays", ...canRead, async (req, res) => {
     return res.json({ success: true, ...(await seasonPlanSvc.plannedLays(companyOf(req), { from: req.query.from, days: req.query.days })) });
   } catch (err) { console.error("[cutting-seasons] ppc-lays:", err); return fail(res, 500, err.message); }
 });
+/* An order's products, their work orders by size and the open season of each —
+   what the Overview's order card opens (17 Oct 2026). */
+router.get("/seasons/order-plan", ...canRead, async (req, res) => {
+  try {
+    const info = await seasonPlanSvc.orderProducts(companyOf(req), str(req.query.moId));
+    if (!info) return fail(res, 404, "That order was not found.");
+    return res.json({ success: true, ...info });
+  } catch (err) { console.error("[cutting-seasons] order-plan:", err); return fail(res, 500, err.message); }
+});
 router.post("/seasons", ...canWrite, async (req, res) => {
   try {
+    /* Started FROM AN ORDER (17 Oct 2026): one product of it, its sizes'
+       remaining pieces in the lay's size columns. */
+    if (req.body?.moId) {
+      let linked;
+      try {
+        /* no product named: the WHOLE order, one lay (17 Oct 2026) */
+        if (!str(req.body.productKey) || str(req.body.productKey) === "all") {
+          const r = await seasonPlanSvc.openWholeOrderLay(companyOf(req), str(req.body.moId), actorOf(req));
+          if (r.seasonId) return fail(res, 409, "This order's lay is already open. Opening it.", { seasonId: r.seasonId });
+          linked = r.plan;
+        } else linked = await seasonPlanSvc.planForOrder(companyOf(req), str(req.body.moId), str(req.body.productKey), actorOf(req));
+      }
+      catch (e) { if (e.status) return fail(res, e.status, e.message, e.seasonId ? { seasonId: e.seasonId } : {}); throw e; }
+      const header = logBook.normaliseHeader(linked.header);
+      const s = await CuttingSeason.create({ companyId: companyOf(req), name: "New season", nameAuto: true, createdBy: actorOf(req), header, plan: { ...linked.plan, suggestion: linked.suggestion } });
+      return res.status(201).json({ success: true, season: seasonView(s.toObject()) });
+    }
     /* Started FOR PPC's lay: the report details come from the lay, the lay
        row it suggests is kept for the screen to start from. */
     const keys = Array.isArray(req.body?.layKeys) ? req.body.layKeys : req.body?.layKey ? [req.body.layKey] : [];
@@ -598,6 +668,8 @@ router.delete("/seasons/:id", ...canWrite, async (req, res) => {
     const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;
     if ((s.rawItems || []).length || (s.pieces || []).length)
       return fail(res, 409, "This season was scanned before the log book and moved fabric on its stickers — it cannot be removed.");
+    if ((s.printRuns || []).length)
+      return fail(res, 409, "Piece labels were printed from this lay and counted as cut on the work orders — it cannot be removed.");
     if (!editable(s, res)) return;
     s.deletedAt = new Date();
     s.deletedBy = actorOf(req);
@@ -605,6 +677,120 @@ router.delete("/seasons/:id", ...canWrite, async (req, res) => {
     return res.json({ success: true });
   } catch (err) { console.error("[cutting-seasons] remove:", err); return fail(res, 500, err.message); }
 });
+/* ── THE FABRIC ISSUED, SCANNED (17 Oct 2026, owner: "they will have to scan,
+   and once they scan all the raw materials Fabric Issued is filled") ──────
+   The store's raw-item labels the cutting master was handed. Each scan reads
+   the label's quantity; the metres add up to the lay's Fabric Issued, which
+   follows every scan and removal. Nothing about stock moves. */
+const { issuedOffLabel } = require("../../../../services/manufacturing/labelIssued");
+function syncFabricIssued(s) {
+  const { fabricIssued: fabricIssuedM } = fabricTotals(s.fabricScans || []);
+  const lay = (s.lays || [])[0];
+  if (lay && fabricIssuedM != null) {
+    lay.fabricIssued = fabricIssuedM;
+    if (lay.fabricReturned != null && lay.fabricReturned > fabricIssuedM) lay.fabricReturned = null;
+  }
+  if (s.plan?.suggestion?.values) { s.plan.suggestion.values.fabricIssued = fabricIssuedM == null ? "" : String(fabricIssuedM); s.markModified("plan"); }
+}
+router.post("/seasons/:id/fabric-scans", ...canWrite, async (req, res) => {
+  try {
+    const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;
+    if (!editable(s, res)) return;
+    const id = parseStickerCode(req.body?.code);
+    if (!id) return fail(res, 400, parsePieceCode(req.body?.code) ? "That is a piece label, not a raw-item label." : "That is not a raw-item label (expected itemid=<id>).");
+    if ((s.fabricScans || []).some((f) => String(f.barcodeId) === id)) return res.json({ success: true, duplicate: true, message: "That label is already scanned in this lay.", season: seasonView(s.toObject()) });
+    const b = await Barcode.findById(id).lean();
+    if (!b) return fail(res, 404, "No raw-item label matches that code.");
+    const idRefusal = identityRefusal(b);
+    if (idRefusal) return fail(res, 400, idRefusal.message, { reason: idRefusal.reason });
+    const issued = await issuedOffLabel(b);
+    if (!issued) return fail(res, 400, `${b.rawItemName || "This label"} says 0 and no store issue of it was found — nothing to cut from it.`);
+    const other = await CuttingSeason.findOne({ companyId: companyOf(req), _id: { $ne: s._id }, deletedAt: null, status: { $ne: "closed" }, $or: [{ "fabricScans.barcodeId": oid(id) }, { "rawItems.barcodeId": oid(id) }] }).select("name").lean();
+    if (other) return fail(res, 409, `That label is already in the open lay "${other.name}".`);
+    s.fabricScans.push({ barcodeId: b._id, rawItemId: b.rawItem || null, rawItemName: b.rawItemName || "", rawItemSku: b.rawItemSku || "", variantText: (b.variantCombination || []).join(" · "), unit: issued.unit, quantity: issued.quantity, source: issued.source, mrfNumber: issued.mrfNumber, scannedAt: new Date(), scannedBy: actorOf(req) });
+    syncFabricIssued(s);
+    await s.save();
+    return res.json({ success: true, duplicate: false, added: s.fabricScans[s.fabricScans.length - 1], season: seasonView(s.toObject()) });
+  } catch (err) { console.error("[cutting-seasons] fabric-scan:", err); return fail(res, 500, err.message); }
+});
+router.delete("/seasons/:id/fabric-scans/:barcodeId", ...canWrite, async (req, res) => {
+  try {
+    const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;
+    if (!editable(s, res)) return;
+    const before = (s.fabricScans || []).length;
+    s.fabricScans = (s.fabricScans || []).filter((f) => String(f.barcodeId) !== String(req.params.barcodeId));
+    if (s.fabricScans.length === before) return fail(res, 404, "That label is not scanned in this lay.");
+    syncFabricIssued(s);
+    await s.save();
+    return res.json({ success: true, season: seasonView(s.toObject()) });
+  } catch (err) { console.error("[cutting-seasons] fabric-scan remove:", err); return fail(res, 500, err.message); }
+});
+
+/* ── PIECE LABELS FROM THE LAY (17 Oct 2026, owner: "print the barcodes
+   according to the quantity written in the variant fields") ──────────────
+   { lines: [{ workOrderId, quantity }] }. Each work order must be one of the
+   season's, and the quantity at most what it still needs cut. The next unit
+   numbers are allotted and counted as cut on the work order in one guarded
+   write (retried if another device moved it first), recorded on the season as
+   a print run, and handed back for the browser to print — WO-<id>-<unit>, the
+   form every scanner reads. */
+/* Each of the lay's work orders as it stands NOW — cut so far, left, the
+   short id and panels a label needs — for the Print step's rows and for a
+   reprint of any number already cut (the Cut page's "Reprint past barcodes"). */
+router.get("/seasons/:id/work-orders", ...canRead, async (req, res) => {
+  try {
+    const s = await loadSeason(req, res); if (!s) return;
+    const ids = [...new Set((s.plan?.lines || []).map((x) => String(x.workOrderId)).filter(isId))];
+    const wos = ids.length ? await WorkOrder.find({ _id: { $in: ids.map(oid) }, ...cutting.workOrderScope(companyOf(req)) }).select("_id workOrderNumber quantity stockItemId variantAttributes cuttingProgress").lean() : [];
+    const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+    const items = await StockItem.find({ _id: { $in: [...new Set(wos.map((w) => String(w.stockItemId)).filter(isId))].map(oid) } }).select("_id numberOfPanels").lean();
+    const panelsOf = new Map(items.map((i) => [String(i._id), i.numberOfPanels || 1]));
+    return res.json({ success: true, workOrders: wos.map((w) => {
+      const done = w.cuttingProgress?.completed || 0;
+      return { workOrderId: String(w._id), workOrderNumber: displayWorkOrderNumber(w), shortId: String(w._id).slice(-8), quantity: w.quantity || 0, completed: done, remaining: Math.max(0, (w.quantity || 0) - done), panels: panelsOf.get(String(w.stockItemId)) || 1, size: seasonPlan.variantParts(w.variantAttributes).size, variantText: variantText({ attributes: w.variantAttributes || [] }) };
+    }) });
+  } catch (err) { console.error("[cutting-seasons] work-orders:", err); return fail(res, 500, err.message); }
+});
+router.post("/seasons/:id/print-labels", ...canWrite, async (req, res) => {
+  try {
+    const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;
+    if (!editable(s, res)) return;
+    if (!(s.lays || []).length) return fail(res, 409, "Save the lay first — the labels are printed from what it cuts.");
+    const asked = (Array.isArray(req.body?.lines) ? req.body.lines : []).map((l) => ({ workOrderId: str(l.workOrderId), quantity: Math.floor(Number(l.quantity) || 0) })).filter((l) => l.quantity > 0);
+    if (!asked.length) return fail(res, 400, "Give at least one work order a quantity to print.");
+    const own = new Set((s.plan?.lines || []).map((x) => String(x.workOrderId)));
+    if (asked.some((l) => !own.has(l.workOrderId) || !isId(l.workOrderId))) return fail(res, 400, "That work order is not one of this lay's.");
+    const StockItem = require("../../../../models/CMS_Models/Inventory/Products/StockItem");
+    const runs = [];
+    /* the lay's number goes on every label (17 Oct 2026): what was typed, else the planned one */
+    const layNo = String((s.lays || [])[0]?.layNo || s.plan?.layNo || "").trim();
+    const keep = async () => { if (runs.length) await s.save(); };
+    for (const l of asked) {
+      let run = null;
+      for (let attempt = 0; attempt < 5 && !run; attempt += 1) {
+        const wo = await WorkOrder.findOne({ _id: oid(l.workOrderId), ...cutting.workOrderScope(companyOf(req)) }).select("_id workOrderNumber quantity stockItemId stockItemName variantAttributes cuttingProgress").lean();
+        if (!wo) { await keep(); return fail(res, 404, "A work order of this lay was not found.", { runs }); }
+        const done = wo.cuttingProgress?.completed || 0;
+        const left = Math.max(0, (wo.quantity || 0) - done);
+        if (l.quantity > left) { await keep(); return fail(res, 409, `${displayWorkOrderNumber(wo)} has only ${left} piece${left === 1 ? "" : "s"} left to cut — not ${l.quantity}.`, { runs }); }
+        const completed = done + l.quantity;
+        const set = { "cuttingProgress.completed": completed, "cuttingProgress.remaining": Math.max(0, (wo.quantity || 0) - completed), cuttingStatus: completed >= (wo.quantity || 0) ? "completed" : "in_progress" };
+        const guard = done ? { "cuttingProgress.completed": done } : { $or: [{ "cuttingProgress.completed": { $exists: false } }, { "cuttingProgress.completed": null }, { "cuttingProgress.completed": 0 }] };
+        const r = await WorkOrder.updateOne({ _id: wo._id, ...guard }, { $set: set });
+        if (!r.modifiedCount) continue;
+        const panels = wo.stockItemId ? (await StockItem.findById(wo.stockItemId).select("numberOfPanels").lean())?.numberOfPanels || 1 : 1;
+        const parts = seasonPlan.variantParts(wo.variantAttributes);
+        run = { workOrderId: wo._id, workOrderNumber: displayWorkOrderNumber(wo), shortId: String(wo._id).slice(-8), size: parts.size, variantText: variantText({ attributes: wo.variantAttributes || [] }), productName: wo.stockItemName || "", from: done + 1, to: completed, count: l.quantity, panels, layNo, at: new Date(), by: actorOf(req) };
+      }
+      if (!run) { await keep(); return fail(res, 409, "Another device was cutting the same work order — try again.", { runs }); }
+      s.printRuns.push(run);
+      runs.push(run);
+    }
+    await s.save();
+    return res.json({ success: true, runs: runs.map((r) => ({ ...r, workOrderId: String(r.workOrderId) })), season: seasonView(s.toObject()) });
+  } catch (err) { console.error("[cutting-seasons] print-labels:", err); return fail(res, 500, err.message); }
+});
+
 router.post("/seasons/:id/discard", ...canWrite, async (req, res) => {
   try {
     const s = await loadSeason(req, res, { forWrite: true }); if (!s) return;

@@ -1,7 +1,7 @@
 "use strict";
 
 const crypto = require("crypto");
-const { google } = require("googleapis");
+const { google } = require("../../utils/lazyGoogleapis");
 const SystemSetting = require("../../models/DevOps/SystemSetting");
 const cipher = require("./mailCredentialCipher");
 

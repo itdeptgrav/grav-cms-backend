@@ -846,6 +846,24 @@ const firstConnection = new Promise((resolve) => {
   signalFirstConnection = resolve;
 });
 
+/* Development builds any index a schema declares that the database lacks —
+   what `autoIndex` used to do — but 20 s after boot, one model at a time, so
+   no request ever waits for it. Production does not (its indexes exist; a new
+   one is created by this in development, or by hand). Once per process. */
+let indexesQueued = false;
+function buildIndexesLater() {
+  if (indexesQueued || process.env.NODE_ENV === "production" || process.env.AUTO_INDEX === "1" || process.env.AUTO_INDEX === "0") return;
+  indexesQueued = true;
+  setTimeout(async () => {
+    let built = 0, failed = 0;
+    for (const name of mongoose.modelNames()) {
+      try { await mongoose.model(name).createIndexes(); built += 1; }
+      catch { failed += 1; }
+    }
+    console.log(`[indexes] checked ${built} models in the background${failed ? ` (${failed} could not — run with AUTO_INDEX=1 to see why)` : ""}`);
+  }, 20000).unref();
+}
+
 const connectDB = async (attempt = 1) => {
   try {
     await mongoose.connect(
@@ -860,9 +878,23 @@ const connectDB = async (attempt = 1) => {
            as "everything takes two minutes". The indexes already exist in
            production; a NEW index still gets created by the next dev boot
            against the same database, or by hand. */
-        autoIndex: process.env.NODE_ENV !== "production",
+        /* OFF everywhere since 17 Oct 2026 (owner: "when the server starts or
+           restarts in development it should start instantly"). Measured on a
+           dev restart: connected at 6 s, then the first query on each model
+           waited 4–8 s for its own index check (CuttingSeason 4.1 s,
+           WorkOrder 3.6 s, PpcOrderTarget 7.7 s) — ~20 s before a page
+           answered. New indexes are still built in development, but in the
+           BACKGROUND after boot (`buildIndexesLater` below), where no query
+           waits for them. AUTO_INDEX=1 restores the old blocking behaviour. */
+        autoIndex: process.env.AUTO_INDEX === "1",
+        /* Same reason: with it on, each model's first query waited for a
+           createCollection round trip (the first ~4 s after connecting). A
+           collection is created by its first write anyway; none of ours needs
+           creation options. */
+        autoCreate: process.env.AUTO_INDEX === "1",
       },
     );
+    buildIndexesLater();
     console.log(
       attempt === 1
         ? "✅ MongoDB connected successfully"
