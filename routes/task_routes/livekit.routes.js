@@ -16,8 +16,8 @@ const express = require("express");
 const router = express.Router();
 const crypto = require("crypto");
 
-// livekit-server-sdk v2+ uses named exports
-const { AccessToken, RoomServiceClient } = require("livekit-server-sdk");
+// livekit-server-sdk v2+ uses named exports. Required where used, not here:
+// loading it at the top made every server start pay for it.
 
 const {
   verifyCoworkToken,
@@ -78,6 +78,7 @@ function getRoomSvc() {
   const url = (LK_URL || "")
     .replace("wss://", "https://")
     .replace("ws://", "http://");
+  const { RoomServiceClient } = require("livekit-server-sdk");
   return new RoomServiceClient(url, LK_KEY, LK_SECRET);
 }
 
@@ -630,6 +631,7 @@ async function buildToken(
   participantName,
   isAdmin = false,
 ) {
+  const { AccessToken } = require("livekit-server-sdk");
   const at = new AccessToken(LK_KEY, LK_SECRET, {
     identity,
     name: participantName,

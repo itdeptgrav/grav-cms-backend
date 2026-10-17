@@ -18,7 +18,7 @@
 //   }) → Promise<Buffer>
 "use strict";
 
-const PDFDocument = require("pdfkit");
+/* pdfkit is required where it is used, not here: loading it at the top made every server start pay for it. */
 
 const MARGIN = 40;
 const INK = "#0f172a", MUTED = "#64748b", RULE = "#e2e8f0", HEAD_BG = "#f1f5f9";
@@ -38,6 +38,7 @@ const str = (v) => (v === null || v === undefined ? "" : String(v));
  */
 async function buildDocumentPdf({ title = "Document", subtitle = "", reference = "", facts = [], sections = [], notes = "", footer = "" } = {}) {
   const head = await letterhead();
+  const PDFDocument = require("pdfkit");
   const doc = new PDFDocument({ size: "A4", margin: MARGIN, info: { Title: `${title} ${reference}`.trim(), Author: "GRAV Clothing" } });
   const chunks = [];
   doc.on("data", (c) => chunks.push(c));

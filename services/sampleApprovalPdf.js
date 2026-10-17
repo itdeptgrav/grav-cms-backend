@@ -16,7 +16,7 @@
 "use strict";
 const { serviceFilter } = require("./companyContext/serviceScope.service");
 
-const PDFDocument = require("pdfkit");
+/* pdfkit is required where it is used, not here: loading it at the top made every server start pay for it. */
 const StockItem = require("../models/CMS_Models/Inventory/Products/StockItem");
 const Account = require("../models/CMS_Models/Sales/Account");
 const ModuleSettings = require("../models/CMS_Models/Inventory/Operations/StoreSettings");
@@ -152,6 +152,7 @@ async function buildApprovalPdf(style, opts = {}) {
     // "some input which are not specified are not needed to showcase").
   ].filter(([, v]) => v != null && String(v).trim() !== "");
 
+  const PDFDocument = require("pdfkit");
   const doc = new PDFDocument({ size: "A4", margin: MARGIN });
   const chunks = [];
   doc.on("data", (c) => chunks.push(c));

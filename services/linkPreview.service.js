@@ -18,7 +18,7 @@
  */
 
 const axios = require("axios");
-const cheerio = require("cheerio");
+/* cheerio is required where it is used, not here: loading it at the top made every server start pay for it. */
 const dns = require("dns").promises;
 const net = require("net");
 
@@ -202,6 +202,7 @@ function clip(text, max) {
  * job listing all go through the exact same four lookups per field.
  */
 function extractMetadata(html, baseUrl) {
+  const cheerio = require("cheerio");
   const $ = cheerio.load(html);
   const meta = (name) =>
     $(`meta[property="${name}"]`).attr("content") ||

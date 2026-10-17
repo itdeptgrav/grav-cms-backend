@@ -22,7 +22,8 @@
  * and balances in the key/value block were never seen.
  */
 
-const XLSX = require("xlsx");
+/* Required on first use: loading xlsx at the top made every server start pay for it. */
+const xlsx = () => require("xlsx");
 
 function parseDate(str) {
   if (!str) return null;
@@ -41,7 +42,7 @@ function parseDate(str) {
     return new Date(`${m[1]}-${m[2].padStart(2, "0")}-${m[3].padStart(2, "0")}T00:00:00.000+05:30`);
   // Excel serial
   if (/^\d+(\.\d+)?$/.test(s)) {
-    const d = XLSX.SSF.parse_date_code(parseFloat(s));
+    const d = xlsx().SSF.parse_date_code(parseFloat(s));
     if (d)
       return new Date(`${d.y}-${String(d.m).padStart(2, "0")}-${String(d.d).padStart(2, "0")}T00:00:00.000+05:30`);
   }
@@ -71,9 +72,9 @@ function directionOf(v) {
 }
 
 function parseBankStatement(buffer) {
-  const wb = XLSX.read(buffer, { type: "buffer", cellDates: false, cellText: true, raw: true });
+  const wb = xlsx().read(buffer, { type: "buffer", cellDates: false, cellText: true, raw: true });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "", raw: false });
+  const rows = xlsx().utils.sheet_to_json(ws, { header: 1, defval: "", raw: false });
 
   const meta = {
     bankName: "",

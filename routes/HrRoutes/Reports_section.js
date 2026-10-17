@@ -1,8 +1,7 @@
 "use strict";
 const express = require("express");
 const router = express.Router();
-const ExcelJS = require("exceljs");
-const PDFDocument = require("pdfkit");
+/* exceljs and pdfkit are required where they are used, not here: loading them at the top made every server start pay for them. */
 
 const DailyAttendance = require("../../models/HR_Models/Dailyattendance");
 const AttendanceSettings = require("../../models/HR_Models/Attendancesettings");
@@ -400,6 +399,7 @@ function streamMonthPerformancePDF(res, data) {
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
+    const PDFDocument = require("pdfkit");
     const doc = new PDFDocument({
         size: "A4", layout: "landscape",
         margins: { top: 24, left: 20, right: 20, bottom: 24 },
@@ -665,6 +665,7 @@ async function streamMonthPerformanceExcel(res, data) {
     const { yearMonth, monthLabel, lastDay, allDays, employees } = data;
     const L = (s) => data.displayLabels?.[s] || s;
 
+    const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
     wb.creator = "Grav Clothing HRMS";
     const ws = wb.addWorksheet("Month Performance", {
@@ -1152,6 +1153,7 @@ function streamListReportPDF(res, { title, columns, rows, monthLabel, filterSumm
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
 
+    const PDFDocument = require("pdfkit");
     const doc = new PDFDocument({
         size: "A4",
         layout: "landscape",
@@ -1255,6 +1257,7 @@ function streamListReportPDF(res, { title, columns, rows, monthLabel, filterSumm
 }
 
 async function streamListReportExcel(res, { title, columns, rows, monthLabel, filterSummary }) {
+    const ExcelJS = require("exceljs");
     const wb = new ExcelJS.Workbook();
     wb.creator = "Grav Clothing HRMS";
     const ws = wb.addWorksheet(title.slice(0, 30), {

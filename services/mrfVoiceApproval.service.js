@@ -2,7 +2,7 @@
 
 const crypto = require("crypto");
 const mongoose = require("mongoose");
-const { AccessToken, AgentDispatchClient, RoomServiceClient } = require("livekit-server-sdk");
+/* livekit-server-sdk is required where it is used: loading it at the top made every server start pay for it. */
 const Session = require("../models/MrfVoiceApprovalSession");
 const itemApproval = require("./mrfItemApproval.service");
 const intent = require("./mrfVoiceIntent.service");
@@ -241,6 +241,7 @@ async function accept({ id, companyId, biometricId, actorName }, deps = {}) {
   const workflowKey = row.workflowKey || "mrf_approval";
   const roomName = `${workflowKey.replaceAll("_", "-")}-${crypto.randomUUID()}`;
   const host = asHttp(cfg.url);
+  const { AccessToken, AgentDispatchClient, RoomServiceClient } = require("livekit-server-sdk");
   const rooms = deps.rooms || new RoomServiceClient(host, cfg.apiKey, cfg.apiSecret);
   const dispatches = deps.dispatches || new AgentDispatchClient(host, cfg.apiKey, cfg.apiSecret);
   await rooms.createRoom({ name: roomName, emptyTimeout: 90, maxParticipants: 2 });
