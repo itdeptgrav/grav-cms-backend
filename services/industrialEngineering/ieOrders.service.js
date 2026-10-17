@@ -770,6 +770,9 @@ const ORDER_PROJECTION = [
   /* 16 Oct 2026: the photo's variant, the operation ids the line plan names,
      the plan's summary and who last set the route. */
   "variantId operations._id operationsPlan linePlan.lineId linePlan.lineName linePlan.summary linePlan.plannedAt linePlan.plannedBy linePlan.version linePlan.copiedFromWorkOrderNumber",
+  /* 17 Oct 2026: the process flow IE drew — its resolved sequence and summary,
+     never the drawing itself (the canvas reads that from /work-orders). */
+  "processFlow.nodes.key processFlow.nodes.department processFlow.nodes.label processFlow.sequence processFlow.summary processFlow.plannedAt processFlow.plannedBy processFlow.version processFlow.copiedFromWorkOrderNumber",
 ].join(" ");
 
 /* ── WHAT IE NEEDS TO PLAN A LINE, PER WORK ORDER (15 Oct 2026, owner) ──────
@@ -780,6 +783,25 @@ const ORDER_PROJECTION = [
  * These are added beside the existing fields, never instead of them. The
  * customer's NAME and the order's number and delivery date are read; nothing
  * commercial (prices, quotations, payments) is selected. */
+/* The stored flow reduced to what a register row needs: the steps in words,
+   who set it and when. The full drawing stays behind GET /work-orders. */
+function processFlowSummary(o) {
+  const f = o?.processFlow;
+  if (!f || !Array.isArray(f.nodes) || !f.nodes.length) return null;
+  const labels = new Map(f.nodes.map((n) => [str(n.key), str(n.label) || str(n.department) || str(n.key)]));
+  const sequence = (f.sequence || []).map(str).filter((k) => labels.has(k));
+  return {
+    steps: f.summary?.steps || f.nodes.length,
+    sequence,
+    sequenceLabels: sequence.map((k) => labels.get(k)),
+    startAt: str(f.summary?.startAt), endAt: str(f.summary?.endAt),
+    plannedAt: f.plannedAt || null,
+    plannedBy: str(f.plannedBy?.name),
+    version: f.version || 1,
+    copiedFromWorkOrderNumber: str(f.copiedFromWorkOrderNumber),
+  };
+}
+
 async function planningContextFor(orders) {
   const { displayWorkOrderNumber } = require("../manufacturing/workOrderNumber");
   const requestIds = [...new Set(orders.map((o) => str(o.customerRequestId)).filter(isId))];
@@ -838,6 +860,8 @@ async function planningContextFor(orders) {
         version: o.linePlan.version || 1,
         copiedFromWorkOrderNumber: str(o.linePlan.copiedFromWorkOrderNumber),
       } : null,
+      /* 17 Oct 2026: the process flow, as the row chip and PPC print it. */
+      processFlow: processFlowSummary(o),
     });
   }
   /* The product photo and the variant as the finishing portals resolve them

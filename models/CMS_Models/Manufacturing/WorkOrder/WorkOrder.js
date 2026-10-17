@@ -487,6 +487,56 @@ const workOrderSchema = new mongoose.Schema(
       default: undefined,
     },
 
+    /* ── THE PROCESS FLOW FOR THIS WORK ORDER (17 Oct 2026, IE) ───────────
+       Which production departments this work order passes through and in
+       what order — Cutting, Sewing, QC 1, Trimming, Washing, Ironing,
+       Embroidery, Printing, QC 2, Packaging, Dispatch, LL, or a department
+       IE names itself. Drawn by IE on a canvas (a node per department, an
+       arrow per hand-over) and stored as the nodes, the arrows AND the
+       resolved `sequence` (a topological order of the department keys), so a
+       reader that only wants "what comes after Sewing" never has to walk the
+       graph. `summary.steps` counts the departments; `startAt`/`endAt` name
+       the first and last. Stored ON the work order like `linePlan`, for the
+       same reasons: several work orders may carry the same flow (IE applies
+       one drawing to many) and each keeps its own copy.
+       NO DEFAULT: a work order whose flow IE has not set carries nothing. */
+    processFlow: {
+      type: new mongoose.Schema({
+        nodes: [new mongoose.Schema({
+          key: { type: String, trim: true, required: true },      // unique in this flow: "cutting", "qc1", "custom-3"
+          department: { type: String, trim: true, required: true }, // the catalogue key, or "custom"
+          label: { type: String, trim: true, default: "" },
+          x: { type: Number, default: 0 },
+          y: { type: Number, default: 0 },
+          notes: { type: String, trim: true, default: "" },
+          /* a department the piece MUST pass (the default) vs one it may
+             skip when the order does not need it (e.g. Washing) */
+          optional: { type: Boolean, default: false },
+        }, { _id: false })],
+        edges: [new mongoose.Schema({
+          from: { type: String, trim: true, required: true },
+          to: { type: String, trim: true, required: true },
+        }, { _id: false })],
+        sequence: [{ type: String, trim: true }],
+        summary: {
+          steps: { type: Number, default: 0 },
+          startAt: { type: String, trim: true, default: "" },
+          endAt: { type: String, trim: true, default: "" },
+        },
+        notes: { type: String, trim: true, default: "" },
+        copiedFromWorkOrderId: { type: mongoose.Schema.Types.ObjectId, ref: "WorkOrder", default: null },
+        copiedFromWorkOrderNumber: { type: String, trim: true, default: "" },
+        version: { type: Number, default: 1 },
+        plannedAt: { type: Date },
+        plannedBy: {
+          userId: { type: String, trim: true, default: "" },
+          name: { type: String, trim: true, default: "" },
+          email: { type: String, trim: true, default: "" },
+        },
+      }, { _id: false }),
+      default: undefined,
+    },
+
     rawMaterials: [rawMaterialAllocationSchema],
     timeline: timelineSchema,
 
